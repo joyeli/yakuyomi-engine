@@ -164,7 +164,9 @@ AURA_MIN_INK_AREA = 2500        # 「大型人物墨」門檻（px）；格線/�
 AURA_R = 30                     # 灰暈半徑：距人物墨此距離內的留白不填
 AURA_FRAME_EXEMPT = 45          # 距格線此範圍內的留白豁免灰暈（正常格間留白照填；hard 模式用）
 AURA_BORDER_EXEMPT = 60         # 距頁邊此範圍內的留白豁免灰暈（hard 模式用）
-AURA_MODE = os.environ.get("NIGHTREAD_AURA", "hard")  # hard=二值+豁免帶；glow=距離場漸層（跟隨輪廓）
+# ★ 拍板 hard（2026-09-05 使用者 A/B 目檢）：邊界 crisp、黑就是黑。glow 保留備查（見下），
+# 它把安全妥協變成「夜景輪廓光」但會在人物衣料上疊一層原作沒有的漸層 ⇒ 風格添加，不採用。
+AURA_MODE = os.environ.get("NIGHTREAD_AURA", "hard")  # hard=二值+豁免帶（定案）；glow=距離場漸層
 AURA_GLOW_R0 = 8                # glow：距人物墨 ≤R0 全保留場景調
 AURA_GLOW_R1 = 42               # glow：≥R1 全 BG；中間線性淡入（距離場＝天然跟隨輪廓、無鋸齒）
 STICKER_TEXTON_PAD = 8          # textOn 的文字 bbox 外擴（語意證據要「真的壓在元件上」

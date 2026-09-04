@@ -113,6 +113,12 @@ Speed claims (e.g. "~3.6× on ARM") are **device numbers and cannot be verified 
 - `nightread_batch.py [names…]` — run a page set (default: the 11 sandbox test pages), print
   the white-area table, write `nightread_stats.json`. Bare names like `demo01` resolve against
   the sandbox test dir.
+- Two experiment switches, both already set to the chosen values — override only to reproduce
+  the comparisons: `NIGHTREAD_CURVE` picks the scene tone curve (`lin8` = chosen: black stays
+  black, paper white compressed to mid-grey; `d2`/`lin`/`knee` are the alternatives that lost
+  the A/B) and `NIGHTREAD_AURA` picks how gutter fill keeps clear of bleed-page figures
+  (`hard` = chosen: binary keep-out with a margin exemption; `glow` = distance-field gradient
+  that follows the contour, rejected as style-adding).
 
 ---
 
