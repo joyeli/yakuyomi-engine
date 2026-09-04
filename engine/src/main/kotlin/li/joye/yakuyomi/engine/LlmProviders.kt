@@ -257,15 +257,31 @@ object LlmProviders {
             ParamRule(Regex("^gpt-5"), temperature = false, maxTokensField = MAX_COMPLETION),
             ParamRule(), // gpt-4o / gpt-4.1 / 其他＝非 reasoning，一般規則
         ),
-        // Gemini（走 OpenAI 相容端點）：思考走 reasoning_effort，compat 層自動映射到 thinkingBudget(2.5 系)／
-        // thinking_level(3.x)。**none 只有 2.5 系吃**；3.x 最低檔是 minimal（關不掉、只能最小化）。
-        // 2.0 系不是思考模型（且 2026-06-01 已停役）→ 什麼都不送。
+        // Gemini（走 OpenAI 相容端點）：思考走 reasoning_effort，compat 層映射到 thinkingBudget(2.5 系)／
+        // thinking_level(3.x)。**送不支援的值＝400 INVALID_ARGUMENT，不會被忽略也不會自動降級**
+        // （官方相容層那張映射表只涵蓋 3.1-pro/3.1-flash-lite/3-flash/2.5，對表上沒列的新世代是直接透傳）。
+        // 2026-09-04 全面查證後的可用值（官方 thinking 頁逐模型表）：
+        //   3.8/3.7-flash        low|medium|high   ← minimal 明確報錯（使用者實測 3.8-flash 400）
+        //   3.6/3.5-flash(-lite) minimal|low|medium|high
+        //   3.1-flash-lite       low|high          ← minimal、medium 皆拒
+        //   3-pro-preview        low|high          ← medium 拒
+        //   3.1-pro-preview      low|medium|high
+        //   2.5-flash(-lite)     none 可真的關思考
+        //   2.5-pro              不能關（none/budget 0 → 400「Thinking can't be disabled」）
+        // ⇒ **`low` 是唯一跨全部現役 chat 模型都不 400 的值**，除 2.5 非 Pro（能關就關、更省）之外一律送 low。
+        // 不送會更糟：官方「無 reasoning_effort 時用模型預設」，而 3 系預設 On(medium/high) ⇒ 更慢更貴。
+        // 3 系官方明說「Reasoning cannot be turned off for Gemini 3 models」，low 已是最省。
+        // 影像/語音類（-image/-tts/-live）值域另有一套（如 3.1-flash-lite-image 只吃 minimal|high）⇒ 不送、
+        // 用模型預設（那類本就不是我們的翻譯目標，只是可能出現在「抓取模型」清單被選到）。
+        // https://ai.google.dev/gemini-api/docs/thinking ／ https://ai.google.dev/gemini-api/docs/openai
         // temperature：官方 changelog 2026-07-21 對「最新 Gemini 模型」標 deprecated，但 compat 層明文
         // silently ignore 不支援的參數 ⇒ 照送無妨（同 DeepSeek v4 的立場）；若日後開始報錯再加 temperature=false 規則。
         // https://ai.google.dev/gemini-api/docs/openai
         "gemini" to listOf(
+            ParamRule(Regex("-(image|tts|live)")),                       // 非文字模型：值域另一套 → 不送
+            ParamRule(Regex("^gemini-2\\.5-pro"), thinkingOff = mapOf("reasoning_effort" to "low")),
             ParamRule(Regex("^gemini-2\\.5"), thinkingOff = mapOf("reasoning_effort" to "none")),
-            ParamRule(Regex("^gemini-[3-9]"), thinkingOff = mapOf("reasoning_effort" to "minimal")),
+            ParamRule(Regex("^gemini-[3-9]"), thinkingOff = mapOf("reasoning_effort" to "low")),
             ParamRule(),
         ),
         // Groq：reasoning_effort **只有部分模型吃**——Qwen 3.x 支援 none|default（真的能關）、GPT-OSS 只有

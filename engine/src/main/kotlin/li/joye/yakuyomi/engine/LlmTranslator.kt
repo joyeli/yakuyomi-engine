@@ -123,8 +123,34 @@ class LlmTranslator(
         else -> v
     }
 
-    /** 回傳 (回應內容, token 用量)——per-call、不寫實例欄位（跨頁併發安全）。usage 缺欄/代理不回＝null。 */
-    private suspend fun request(messages: JSONArray): Pair<String, Usage?> = withContext(Dispatchers.IO) {
+    /**
+     * 回傳 (回應內容, token 用量)——per-call、不寫實例欄位（跨頁併發安全）。usage 缺欄/代理不回＝null。
+     *
+     * **思考參數自癒**（2026-09-04）：各家的「關思考」欄位與可用值改版頻繁（DeepSeek 退役 model、
+     * Gemini 2.0 停役、Groq 停役、Gemini「thinking level MINIMAL 不支援」＝半年內第四次），
+     * [LlmProviders.PARAM_RULES] 這種靜態表永遠追不上 ⇒ 收到 400 且 error body 指向思考參數時，
+     * **脫掉思考參數重送一次**。代價＝該次請求用該模型的預設思考行為（可能較慢/較貴），
+     * 但「能翻」遠優於「整章 400」。純參數協商、不改語意；只重試一次、避免無限退讓。
+     */
+    private suspend fun request(messages: JSONArray): Pair<String, Usage?> {
+        val key = "${cfg.provider}|${LlmProviders.migrateModel(cfg.provider, cfg.model)}"
+        // 已知會拒的組合直接不送（否則整章每頁都先白花一次 400）。跨頁、跨引擎重建都記得。
+        if (key in thinkingRejected) return requestOnce(messages, dropThinking = true)
+        return try {
+            requestOnce(messages, dropThinking = false)
+        } catch (e: RuntimeException) {
+            val m = e.message.orEmpty()
+            if (!isThinkingParamRejection(m)) throw e
+            thinkingRejected.add(key)
+            android.util.Log.w(TAG, "思考參數被拒（$m）→ 記住 $key 並脫掉思考參數重試")
+            requestOnce(messages, dropThinking = true)
+        }
+    }
+
+    private suspend fun requestOnce(
+        messages: JSONArray,
+        dropThinking: Boolean,
+    ): Pair<String, Usage?> = withContext(Dispatchers.IO) {
         // 退役 model 名稱遷移（見 LlmProviders.RETIRED_MODELS）：2026-07-24 DeepSeek 砍掉 deepseek-chat /
         // deepseek-reasoner，舊設定送出去會 400。這裡就地換名 ⇒ 存著舊名稱的使用者不用手動改設定。
         // 只認 provider id（custom/sakura 的同名模型不動）；除 model 外請求其餘欄位一字不動。
@@ -137,6 +163,7 @@ class LlmTranslator(
             .put("messages", messages)
             .put("stream", false)
         LlmProviders.requestParams(cfg.provider, model, cfg.thinking, cfg.temperature)
+            .filterKeys { !(dropThinking && it in THINKING_KEYS) }
             .forEach { (k, v) -> json.put(k, toJson(v)) }
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
@@ -173,6 +200,35 @@ class LlmTranslator(
 
     companion object {
         private const val TAG = "LlmTranslator"
+
+        /** 所有 provider 用來「開/關思考」的頂層欄位名（見 [LlmProviders.PARAM_RULES]）。自癒重試時整組脫掉。 */
+        private val THINKING_KEYS = setOf("reasoning_effort", "reasoning", "thinking", "enable_thinking")
+
+        /**
+         * 已知「送思考參數就 400」的 provider|model（自癒重試學到的）。process 級、跨頁跨引擎重建共用
+         * ⇒ 一章只白花第一次那一發。不落磁碟：各家改版後重開 app 會重新探一次、自動恢復送思考參數。
+         */
+        private val thinkingRejected = java.util.Collections.newSetFromMap(
+            java.util.concurrent.ConcurrentHashMap<String, Boolean>(),
+        )
+
+        /**
+         * 這個 400 是不是「思考參數不被接受」？——比對各家實測訊息的共同字眼，寧可窄一點：
+         * 誤判成是 ⇒ 白花一次請求；誤判成不是 ⇒ 回到原本的整章失敗（不會更糟）。
+         * 實例：Gemini「Thinking level MINIMAL is not supported for this model」、
+         * Groq「reasoning_effort is not supported with this model」、
+         * OpenAI reasoning 模型對取樣參數的「Unsupported parameter」。
+         */
+        internal fun isThinkingParamRejection(msg: String): Boolean {
+            if (!msg.startsWith("HTTP 400")) return false
+            val m = msg.lowercase()
+            val mentionsThinking = listOf("thinking", "reasoning").any { it in m }
+            val mentionsUnsupported = listOf(
+                "not supported", "unsupported", "not allowed",
+                "invalid", "unrecognized", "unknown",
+            ).any { it in m }
+            return mentionsThinking && mentionsUnsupported
+        }
         // 寬鬆解析：DeepSeek 偶爾吐格式變體（實測 <|1>| 管線跑到 > 後面、或 <|1>）。
         // 只認「<、可選|、數字、一串 |/>、譯文」⇒ 容 <|1|> / <|1>| / <|1>，非決定性格式錯不再整頁失敗。
         private val LINE_RE = Regex("""^<\|?(\d+)\s*[|>]+\s*(.*)$""")

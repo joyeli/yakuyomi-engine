@@ -64,8 +64,9 @@ class LlmParamsTest {
     // ── 其餘各家的思考開關形狀 ──
 
     @Test fun geminiEffortDependsOnGeneration() {
-        assertEquals("none", params("gemini", "gemini-2.5-flash")["reasoning_effort"])   // none 只有 2.5 系吃
-        assertEquals("minimal", params("gemini", "gemini-3.6-flash")["reasoning_effort"]) // 3.x 最低只能 minimal
+        // 逐模型的完整覆蓋見 geminiThinkingEffortIsSafeAcrossEveryLiveModel；這裡只守世代分界。
+        assertEquals("none", params("gemini", "gemini-2.5-flash")["reasoning_effort"])   // none 只有 2.5 非 Pro 吃
+        assertEquals("low", params("gemini", "gemini-3.6-flash")["reasoning_effort"])    // 3 系關不掉、low 最省且安全
         assertFalse(params("gemini", "gemini-2.0-flash").containsKey("reasoning_effort")) // 非思考模型 → 不送
     }
 
@@ -147,6 +148,56 @@ class LlmParamsTest {
         assertEquals("llama-3.3-70b-versatile", LlmProviders.migrateModel("custom", "llama-3.3-70b-versatile"))
     }
 
+    @Test fun geminiThinkingEffortIsSafeAcrossEveryLiveModel() {
+        // low ＝ 唯一跨全部現役 gemini chat 模型都不 400 的值（2026-09-04 查證，見 PARAM_RULES 註記）。
+        // 3.8/3.7-flash 拒 minimal（使用者實測 400）、3.1-flash-lite 與 3-pro-preview 只吃 low|high。
+        for (m in listOf(
+            "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+            "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview", "gemini-3-flash-preview",
+        )) {
+            assertEquals("送給 $m 的 reasoning_effort 不安全", "low", params("gemini", m)["reasoning_effort"])
+        }
+        // 2.5 非 Pro＝唯一能真的關思考的一群（更省，維持 none）
+        assertEquals("none", params("gemini", "gemini-2.5-flash")["reasoning_effort"])
+        assertEquals("none", params("gemini", "gemini-2.5-flash-lite")["reasoning_effort"])
+        // 2.5-pro 不能關（送 none → 400「Thinking can't be disabled for this model」）
+        assertEquals("low", params("gemini", "gemini-2.5-pro")["reasoning_effort"])
+        // 影像類值域另一套（3.1-flash-lite-image 只吃 minimal|high）→ 什麼都不送
+        assertFalse(params("gemini", "gemini-3.1-flash-lite-image").containsKey("reasoning_effort"))
+    }
+
+    // ── 思考參數自癒（收到 400 就脫掉思考欄位重送）──
+
+    @Test fun thinkingRejectionIsRecognisedAcrossProviders() {
+        // 各家實測過的拒收訊息都要認得（Gemini 3.8-flash 實例＝2026-09-04 使用者回報）
+        assertTrue(
+            LlmTranslator.isThinkingParamRejection(
+                """HTTP 400 {"error":{"code":400,"message":"Thinking level MINIMAL is not supported """ +
+                    """for this model. Please retry with other thinking level.","status":"INVALID_ARGUMENT"}}""",
+            ),
+        )
+        assertTrue(
+            LlmTranslator.isThinkingParamRejection(
+                """HTTP 400 {"error":{"message":"reasoning_effort is not supported with this model"}}""",
+            ),
+        )
+        assertTrue(
+            LlmTranslator.isThinkingParamRejection(
+                """HTTP 400 {"error":{"message":"Unsupported parameter: 'reasoning_effort'"}}""",
+            ),
+        )
+    }
+
+    @Test fun unrelatedFailuresAreNotTreatedAsThinkingRejection() {
+        // 脫思考參數救不了的錯不能誤判（否則白花一次請求、還蓋掉真正的錯誤訊息）
+        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 400 {"error":{"message":"Model Not Exist"}}"""))
+        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 401 {"error":{"message":"invalid api key"}}"""))
+        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 402 insufficient balance"""))
+        // 非 400 的思考字眼（例如 429 訊息裡提到 reasoning）不重試
+        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 429 reasoning tokens rate limit"""))
+    }
+
     @Test fun qwenTemperatureClampsInsideOpenInterval() {
         // DashScope 官方：「Range: [0, 2). Do not set to 0.」——0 與 2 都不合法，送了 400。
         assertEquals(0.01, params("qwen", "qwen-plus", temp = 0.0)["temperature"])
@@ -167,7 +218,7 @@ class LlmParamsTest {
         // 換預設模型後，規則是否還命中對的那條（換 id 卻沒對到規則＝白改）
         fun defaultParams(id: String) = LlmProviders.byId(id).let { params(it.id, it.defaultModel) }
         assertEquals(mapOf("type" to "disabled"), defaultParams("deepseek")["thinking"])
-        assertEquals("minimal", defaultParams("gemini")["reasoning_effort"])  // 3.x 關不掉、只能最小化
+        assertEquals("low", defaultParams("gemini")["reasoning_effort"])      // 3 系關不掉、low 是跨模型安全底
         assertEquals("low", defaultParams("groq")["reasoning_effort"])        // gpt-oss 只吃 low|medium|high
         assertEquals(mapOf("effort" to "none"), defaultParams("openrouter")["reasoning"])
         assertFalse(defaultParams("openai").containsKey("reasoning_effort"))  // gpt-4o-mini＝非推理模型
