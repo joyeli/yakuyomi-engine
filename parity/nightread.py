@@ -160,6 +160,14 @@ HARMONIZE_COLLAR_INK = 0.30     # 亮島外環細墨密度上限：鬍鬚/密集
                                 # 空白人頭只有單條輪廓線、低 → 放行
 # 紙白正規化（色紙/掃描頁）：demo05 水彩紙白峰 223 → 整頁沒有一個像素 ≥ WHITE_TH、整套失效。
 # 頁級估亮部眾數，低於 PAPER_NORM_MIN 就把亮部線性拉到 255（WHITE_TH 語意不變、13 個使用點免動）。
+# 批2 前兩刀（2026-09-08 轉正，11 頁回歸零附帶傷害；env 設 0 可重現 A/B）：
+# · PANEL_CORE：panel 候選卡在 eaten 中段門（0.06–0.30）者，改走核心填色（格框種子、切窄頸）+
+#   _sticker_protect 區域保護，不整顆拒。這道門當初就是為白鬍（ch34_006）設的，但那是核心填色
+#   出現之前——實測白鬍/白髮完整、背景全黑、輪廓白描邊，該頁 -6.7pt。
+# · TEXTCOV_OFF：≥2% 的大塊 panel 候選跳過 textCov 門。memory 曾警告鬆這門會漏併氣泡——但那是
+#   偽泡出現之前；漏併的泡現在會被偽泡重繪成深底亮字，demo03/04 實測零漏併，demo02 -0.6。
+EXP_PANEL_CORE = os.environ.get("NIGHTREAD_PANEL_CORE", "1") == "1"
+EXP_TEXTCOV_OFF = os.environ.get("NIGHTREAD_TEXTCOV_OFF", "1") == "1"
 PAPER_NORM_MIN = 245            # 紙白峰 ≥ 此視為乾淨白紙、不動
 PAPER_PEAK_LO = 200             # 估峰值只看 ≥ 此的像素（排除調子/墨）
 PAPER_NORM_CHROMA_MAX = 8.0     # 峰值區平均彩度 ≤ 此才視為「無彩色紙」；水彩淡彩底（demo05 粉底）超過 → 不動
@@ -634,15 +642,21 @@ def sticker_plan(g, img_bgr, lab, stats, gutter_ids, panel_ids, frameless, regio
             if ok:
                 promoted.add(i)
         else:
+            textcov_ok = (met["textCov"] <= STICKER_TEXT_MAX
+                          or (EXP_TEXTCOV_OFF and met["areaFrac"] >= 0.02))
+            eaten_mid_ok = (met["eatenFrac"] <= STICKER_EATEN_MAX
+                            or met["textOn"] >= STICKER_TEXT_BG_MIN)
             ok = (STICKER_FIG_MIN <= met["figFrac"] <= STICKER_FIG_MAX
                   and met["thinFrac"] <= STICKER_THIN_MAX
                   and met["chroma"] <= STICKER_CHROMA_MAX
-                  and met["textCov"] <= STICKER_TEXT_MAX
+                  and textcov_ok
                   and met["eatenFrac"] <= STICKER_EATEN_HARD
-                  and (met["eatenFrac"] <= STICKER_EATEN_MAX
-                       or met["textOn"] >= STICKER_TEXT_BG_MIN)
+                  and (eaten_mid_ok or EXP_PANEL_CORE)
                   and (met["areaFrac"] >= STICKER_SMALL_AREA
                        or met["textOn"] >= STICKER_TEXT_BG_MIN))
+            if ok and EXP_PANEL_CORE and not eaten_mid_ok and not frameless and i in panel_ids:
+                # E1：中段 eaten 的 panel 白改走核心填色（格框種子、切窄頸）+ 區域級保護，不整顆拒
+                promoted.add(i)
         met["accept"] = bool(ok)
         audit.append(met)
         if ok:
