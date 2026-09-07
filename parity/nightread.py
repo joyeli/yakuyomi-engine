@@ -158,6 +158,14 @@ HARMONIZE_IN_ZONE = 0.6         # 亮島落在暗區內的比例下限
 HARMONIZE_AREA_MAX = 0.004      # 亮島整頁佔比上限（群眾人頭尺度；主角臉更大 → 排除）
 HARMONIZE_COLLAR_INK = 0.30     # 亮島外環細墨密度上限：鬍鬚/密集髮絲（ch34_006）高 → 排除；
                                 # 空白人頭只有單條輪廓線、低 → 放行
+# 紙白正規化（色紙/掃描頁）：demo05 水彩紙白峰 223 → 整頁沒有一個像素 ≥ WHITE_TH、整套失效。
+# 頁級估亮部眾數，低於 PAPER_NORM_MIN 就把亮部線性拉到 255（WHITE_TH 語意不變、13 個使用點免動）。
+PAPER_NORM_MIN = 245            # 紙白峰 ≥ 此視為乾淨白紙、不動
+PAPER_PEAK_LO = 200             # 估峰值只看 ≥ 此的像素（排除調子/墨）
+PAPER_NORM_CHROMA_MAX = 8.0     # 峰值區平均彩度 ≤ 此才視為「無彩色紙」；水彩淡彩底（demo05 粉底）超過 → 不動
+# 無框頁的「真頁邊帶」：無框頁不填背景（修法2），但貼頁邊的薄帶留白是安全的——
+# 元件深入頁內的最大距離 ≤ 短邊 × 此比例 才算頁邊帶（開放背景會深入頁心、不符）
+FRAMELESS_MARGIN_DEPTH = 0.12
 # 留白填深的人物灰暈（ch34_010 左下案＝出血式無框特寫：外套白與頁白連續且輪廓開放，
 # 像素層無界 → 唯一安全解＝gutter 填色避開大型人物墨結構周圍，人物旁留灰暈）：
 AURA_MIN_INK_AREA = 2500        # 「大型人物墨」門檻（px）；格線/氣泡輪廓先排除不算
@@ -269,6 +277,28 @@ def detect(img_bgr):
 
 
 # ── 遮罩：白元件分類（修法2/3）＋氣泡（修法1）───────────────────────
+
+def normalize_paper(g, img_bgr=None):
+    """紙白正規化：亮部（≥PAPER_PEAK_LO）眾數當紙白峰；峰 < PAPER_NORM_MIN 且**峰值區近乎無彩**時
+    把 g 線性放大到峰=255（clip）。彩度門是關鍵：真掃描色紙的「紙白」是灰白（chroma≈0），水彩淡彩底
+    （demo05 峰 223、粉色）是畫不是紙——沒這道門會把整頁淡彩拉成白、輸出反而變亮（b21 實測 +8pt）。
+    回傳 (g', peak)。乾淨白紙（峰≥245）原樣回傳＝現有 11 頁零變化。"""
+    h = np.bincount(g.ravel(), minlength=256)
+    if h[PAPER_PEAK_LO:].sum() == 0:
+        return g, 255
+    peak = PAPER_PEAK_LO + int(np.argmax(h[PAPER_PEAK_LO:]))
+    if peak >= PAPER_NORM_MIN:
+        return g, peak
+    if img_bgr is not None:
+        sel = np.abs(g.astype(np.int16) - peak) <= 4
+        if sel.any():
+            px = img_bgr[sel].astype(np.int16)
+            chroma = float((px.max(axis=1) - px.min(axis=1)).mean())
+            if chroma > PAPER_NORM_CHROMA_MAX:
+                return g, peak                            # 有彩＝淡彩畫底，不是紙
+    gn = np.clip(np.round(g.astype(np.float32) * (255.0 / peak)), 0, 255).astype(np.uint8)
+    return gn, peak
+
 
 def frame_line_mask(g):
     """長直格框線遮罩：暗像素對「長水平/垂直線」形態學開運算＝只留貼直的長線（格框）。
@@ -942,6 +972,21 @@ def compose(g, gutter, bubble, seg, frameless, lab=None, stats=None, sticker=(),
     out = scene_final(g, seg).astype(np.float32)
     if not frameless:                                   # 修法2：無框頁背景不填深
         out = paint_gutter(out, g, gutter, frame=frame, bubble=bubble)
+    elif gutter.any():
+        # 無框頁只填「真頁邊帶」：留白元件深入頁內的最大距離 ≤ 短邊×FRAMELESS_MARGIN_DEPTH 才是
+        # 貼邊薄帶（開放背景會深入頁心、不符）；仍套人物灰暈（出血人物碰邊的保護）。
+        H2, W2 = g.shape
+        yy, xx = np.mgrid[0:H2, 0:W2]
+        bd = np.minimum(np.minimum(yy, H2 - 1 - yy), np.minimum(xx, W2 - 1 - xx))
+        n_, lb_, st_, _ = cv2.connectedComponentsWithStats(gutter.astype(np.uint8), 8)
+        keep = np.zeros_like(gutter)
+        lim = FRAMELESS_MARGIN_DEPTH * min(H2, W2)
+        for i in range(1, n_):
+            m = lb_ == i
+            if bd[m].max() <= lim:
+                keep |= m
+        if keep.any():
+            out = paint_gutter(out, g, keep, frame=frame if frame is not None else np.zeros_like(gutter, np.uint8), bubble=bubble)
     if sticker:                                         # 修法4：純白背景填黑＋前景白描邊
         out = paint_sticker(out, g, lab, stats, sticker, bubble,
                             core_ids=core_ids, frame=frame)
@@ -1008,6 +1053,7 @@ def run_page(page_path, outdir=OUT_DEFAULT, col_w=1000):
     img = cv2.imread(page_path)                        # 彩頁也吃（偵測吃 BGR）
     assert img is not None, page_path
     g = cv2.imread(page_path, cv2.IMREAD_GRAYSCALE)
+    g, paper_peak = normalize_paper(g, img)           # 色紙/掃描頁：亮部拉到 255（見 PAPER_NORM_MIN；淡彩底不動）
     H, W = g.shape
 
     lines, regions, seg = detect(img)
@@ -1031,6 +1077,7 @@ def run_page(page_path, outdir=OUT_DEFAULT, col_w=1000):
         json.dump({
             "image": page_path, "width": W, "height": H,
             "pageType": "frameless" if frameless else "framed",
+            "paperPeak": int(paper_peak),
             "frameLines": {"h": round(hk, 3), "v": round(vk, 3)},
             "detector": "DBNet (m-i-t default @ .upstream-ref, detect-20241225.ckpt) "
                         "torch eager; text_th=0.5 box_th=0.7 unclip=2.3; "
