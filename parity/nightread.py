@@ -178,6 +178,21 @@ HARMONIZE_COLLAR_INK = 0.30     # 亮島外環細墨密度上限：鬍鬚/密集
 #   偽泡出現之前；漏併的泡現在會被偽泡重繪成深底亮字，demo03/04 實測零漏併，demo02 -0.6。
 EXP_PANEL_CORE = os.environ.get("NIGHTREAD_PANEL_CORE", "1") == "1"
 EXP_TEXTCOV_OFF = os.environ.get("NIGHTREAD_TEXTCOV_OFF", "1") == "1"
+# 機制開關（消融/守護框評測用，預設全開）：
+EXP_HUG = os.environ.get("NIGHTREAD_HUG", "1") == "1"              # 修法5 貼框擢升
+EXP_PSEUDO = os.environ.get("NIGHTREAD_PSEUDO", "1") == "1"        # 偽泡
+EXP_HARMONIZE = os.environ.get("NIGHTREAD_HARMONIZE", "1") == "1"  # 人頭一致化
+EXP_GUTTER = os.environ.get("NIGHTREAD_GUTTER", "1") == "1"        # 留白填深（基礎機制，消融用）
+# 守護框驅動的結構性安全策略（2026-09-08 晚；v0 全關仍 61 框違規＝基礎機制在吃出血人物/字壓臉）：
+SAFE_GUTTER = os.environ.get("NIGHTREAD_SAFE_GUTTER", "1") == "1"   # 留白只填「真頁邊帶」（深入 ≤ 短邊×比例）
+SAFE_GUTTER_DEPTH = float(os.environ.get("NIGHTREAD_GUTTER_DEPTH", "0.12"))
+SAFE_BUBBLE_RATIO = float(os.environ.get("NIGHTREAD_BUBBLE_RATIO", "3.0"))  # 泡元件面積 ≤ 字 bbox × 此；0=關
+SAFE_STICKER = os.environ.get("NIGHTREAD_SAFE_STICKER", "1") == "1"   # panel 貼紙也一律核心填色+厚墨灰暈（不整顆填）
+SAFE_GUTTER_FAT = float(os.environ.get("NIGHTREAD_GUTTER_FAT", "0"))   # >0：留白元件最大內切半徑超過此 px ＝「肥留白」
+                                                                        # （含出血人物的臉/外套），整顆不填。真格間薄帶 ≤30。
+BUBBLE_MAX_OVERRIDE = float(os.environ.get("NIGHTREAD_BUBBLE_MAX", "0"))  # >0 覆蓋 BUBBLE_COMP_MAX_FRAC
+EXP_BUBBLE = os.environ.get("NIGHTREAD_BUBBLE", "1") == "1"        # 氣泡重繪（基礎機制，消融用）
+EXP_STICKER = os.environ.get("NIGHTREAD_STICKER", "1") == "1"      # 貼紙（修法4 panel 白＋擢升，消融用）
 PAPER_NORM_MIN = 245            # 紙白峰 ≥ 此視為乾淨白紙、不動
 PAPER_PEAK_LO = 200             # 估峰值只看 ≥ 此的像素（排除調子/墨）
 PAPER_NORM_CHROMA_MAX = 8.0     # 峰值區平均彩度 ≤ 此才視為「無彩色紙」；水彩淡彩底（demo05 粉底）超過 → 不動
@@ -420,8 +435,14 @@ def build_bubble_mask(g, regions, seg, lab, stats, excluded_ids):
             if i in merged or int(i) in rejected:
                 continue
             a = int(stats[i, cv2.CC_STAT_AREA])
-            if (a > BUBBLE_COMP_MAX_FRAC * g.size or a > BUBBLE_LOCAL_K * win_area
+            max_frac = BUBBLE_MAX_OVERRIDE if BUBBLE_MAX_OVERRIDE > 0 else BUBBLE_COMP_MAX_FRAC
+            if (a > max_frac * g.size or a > BUBBLE_LOCAL_K * win_area
                     or i in excluded_ids):
+                rejected.add(int(i))
+                continue
+            # 安全策略：泡元件不得遠大於它的字（真泡字塞 30–50%＝比 2–3.5；「字壓在臉頰/手上」
+            # 的元件是整片皮膚白、比 10+）。超過 → 不當泡，字交偽泡貼身袖套。
+            if SAFE_BUBBLE_RATIO > 0 and a > SAFE_BUBBLE_RATIO * max(1, (x1 - x0) * (y1 - y0)):
                 rejected.add(int(i))
                 continue
             if a >= BUBBLE_CORE_MIN_FRAC * g.size:
@@ -628,7 +649,7 @@ def sticker_plan(g, img_bgr, lab, stats, gutter_ids, panel_ids, frameless, regio
         hug = {}
         min_area = GUTTER_MIN_AREA_FRAC * g.size
         listed = gutter_ids | panel_ids
-        for i in range(1, stats.shape[0]):
+        for i in (range(1, stats.shape[0]) if EXP_HUG else ()):
             if i in listed or stats[i, cv2.CC_STAT_AREA] < min_area:
                 continue
             x, y, w_, h_ = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
@@ -693,6 +714,10 @@ def sticker_plan(g, img_bgr, lab, stats, gutter_ids, panel_ids, frameless, regio
         audit.append(met)
         if ok:
             accept.add(i)
+            if SAFE_STICKER and not frameless:
+                # 安全策略：panel 白也走核心填色（格框種子、切窄頸、厚墨灰暈），不整顆填。
+                # 守護框歸因：貼紙單獨 12 框違規、7 是白髮＝整顆填把連進背景的髮絲白吃掉。
+                promoted.add(i)
     return accept, audit, promoted
 
 
@@ -1040,8 +1065,35 @@ def compose(g, gutter, bubble, seg, frameless, lab=None, stats=None, sticker=(),
             core_ids=(), frame=None, regions=None):
     """整頁合成：D2 畫面 →（有框頁才）留白填深 → 修法4 貼紙式背景 → 氣泡重繪。"""
     out = scene_final(g, seg).astype(np.float32)
-    if not frameless:                                   # 修法2：無框頁背景不填深
+    if not EXP_GUTTER:
+        pass
+    elif not frameless and not SAFE_GUTTER:             # 修法2：無框頁背景不填深
         out = paint_gutter(out, g, gutter, frame=frame, bubble=bubble)
+    elif not frameless and gutter.any():
+        if SAFE_GUTTER_FAT > 0:
+            # 肥留白不填：每個留白元件量最大內切半徑（距離變換最大值）；真格間/頁邊薄帶 ≤ ~30px，
+            # 含出血人物臉/外套的元件是肥塊 ⇒ 整顆不填（all-or-nothing，避免只填一圈黑邊仍毀臉）。
+            n_, lb_, st_, _ = cv2.connectedComponentsWithStats(gutter.astype(np.uint8), 8)
+            dt = cv2.distanceTransform(gutter.astype(np.uint8), cv2.DIST_L2, 5)
+            keep = np.zeros_like(gutter)
+            for i in range(1, n_):
+                m = lb_ == i
+                if dt[m].max() <= SAFE_GUTTER_FAT:
+                    keep |= m
+            gutter = keep
+        # 安全策略：留白元件「深入格內」的部分不填。出血特寫的臉/白衣與頁白同元件、只有細線稿、
+        # 沒有墨團可觸發灰暈（demo01 臉頰 98% 黑、ch34_015 肩、demo02 貼頁緣的臉皆此型）。
+        # 頁邊帶（距頁邊/格線 ≤ 短邊×SAFE_GUTTER_DEPTH）照填；更深處留灰＝失敗方向安全。
+        H2, W2 = g.shape
+        yy, xx = np.mgrid[0:H2, 0:W2]
+        bd = np.minimum(np.minimum(yy, H2 - 1 - yy), np.minimum(xx, W2 - 1 - xx)).astype(np.float32)
+        if frame is not None and frame.any():
+            fd = cv2.distanceTransform((frame == 0).astype(np.uint8), cv2.DIST_L2, 3)
+            bd = np.minimum(bd, fd)
+        lim = SAFE_GUTTER_DEPTH * min(H2, W2)
+        band = gutter & (bd <= lim)
+        if band.any():
+            out = paint_gutter(out, g, band, frame=frame, bubble=bubble)
     elif gutter.any():
         # 無框頁只填「真頁邊帶」：留白元件深入頁內的最大距離 ≤ 短邊×FRAMELESS_MARGIN_DEPTH 才是
         # 貼邊薄帶（開放背景會深入頁心、不符）；仍套人物灰暈（出血人物碰邊的保護）。
@@ -1057,18 +1109,19 @@ def compose(g, gutter, bubble, seg, frameless, lab=None, stats=None, sticker=(),
                 keep |= m
         if keep.any():
             out = paint_gutter(out, g, keep, frame=frame if frame is not None else np.zeros_like(gutter, np.uint8), bubble=bubble)
-    if sticker:                                         # 修法4：純白背景填黑＋前景白描邊
+    if sticker and EXP_STICKER:                         # 修法4：純白背景填黑＋前景白描邊
         out = paint_sticker(out, g, lab, stats, sticker, bubble,
                             core_ids=core_ids, frame=frame)
-    out = paint_bubbles(out, g, bubble, seg)
-    if regions is not None:                             # 偽泡：開口泡/字壓背景/字壓留白救回
+    if EXP_BUBBLE:
+        out = paint_bubbles(out, g, bubble, seg)
+    if regions is not None and EXP_PSEUDO:              # 偽泡：開口泡/字壓背景/字壓留白救回
         pb = build_pseudo_bubbles(g, regions, bubble)
         if pb.any():
             out = paint_bubbles(out, g, pb, seg)
         skip = bubble | pb | gutter
     else:
         skip = bubble | gutter
-    if lab is not None:                                 # 批1.5：浮在黑裡的空白人頭一致化
+    if lab is not None and EXP_HARMONIZE:               # 批1.5：浮在黑裡的空白人頭一致化
         out = harmonize_enclosed_whites(out, g, lab, stats, skip)
     return np.clip(out, 0, 255).astype(np.uint8)
 
