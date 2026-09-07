@@ -87,6 +87,11 @@ GUTTER_MIN_AREA_FRAC = 0.0006   # 留白元件最小面積（整頁佔比）
 # 修法1：氣泡白元件上限
 BUBBLE_COMP_MAX_FRAC = 0.07     # 元件整頁佔比上限（6–8% 帶，取中偏上）
 BUBBLE_LOCAL_K = 4.0            # 元件面積 ≤ K × 文字搜尋窗面積（局部性）
+BUBBLE_CORE_MIN_FRAC = 0.003    # ≥ 此頁面佔比的泡元件走「文字種子核心填色」（小緊泡整顆填、不切）
+BUBBLE_NECK_R = 8               # 泡的切頸半徑：泡框缺口漏進背景（ch34_011 圓泡右側漏出）、字寫在背景上
+                                # 的白連進臉的下巴縫（demo01 主角）都是窄頸；真泡內部寬闊、行間白 ≥13px 不受影響。
+                                # ★形狀門（實心度）已實測不可用：真泡的白被字切成凹形、填洞後 demo01 臉塊 0.72
+                                # 落在真泡分佈正中；「貼厚墨」也不可用（粗體字筆畫本身就 ≥6px）。幾何切頸是唯一解。
 # 修法2：頁型判別（長直格框線，px/千像素）
 FRAME_LINE_L_DIV = 5            # 線長 = min(W,H)//DIV（至少 60px）
 FRAME_DARK_TH = 100             # 「框線暗」灰階上限
@@ -140,10 +145,15 @@ FAINT_OF_F_MAX = 0.62           # F 像素中淡色(>FAINT_G)佔比上限：群�
 FAINT_G = 160
 # 偽泡（開口氣泡/字壓背景救回）：
 PB_COV_MAX = 0.85               # 氣泡遮罩蓋率低於此的 text region 才啟動偽泡
-PB_NECK_R = 7                   # 偽泡切頸（擋下巴縫/泡尾缺口；泡內行間白不受影響）
-PB_GROW_FRAC = 0.35             # 生長距離上限＝max(text bbox 邊) × 此值
-                                # ⚠️ 0.60 時 ch34_010 左下開口泡長進相連的外套白、把手塗黑（真凶
-                                # 是偽泡非貼紙——驗屍 2026-08-26）；收緊後 demo02 大字框仍蓋滿
+PB_NECK_R = 10                  # 偽泡切頸（擋下巴縫/泡尾缺口；泡內行間白不受影響）
+PB_GROW_FRAC = 0.60             # 生長距離上限＝**min**(text bbox 邊) × 此值
+                                # ⚠️ 用長邊時：直排長字串（60×500）可長 175px，穿過下巴縫流進臉白——
+                                #   demo01 主角下半臉、demo05 小臉、ch34_011 學生臉全被塗黑（2026-09-08
+                                #   審查員抓到，我三輪目檢都漏）。改短邊：直排字只長 36px＝貼身袖套；
+                                #   demo02 橫向大字框（600×150）長 90px 仍蓋到框邊。
+PB_AURA_R = 12                  # 偽泡的人物灰暈：距「厚墨塊」此距離內不填（髮團/臉部深色特徵是厚的，
+PB_AURA_THICK = 6               #   字框/氣泡輪廓是細筆畫≤4px、不算）——第二道保險
+PB_AURA_MIN_AREA = 800
 # 批1.5（2026-08-26 使用者兩案）：
 # 手/外套漏填（ch34_010 左下案）：測地/直線比——背景從格框「直直就到」（比≈1）、
 # 衣料/皮膚要繞過人物墨線障礙才到（比高）。人物殼 closing 版已證蓋不住寬開衣料白、廢棄。
@@ -407,14 +417,31 @@ def build_bubble_mask(g, regions, seg, lab, stats, excluded_ids):
         lab_c = lab[cy0:cy1, cx0:cx1]
         touch = np.unique(lab_c[(seg_dil[cy0:cy1, cx0:cx1] > 0) & (lab_c > 0)])
         for i in touch:
-            if i in merged:
+            if i in merged or int(i) in rejected:
                 continue
             a = int(stats[i, cv2.CC_STAT_AREA])
             if (a > BUBBLE_COMP_MAX_FRAC * g.size or a > BUBBLE_LOCAL_K * win_area
                     or i in excluded_ids):
                 rejected.add(int(i))
                 continue
-            bubble |= lab == i
+            if a >= BUBBLE_CORE_MIN_FRAC * g.size:
+                # 文字種子核心填色（2026-09-08，審查員抓到 demo01 主角臉被當泡填黑後）：不整顆併入，
+                # 從「字 bbox 內的白」出發、開運算切窄頸、只留與字連通的寬闊區、再測地回收貼線稿。
+                # 泡框缺口漏出的背景（窄頸）與經下巴縫連進來的臉白被切掉；真泡內部照填。
+                bx, by, bw, bh = stats[i, :4]
+                comp = lab[by:by + bh, bx:bx + bw] == i
+                seed = np.zeros_like(comp)
+                sx0, sy0 = max(0, x0 - bx), max(0, y0 - by)
+                sx1, sy1 = min(bw, x1 - bx), min(bh, y1 - by)
+                if sx1 > sx0 and sy1 > sy0:
+                    seed[sy0:sy1, sx0:sx1] = True
+                core = broad_core_fill(comp, seed & comp, neck_r=BUBBLE_NECK_R, recover_r=BUBBLE_NECK_R)
+                if not core.any():
+                    rejected.add(int(i))
+                    continue
+                bubble[by:by + bh, bx:bx + bw] |= core
+            else:
+                bubble |= lab == i
             merged.add(int(i))
         bubble[y0:y1, x0:x1] |= seg[y0:y1, x0:x1]       # 區內筆畫本身一定算氣泡內容
     return bubble, merged, rejected
@@ -657,11 +684,35 @@ def sticker_plan(g, img_bgr, lab, stats, gutter_ids, panel_ids, frameless, regio
             if ok and EXP_PANEL_CORE and not eaten_mid_ok and not frameless and i in panel_ids:
                 # E1：中段 eaten 的 panel 白改走核心填色（格框種子、切窄頸）+ 區域級保護，不整顆拒
                 promoted.add(i)
+            if ok and i in hug:
+                # 弱貼框（0.25–0.40）擢升元件過原門後也走核心填色——當初只給強貼框，弱貼框整顆填，
+                # demo01 主角臉（hug 0.327、textOn 0.289 走 eaten 逃生門放行）就是這樣被塗黑的。
+                # 擢升元件一律核心填色：它們本來就是「不與留白連通、只靠貼框證據」的不確定背景。
+                promoted.add(i)
         met["accept"] = bool(ok)
         audit.append(met)
         if ok:
             accept.add(i)
     return accept, audit, promoted
+
+
+def thick_ink_aura(g, r=PB_AURA_R, thick=PB_AURA_THICK, min_area=PB_AURA_MIN_AREA):
+    """厚墨灰暈遮罩：髮團/臉部深色特徵這類「厚」墨塊（距離變換最大值 ≥ thick、面積 ≥ min_area）
+    周圍 r px。字框/氣泡輪廓/格線是細筆畫、不算厚墨。偽泡與貼紙核心填色共用＝臉旁的白不准填。"""
+    ink = (g < WHITE_TH).astype(np.uint8)
+    dt = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
+    n_i, lb_i, st_i, _ = cv2.connectedComponentsWithStats(ink, 8)
+    thick_ids = np.zeros(n_i, bool)
+    for i in range(1, n_i):
+        if st_i[i, cv2.CC_STAT_AREA] >= min_area:
+            x, y, w2, h2 = st_i[i, :4]
+            if dt[y:y + h2, x:x + w2][lb_i[y:y + h2, x:x + w2] == i].max() >= thick:
+                thick_ids[i] = True
+    thick_m = thick_ids[lb_i]
+    if not thick_m.any():
+        return np.zeros_like(thick_m)
+    ka = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1,) * 2)
+    return cv2.dilate(thick_m.astype(np.uint8), ka) > 0
 
 
 def geodesic_grow(seed, within, iters, step=5):
@@ -737,6 +788,7 @@ def paint_sticker(out, g, lab, stats, accept, bubble, core_ids=(), frame=None):
                 fr8 = (~fr).astype(np.uint8)
                 euc = cv2.distanceTransform(fr8, cv2.DIST_L2, 3)
                 fill = fill & (geo <= GEO_RATIO_MAX * euc + GEO_SLACK)
+                fill = fill & ~thick_ink_aura(sub)         # 臉旁（髮團/深色特徵周圍）的白不填
             if not fill.any():
                 continue
         else:
@@ -919,6 +971,9 @@ def build_pseudo_bubbles(g, regions, bubble):
     ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * PB_NECK_R + 1,) * 2)
     w_cut = cv2.morphologyEx(white.astype(np.uint8), cv2.MORPH_OPEN, ko)
     w_cut = geodesic_grow(w_cut > 0, white, PB_NECK_R, step=3)   # 回收切掉的邊緣
+    # 厚墨灰暈：髮團/臉部深色特徵這類「厚」墨塊周圍 PB_AURA_R 內的白不准偽泡長進去；
+    # 字框/氣泡輪廓是細筆畫（距離變換最大值 < PB_AURA_THICK）、不算厚墨 ⇒ 開口泡仍可填到框邊。
+    w_cut &= ~thick_ink_aura(g)
     pb = np.zeros((H, W_), bool)
     for r_ in regions:
         x0, y0, x1, y1 = r_["bbox"]
@@ -929,7 +984,7 @@ def build_pseudo_bubbles(g, regions, bubble):
         win = bubble[y0:y1, x0:x1]
         if win.size == 0 or win.mean() >= PB_COV_MAX:
             continue
-        cap = int(PB_GROW_FRAC * max(x1 - x0, y1 - y0))
+        cap = int(PB_GROW_FRAC * min(x1 - x0, y1 - y0))
         pad = cap + PB_NECK_R + 2
         wx0, wy0 = max(0, x0 - pad), max(0, y0 - pad)
         wx1, wy1 = min(W_, x1 + pad), min(H, y1 + pad)
@@ -970,7 +1025,8 @@ def harmonize_enclosed_whites(out, g, lab, stats, skip_mask):
         cu = isl.astype(np.uint8)
         collar = (cv2.dilate(cu, kc) > 0) & ~isl
         gw = g[y0:y1, x0:x1]
-        fine = (gw < 200) & (gw > 40)          # 細墨（鬍鬚/髮絲調子；排除純黑實塊）
+        fine = (gw < 200)                       # 墨（含純黑筆畫：排線間隙的白會被當亮島填黑成斑馬紋——
+                                                #   ch34_010 後腦排線案；排除純黑反而放行了它）
         if collar.any() and float(fine[collar].mean()) > HARMONIZE_COLLAR_INK:
             continue
         o = out[y0:y1, x0:x1]
