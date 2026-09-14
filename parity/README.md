@@ -103,22 +103,9 @@ Speed claims (e.g. "~3.6× on ARM") are **device numbers and cannot be verified 
 - `seg_validate.py` — inspect the detector's `seg` stroke mask at thresholds.
 - `emit_grouping_fixture.py` — generate the Kotlin grouping test fixture (see below).
 
-**Night-read rebuild (dark-mode prototype)**
-- `nightread.py <page> [-o dir]` — single page end-to-end: DBNet detection → three-zone masks
-  (bubbles / gutters / scene) → composed dark reading page. Design red lines (scene is never
-  inverted; bubbles = dark fill + bright text), tunable constants and the three fixes
-  (bubble component area cap / frameless-page downgrade / panel-aware gutters) are all in the
-  file header. Outputs to `out/nightread/`: `<name>_final.png` + `_cmp.png` (triptych:
-  original | result | mask viz) + per-mask PNGs / regions json.
-- `nightread_batch.py [names…]` — run a page set (default: the 11 sandbox test pages), print
-  the white-area table, write `nightread_stats.json`. Bare names like `demo01` resolve against
-  the sandbox test dir.
-- Two experiment switches, both already set to the chosen values — override only to reproduce
-  the comparisons: `NIGHTREAD_CURVE` picks the scene tone curve (`lin8` = chosen: black stays
-  black, paper white compressed to mid-grey; `d2`/`lin`/`knee` are the alternatives that lost
-  the A/B) and `NIGHTREAD_AURA` picks how gutter fill keeps clear of bleed-page figures
-  (`hard` = chosen: binary keep-out with a margin exemption; `glow` = distance-field gradient
-  that follows the contour, rejected as style-adding).
+**Night-read rebuild** — moved to its own repo, [yakuyomi-nightread](https://github.com/joyeli/yakuyomi-nightread)
+(`research/`). It still imports this directory's `export_dbnet_ncnn.py` / `mit_grouping.py` / `paths.py` for
+text detection; point its `YAKU_ENGINE_CLONE` at this checkout.
 
 ---
 
