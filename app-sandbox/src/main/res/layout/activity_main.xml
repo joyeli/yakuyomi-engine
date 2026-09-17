@@ -113,6 +113,21 @@
             android:layout_marginTop="4dp"
             android:text="偵測 + OCR 檢驗（內建 6 圖·產品設定·框/讀出/秒）" />
 
+        <!-- ===== 夜讀（上機驗證）：跑選取的圖，量化前後並排 + 分段耗時 ===== -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="──── 夜讀（跑上方選取的圖）────"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/nightReadAbButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="夜讀 A/B（未量化 vs 量化·並排 + 分段耗時）" />
+
         <Switch
             android:id="@+id/genLogSwitch"
             android:layout_width="wrap_content"

@@ -31,6 +31,12 @@ import li.joye.yakuyomi.engine.Grouping
 import li.joye.yakuyomi.engine.InpainterConfig
 import li.joye.yakuyomi.engine.Inpainter
 import li.joye.yakuyomi.engine.ModelSet
+import li.joye.yakuyomi.nightread.Gray
+import li.joye.yakuyomi.nightread.Mask
+import li.joye.yakuyomi.nightread.NightRead
+import li.joye.yakuyomi.nightread.NightReadInput
+import li.joye.yakuyomi.nightread.TextRegion as NrRegion
+import li.joye.yakuyomi.nightread.ort.CharMaskOrt
 import li.joye.yakuyomi.engine.OcrConfig
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.RenderConfig
@@ -79,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         binding.crossPageButton.setOnClickListener { runCrossPageBench() }
         binding.ocrAbButton.setOnClickListener { runOcrAb() }
         binding.detectOcrCheckButton.setOnClickListener { runDetectOcrCheck() }
+        binding.nightReadAbButton.setOnClickListener { runNightReadAb() }
         binding.inpaintSpinner.adapter = android.widget.ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item, INPAINT_MODES,
         )
@@ -665,6 +672,221 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 夜讀 A/B：對選取的每一張圖跑兩套模型配方，把結果並排、分段耗時印在同一張大圖上。
+     *
+     * 量化的差異多半是局部的（某塊背景填了沒填、某顆泡破沒破），分開看截圖比不出來，所以並排。
+     * 兩套配方的差別**只在模型精度**：偵測的前後處理都走 `Detector` 的 companion，換的只有前向那一步。
+     *
+     *   fp16 + fp32   NCNN 偵測（.param/.bin）+ manga_seg_s.onnx
+     *   int8 + int8   ONNX 偵測（*dbnet*int8*.onnx）+ manga_seg_s_int8.onnx
+     *
+     * `cartoonseg.onnx` 兩套共用、可不放：少它會多幾框違規，但兩邊條件一致仍比得出量化的影響。
+     * 每張圖跑兩次取第二次——第一次吃到的是模型冷啟，不是推論。
+     */
+    private fun runNightReadAb() {
+        binding.nightReadAbButton.isEnabled = false
+        val picked = selected.sorted().mapNotNull { TEST_IMAGES.getOrNull(it) }
+        lifecycleScope.launch(Dispatchers.Default) {
+            clearOutputs()
+            try {
+                val tree = currentTree() ?: run { log("✗ 請先按「選擇模型資料夾」"); return@launch }
+                if (picked.isEmpty()) { log("✗ 請先在上方選至少一張圖"); return@launch }
+
+                val detNcnn = resolveDetectorPath(tree)
+                val detOnnx = findFile(tree, "dbnet", ".onnx")?.let { ensureLocal(it) }
+                val yolo32 = findFile(tree, "manga_seg", ".onnx")
+                    ?.takeIf { (it.name ?: "").lowercase().contains("int8").not() }?.let { ensureLocal(it) }
+                val yolo8 = tree.listFiles().firstOrNull {
+                    val n = (it.name ?: "").lowercase()
+                    n.contains("manga_seg") && n.contains("int8") && n.endsWith(".onnx")
+                }?.let { ensureLocal(it) }
+                val cseg = tree.listFiles().firstOrNull {
+                    val n = (it.name ?: "").lowercase()
+                    n.contains("cartoonseg") && !n.contains("int8") && n.endsWith(".onnx")
+                }?.let { ensureLocal(it) }
+
+                log("模型：dbnet.param=${detNcnn != null} dbnet.onnx=${detOnnx != null} " +
+                    "manga_seg=${yolo32 != null} manga_seg_int8=${yolo8 != null} cartoonseg=${cseg != null}")
+                if (detNcnn == null || detOnnx == null || yolo32 == null || yolo8 == null) {
+                    log("✗ 模型不齊：需要 dbnet 的 .param/.bin 與 *dbnet*.onnx（int8），"); log("  外加 manga_seg_s.onnx 與 manga_seg_s_int8.onnx")
+                    return@launch
+                }
+
+                val recipes = listOf(
+                    Triple("fp16 + fp32", detNcnn to null as String?, yolo32),
+                    Triple("int8 + int8", null as String? to detOnnx, yolo8),
+                )
+                val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
+                val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
+
+                for ((label, det, yolo) in recipes) {
+                    log("▶ $label 載入模型…")
+                    val detector = det.first?.let { Detector(it) }
+                    val detOrt = det.second?.let { DbnetOrtSandbox(it) }
+                    CharMaskOrt(yolo, cseg).use { masker ->
+                        for ((name, bmp) in pages) {
+                            repeat(2) { pass ->
+                                val t = LongArray(3)
+                                val out = nightReadOnce(bmp, detector, detOrt, masker, t)
+                                if (pass == 1) {
+                                    results.getOrPut(label) { mutableListOf() }.add(Triple(name, out, t))
+                                    log("  $name  detect ${t[0]}ms  mask ${t[1]}ms  render ${t[2]}ms  " +
+                                        "total ${t.sum()}ms")
+                                } else {
+                                    out.recycle()
+                                }
+                            }
+                        }
+                    }
+                    detector?.close()
+                    detOrt?.close()
+                }
+
+                val sheet = composeNightReadSheet(pages, recipes.map { it.first }, results)
+                val name = "nightread_ab_${stamp()}.png"
+                saveNamed(tree, name, sheet)
+                addImage("夜讀 A/B", sheet)
+                log("→ 已存 $name 到所選資料夾")
+            } catch (e: Throwable) {
+                log("✗ ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                withContext(Dispatchers.Main) { binding.nightReadAbButton.isEnabled = true }
+            }
+        }
+    }
+
+    /** 跑一次夜讀，把三段耗時寫進 [t]（detect / mask / render）。 */
+    private fun nightReadOnce(
+        page: Bitmap,
+        detector: Detector?,
+        detOrt: DbnetOrtSandbox?,
+        masker: CharMaskOrt,
+        t: LongArray,
+    ): Bitmap {
+        val w = page.width
+        val h = page.height
+        val px = IntArray(w * h)
+        page.getPixels(px, 0, w, 0, 0, w, h)
+
+        var ts = System.currentTimeMillis()
+        val detection = detector?.detect(page) ?: detOrt!!.detect(page)
+        val regions = Grouping.group(detection.lines).map {
+            NrRegion(
+                it.x0.toInt().coerceIn(0, w), it.y0.toInt().coerceIn(0, h),
+                it.x1.toInt().coerceIn(0, w), it.y1.toInt().coerceIn(0, h),
+            )
+        }
+        val seg = bitmapToNrMask(detection.textMask, w, h)
+        detection.textMask.recycle()
+        t[0] = System.currentTimeMillis() - ts
+
+        ts = System.currentTimeMillis()
+        val chars = masker.detect(px, w, h)
+        t[1] = System.currentTimeMillis() - ts
+
+        ts = System.currentTimeMillis()
+        val gray = Gray(w, h)
+        val chroma = Gray(w, h)
+        for (i in px.indices) {
+            val p = px[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            // BT.601，與 cv2.imread(IMREAD_GRAYSCALE) 同式：管線所有門檻都在這個灰階空間量的
+            gray.data[i] = ((r * 299 + g * 587 + b * 114 + 500) / 1000).coerceIn(0, 255)
+            chroma.data[i] = maxOf(r, g, b) - minOf(r, g, b)
+        }
+        val res = NightRead.render(NightReadInput(gray, seg, regions, chars, chroma))
+        t[2] = System.currentTimeMillis() - ts
+
+        val outPx = IntArray(w * h)
+        for (i in outPx.indices) {
+            val v = res.out.data[i]
+            outPx[i] = Color.rgb(v, v, v)
+        }
+        return Bitmap.createBitmap(outPx, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun bitmapToNrMask(bmp: Bitmap, w: Int, h: Int): Mask {
+        val m = Mask(w, h)
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        if (bmp.width == w && bmp.height == h) {
+            for (i in px.indices) m.data[i] = (px[i] and 0xFF) > 127
+        } else {
+            // 筆畫遮罩可能是半解析度，最近鄰放大回原尺寸
+            val sx = bmp.width.toDouble() / w
+            val sy = bmp.height.toDouble() / h
+            for (y in 0 until h) {
+                val my = minOf(bmp.height - 1, (y * sy).toInt())
+                for (x in 0 until w) {
+                    val mx = minOf(bmp.width - 1, (x * sx).toInt())
+                    m.data[y * w + x] = (px[my * bmp.width + mx] and 0xFF) > 127
+                }
+            }
+        }
+        return m
+    }
+
+    /** 合成 A/B 大圖：頂部裝置與耗時，其下每列一張圖（原圖｜各配方）。 */
+    private fun composeNightReadSheet(
+        pages: List<Pair<String, Bitmap>>,
+        labels: List<String>,
+        results: Map<String, List<Triple<String, Bitmap, LongArray>>>,
+    ): Bitmap {
+        val colW = 520
+        val gap = 10
+        val headerH = 70 + 26 * (labels.size * pages.size + labels.size + 1)
+        val cols = 1 + labels.size
+        val rowH = pages.map { (_, b) -> (colW.toFloat() / b.width * b.height).toInt() + 24 }
+        val sheet = Bitmap.createBitmap(
+            cols * colW + (cols + 1) * gap,
+            headerH + rowH.sum() + (rowH.size + 1) * gap,
+            Bitmap.Config.ARGB_8888,
+        )
+        val c = Canvas(sheet)
+        c.drawColor(Color.rgb(18, 18, 18))
+        fun paint(size: Float, colour: Int) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = size; color = colour; typeface = Typeface.MONOSPACE
+        }
+        var y = 34f
+        c.drawText("Night reading — quantisation A/B", gap.toFloat(), y, paint(24f, Color.WHITE))
+        y += 24
+        c.drawText(
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE}",
+            gap.toFloat(), y, paint(16f, Color.rgb(140, 140, 140)),
+        )
+        y += 26
+        for (label in labels) {
+            c.drawText(label, gap.toFloat(), y, paint(18f, Color.rgb(210, 210, 210)))
+            y += 22
+            for ((name, _, t) in results[label].orEmpty()) {
+                c.drawText(
+                    "    ${name.padEnd(18)} detect ${t[0]}ms  mask ${t[1]}ms  render ${t[2]}ms  total ${t.sum()}ms",
+                    gap.toFloat(), y, paint(16f, Color.rgb(190, 210, 235)),
+                )
+                y += 20
+            }
+        }
+        var top = headerH.toFloat()
+        pages.forEachIndexed { i, (name, src) ->
+            val imgs = listOf(src) + labels.map { l -> results[l].orEmpty().first { it.first == name }.second }
+            val names = listOf("original") + labels
+            names.forEachIndexed { col, l ->
+                val x = gap + col * (colW + gap)
+                c.drawText("$l · $name", x + 2f, top + 16, paint(15f, Color.rgb(140, 140, 140)))
+                c.drawBitmap(
+                    imgs[col], null,
+                    android.graphics.Rect(x, (top + 24).toInt(), x + colW, (top + rowH[i]).toInt()),
+                    Paint(Paint.FILTER_BITMAP_FLAG),
+                )
+            }
+            top += rowH[i] + gap
+        }
+        return sheet
+    }
+
     /** 用指定檔名存 PNG 到資料夾（覆蓋同名）。 */
     private fun saveNamed(tree: DocumentFile, name: String, bmp: Bitmap) {
         runCatching {
@@ -1124,6 +1346,12 @@ class MainActivity : AppCompatActivity() {
             //     （はないのかね→「居然有」、貴族でもなく→「就算是貴族」）＋多行密集小字。
             //     用途：改 OCR 前處理（如 bicubic warp）前後跑診斷對照、驗證「意思相反」是否救回。
             "test/demo06.jpg", // 6
+            // 7–9 = 夜讀用的代表頁：有框黑白 / 多泡 / 無框彩頁
+            "test/ch34_011.jpg", // 7
+            "test/ch34_014.jpg", // 8
+            // 10 = **已經貼好譯文的成品頁**：夜讀在產品上處理的一律是翻譯完成後的頁，
+            //      譯文是純色黑字，墨度與邊緣都跟手寫原文不同，量測要帶著它。
+            "test/translated.webp", // 9
         )
         private const val ALPHABET = "models/alphabet-all-v5.txt"
         private const val FONT = "fonts/NotoSansMonoCJK.ttc"

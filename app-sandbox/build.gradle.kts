@@ -81,6 +81,8 @@ kotlin {
 
 dependencies {
     implementation(project(":engine"))
+    // 夜讀：上機驗證用。含 :nightread 核心（純 Kotlin）與 :nightread-ort（人物遮罩推論）。
+    implementation("li.joye.yakuyomi:nightread-ort:0.1.0")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.lifecycle.runtime.ktx)

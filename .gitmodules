@@ -1,0 +1,3 @@
+[submodule "yakuyomi-nightread"]
+	path = yakuyomi-nightread
+	url = https://github.com/joyeli/yakuyomi-nightread.git
