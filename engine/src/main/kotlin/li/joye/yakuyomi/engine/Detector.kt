@@ -58,11 +58,11 @@ class Detector(
         val prob = FloatArray(area)
         for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
         val lines = linesFromProbMap(
-            prob, inW, inH, pre.ratio, page.width, page.height,
+            cfg, prob, inW, inH, pre.ratio, page.width, page.height,
             cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
         )
         // mask（已 sigmoid）→ 原圖尺寸筆畫遮罩。mask 空間 ratio = pre.ratio × mw/inW（半解析=ratio/2、全解析=ratio，動態）。
-        val textMask = segToMask(mask, mw, mh, pre.ratio * mw.toFloat() / inW, page.width, page.height)
+        val textMask = segToMask(cfg, mask, mw, mh, pre.ratio * mw.toFloat() / inW, page.width, page.height)
         Log.i(TAG, "DBNet 偵測到 ${lines.size} 行（in ${inW}x$inH mask ${mw}x$mh）")
         return Detection(lines, textMask)
     }
@@ -87,119 +87,6 @@ class Detector(
      * 故有效區＝seg[0:nh, 0:nw]（nw=round(origW*ratio)、nh=round(origH*ratio)）→ 縮回原圖 → 門檻。
      * 對齊 parity/seg_validate.py（裁 pad → cv2.resize 雙線性 → >segThreshold）。
      */
-    private fun segToMask(
-        s: FloatArray,
-        srcW: Int,
-        srcH: Int,
-        ratio: Float,
-        origW: Int,
-        origH: Int,
-    ): Bitmap {
-        val nw = (origW * ratio).roundToInt().coerceIn(1, srcW)
-        val nh = (origH * ratio).roundToInt().coerceIn(1, srcH)
-        // 有效區轉灰階小圖
-        val gray = IntArray(nw * nh)
-        for (y in 0 until nh) {
-            val srow = y * srcW
-            val drow = y * nw
-            for (x in 0 until nw) {
-                val v = (s[srow + x] * 255f).toInt().coerceIn(0, 255)
-                gray[drow + x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
-            }
-        }
-        val small = Bitmap.createBitmap(gray, nw, nh, Bitmap.Config.ARGB_8888)
-        val scaled = Bitmap.createScaledBitmap(small, origW, origH, true) // 雙線性，比照 cv2.resize
-        // ★ createScaledBitmap 在「目標尺寸＝來源尺寸」時回傳同一物件（scaled === small）→ 不可先 recycle small，
-        //   否則等於把 scaled 也 recycle 掉、下面 getPixels 會崩（"getPixels on a recycled bitmap"）。
-        //   觸發條件：頁尺寸使 r=min(size/h,size/w)=1.0（如 720×1024、size=1024）→ nw,nh==origW,origH。
-        //   故：先 getPixels，再「只在 scaled 為不同物件時」recycle 它，最後一律 recycle small。
-        val th = (cfg.segThreshold * 255f).toInt()
-        val px = IntArray(origW * origH)
-        scaled.getPixels(px, 0, origW, 0, 0, origW, origH)
-        if (scaled !== small) scaled.recycle()
-        small.recycle()
-        for (i in px.indices) px[i] = if ((px[i] and 0xFF) > th) MASK_ON else MASK_OFF
-        return Bitmap.createBitmap(px, origW, origH, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun linesFromProbMap(
-        prob: FloatArray,
-        gridW: Int,
-        gridH: Int,
-        ratio: Float,
-        origW: Int,
-        origH: Int,
-        binThresh: Float,
-        scoreThresh: Float,
-        unclip: Float,
-    ): List<TextLine> {
-        val thresh = binThresh
-        val visited = BooleanArray(prob.size)
-        val stack = IntArray(prob.size)
-        val out = ArrayList<TextLine>()
-        val boundary = ArrayList<Pt>()
-
-        for (seed in prob.indices) {
-            if (visited[seed] || prob[seed] <= thresh) continue
-
-            var sp = 0
-            stack[sp++] = seed
-            visited[seed] = true
-            boundary.clear()
-            var sum = 0f
-            var cnt = 0
-
-            while (sp > 0) {
-                val idx = stack[--sp]
-                val x = idx % gridW
-                val y = idx / gridW
-                sum += prob[idx]
-                cnt++
-                var isBoundary = false
-
-                var dy = -1
-                while (dy <= 1) {
-                    var dx = -1
-                    while (dx <= 1) {
-                        if (dx != 0 || dy != 0) {
-                            val nx = x + dx
-                            val ny = y + dy
-                            if (nx in 0 until gridW && ny in 0 until gridH) {
-                                val nidx = ny * gridW + nx
-                                if (prob[nidx] > thresh) {
-                                    if (!visited[nidx]) {
-                                        visited[nidx] = true
-                                        stack[sp++] = nidx
-                                    }
-                                } else if (dx == 0 || dy == 0) {
-                                    isBoundary = true
-                                }
-                            } else if (dx == 0 || dy == 0) {
-                                isBoundary = true
-                            }
-                        }
-                        dx++
-                    }
-                    dy++
-                }
-                if (isBoundary) boundary.add(Pt(x.toFloat(), y.toFloat()))
-            }
-
-            val score = if (cnt > 0) sum / cnt else 0f
-            if (score < scoreThresh) continue
-            val rect = Geometry.minAreaRect(boundary) ?: continue
-            if (min(rect.w, rect.h) < cfg.minSide) continue
-
-            val quad = rect.unclip(unclip).corners().map {
-                Pt(
-                    (it.x / ratio).coerceIn(0f, origW.toFloat()),
-                    (it.y / ratio).coerceIn(0f, origH.toFloat()),
-                )
-            }
-            out.add(TextLine(quad, score))
-        }
-        return out
-    }
 
     override fun close() {
         if (ncnnHandle != 0L) {
@@ -212,8 +99,173 @@ class Detector(
         private const val TAG = "Detector"
         private const val MASK_ON = 0xFFFFFFFF.toInt()
         private const val MASK_OFF = 0xFF000000.toInt()
+
+        /**
+         * DBNet 的前處理：resize_aspect 到長邊 [size]、pad 到 256 倍數、/127.5−1。
+         *
+         * 公開出來是為了讓**替代推論後端**（例如 int8 ONNX 走 ORT）走完全相同的前處理——
+         * 前處理差一點，後面所有門檻就都歪了。
+         */
+        fun preprocess(
+            page: Bitmap,
+            size: Int = DetectorConfig().dbnetInputSize,
+            sharpen: Boolean = false,
+        ): DetectorInput {
+            val pre = ImageOps.detectorChwDbnet(page, size, sharpen)
+            return DetectorInput(pre.chw, pre.ratio, pre.w, pre.h)
+        }
+
+        /**
+         * 從前向輸出做完整後處理：DB 機率圖 → 文字行四邊形，筆畫遮罩 → 原圖尺寸 Bitmap。
+         *
+         * [db] 是模型第一個輸出的 **raw logits**（2 通道，只用 ch0，內部補 sigmoid）；
+         * [mask] 是第二個輸出（已 sigmoid），尺寸 [mw]×[mh] 可與輸入不同（半／全解析都吃）。
+         *
+         * 與 [detect] 共用同一套後處理，所以換推論後端不會換行為。
+         */
+        fun postprocess(
+            db: FloatArray,
+            mask: FloatArray,
+            mw: Int,
+            mh: Int,
+            input: DetectorInput,
+            pageW: Int,
+            pageH: Int,
+            cfg: DetectorConfig = DetectorConfig(),
+        ): Detection {
+            val area = input.w * input.h
+            val prob = FloatArray(area)
+            for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
+            val lines = linesFromProbMap(
+                cfg, prob, input.w, input.h, input.ratio, pageW, pageH,
+                cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
+            )
+            val textMask = segToMask(
+                cfg, mask, mw, mh, input.ratio * mw.toFloat() / input.w, pageW, pageH,
+            )
+            return Detection(lines, textMask)
+        }
+
+        private fun segToMask(
+                cfg: DetectorConfig,
+            s: FloatArray,
+            srcW: Int,
+            srcH: Int,
+            ratio: Float,
+            origW: Int,
+            origH: Int,
+        ): Bitmap {
+            val nw = (origW * ratio).roundToInt().coerceIn(1, srcW)
+            val nh = (origH * ratio).roundToInt().coerceIn(1, srcH)
+            // 有效區轉灰階小圖
+            val gray = IntArray(nw * nh)
+            for (y in 0 until nh) {
+                val srow = y * srcW
+                val drow = y * nw
+                for (x in 0 until nw) {
+                    val v = (s[srow + x] * 255f).toInt().coerceIn(0, 255)
+                    gray[drow + x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+                }
+            }
+            val small = Bitmap.createBitmap(gray, nw, nh, Bitmap.Config.ARGB_8888)
+            val scaled = Bitmap.createScaledBitmap(small, origW, origH, true) // 雙線性，比照 cv2.resize
+            // ★ createScaledBitmap 在「目標尺寸＝來源尺寸」時回傳同一物件（scaled === small）→ 不可先 recycle small，
+            //   否則等於把 scaled 也 recycle 掉、下面 getPixels 會崩（"getPixels on a recycled bitmap"）。
+            //   觸發條件：頁尺寸使 r=min(size/h,size/w)=1.0（如 720×1024、size=1024）→ nw,nh==origW,origH。
+            //   故：先 getPixels，再「只在 scaled 為不同物件時」recycle 它，最後一律 recycle small。
+            val th = (cfg.segThreshold * 255f).toInt()
+            val px = IntArray(origW * origH)
+            scaled.getPixels(px, 0, origW, 0, 0, origW, origH)
+            if (scaled !== small) scaled.recycle()
+            small.recycle()
+            for (i in px.indices) px[i] = if ((px[i] and 0xFF) > th) MASK_ON else MASK_OFF
+            return Bitmap.createBitmap(px, origW, origH, Bitmap.Config.ARGB_8888)
+        }
+
+        private fun linesFromProbMap(
+                cfg: DetectorConfig,
+            prob: FloatArray,
+            gridW: Int,
+            gridH: Int,
+            ratio: Float,
+            origW: Int,
+            origH: Int,
+            binThresh: Float,
+            scoreThresh: Float,
+            unclip: Float,
+        ): List<TextLine> {
+            val thresh = binThresh
+            val visited = BooleanArray(prob.size)
+            val stack = IntArray(prob.size)
+            val out = ArrayList<TextLine>()
+            val boundary = ArrayList<Pt>()
+
+            for (seed in prob.indices) {
+                if (visited[seed] || prob[seed] <= thresh) continue
+
+                var sp = 0
+                stack[sp++] = seed
+                visited[seed] = true
+                boundary.clear()
+                var sum = 0f
+                var cnt = 0
+
+                while (sp > 0) {
+                    val idx = stack[--sp]
+                    val x = idx % gridW
+                    val y = idx / gridW
+                    sum += prob[idx]
+                    cnt++
+                    var isBoundary = false
+
+                    var dy = -1
+                    while (dy <= 1) {
+                        var dx = -1
+                        while (dx <= 1) {
+                            if (dx != 0 || dy != 0) {
+                                val nx = x + dx
+                                val ny = y + dy
+                                if (nx in 0 until gridW && ny in 0 until gridH) {
+                                    val nidx = ny * gridW + nx
+                                    if (prob[nidx] > thresh) {
+                                        if (!visited[nidx]) {
+                                            visited[nidx] = true
+                                            stack[sp++] = nidx
+                                        }
+                                    } else if (dx == 0 || dy == 0) {
+                                        isBoundary = true
+                                    }
+                                } else if (dx == 0 || dy == 0) {
+                                    isBoundary = true
+                                }
+                            }
+                            dx++
+                        }
+                        dy++
+                    }
+                    if (isBoundary) boundary.add(Pt(x.toFloat(), y.toFloat()))
+                }
+
+                val score = if (cnt > 0) sum / cnt else 0f
+                if (score < scoreThresh) continue
+                val rect = Geometry.minAreaRect(boundary) ?: continue
+                if (min(rect.w, rect.h) < cfg.minSide) continue
+
+                val quad = rect.unclip(unclip).corners().map {
+                    Pt(
+                        (it.x / ratio).coerceIn(0f, origW.toFloat()),
+                        (it.y / ratio).coerceIn(0f, origH.toFloat()),
+                    )
+                }
+                out.add(TextLine(quad, score))
+            }
+            return out
+        }
     }
 }
 
 /** 偵測結果：文字行 ＋ 原圖尺寸的細筆畫文字遮罩（去字用，§去字升級）。 */
+/** DBNet 的前處理結果，給 [Detector.postprocess] 與替代推論後端用。 */
+class DetectorInput(val chw: FloatArray, val ratio: Float, val w: Int, val h: Int)
+
 class Detection(val lines: List<TextLine>, val textMask: Bitmap)
