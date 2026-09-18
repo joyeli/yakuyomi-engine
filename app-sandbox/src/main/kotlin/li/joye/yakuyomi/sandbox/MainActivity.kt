@@ -673,16 +673,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 夜讀 A/B：對選取的每一張圖跑兩套模型配方，把結果並排、分段耗時印在同一張大圖上。
+     * 夜讀上機測試：對選取的每一張圖跑**定案配方**，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 量化的差異多半是局部的（某塊背景填了沒填、某顆泡破沒破），分開看截圖比不出來，所以並排。
-     * 兩套配方的差別**只在模型精度**：偵測的前後處理都走 `Detector` 的 companion，換的只有前向那一步。
+     * 定案配方＝NCNN 偵測（fp16）＋ cseg fp32 ∪ yoloseg **int8**，理由（2026-09-18 真機量完）：
+     *   · 偵測不量化：int8 在這顆晶片上比 NCNN fp16 **慢 55%**（桌面快 1.78× 的結論不成立）
+     *   · yoloseg 量化：38.9 → 10.5 MB、推論快 31%，守護框只從 18 升到 19
+     *   · cseg 不量化：int8 版要把分數門檻降到遮罩過度覆蓋，泡會被當成人物吃掉
+     *   · cseg 可以不放：省 228 MB 但守護框 18 → 27，那九框是紅線，不拿來換空間
      *
-     *   fp16 + fp32   NCNN 偵測（.param/.bin）+ manga_seg_s.onnx
-     *   int8 + int8   ONNX 偵測（*dbnet*int8*.onnx）+ manga_seg_s_int8.onnx
-     *
-     * `cartoonseg.onnx` 兩套共用、可不放：少它會多幾框違規，但兩邊條件一致仍比得出量化的影響。
-     * 每張圖跑兩次取第二次——第一次吃到的是模型冷啟，不是推論。
+     * 量化 A/B 已經跑完並定案，所以這裡只跑一套——兩套要花兩倍時間，而現在的瓶頸是重繪。
+     * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。
      */
     private fun runNightReadAb() {
         binding.nightReadAbButton.isEnabled = false
@@ -694,28 +694,26 @@ class MainActivity : AppCompatActivity() {
                 if (picked.isEmpty()) { log("✗ 請先在上方選至少一張圖"); return@launch }
 
                 val detNcnn = resolveDetectorPath(tree)
-                val detOnnx = findFile(tree, "dbnet", ".onnx")?.let { ensureLocal(it) }
-                val yolo32 = findFile(tree, "manga_seg", ".onnx")
-                    ?.takeIf { (it.name ?: "").lowercase().contains("int8").not() }?.let { ensureLocal(it) }
-                val yolo8 = tree.listFiles().firstOrNull {
+                // yoloseg 取 int8（定案），沒有就退回 fp32
+                val yolo = tree.listFiles().firstOrNull {
                     val n = (it.name ?: "").lowercase()
                     n.contains("manga_seg") && n.contains("int8") && n.endsWith(".onnx")
-                }?.let { ensureLocal(it) }
+                } ?: findFile(tree, "manga_seg", ".onnx")
+                val yoloPath = yolo?.let { ensureLocal(it) }
                 val cseg = tree.listFiles().firstOrNull {
                     val n = (it.name ?: "").lowercase()
                     n.contains("cartoonseg") && !n.contains("int8") && n.endsWith(".onnx")
                 }?.let { ensureLocal(it) }
 
-                log("模型：dbnet.param=${detNcnn != null} dbnet.onnx=${detOnnx != null} " +
-                    "manga_seg=${yolo32 != null} manga_seg_int8=${yolo8 != null} cartoonseg=${cseg != null}")
-                if (detNcnn == null || detOnnx == null || yolo32 == null || yolo8 == null) {
-                    log("✗ 模型不齊：需要 dbnet 的 .param/.bin 與 *dbnet*.onnx（int8），"); log("  外加 manga_seg_s.onnx 與 manga_seg_s_int8.onnx")
+                log("模型：dbnet.param=${detNcnn != null} yoloseg=${yolo?.name} cartoonseg=${cseg != null}")
+                if (detNcnn == null || yoloPath == null) {
+                    log("✗ 模型不齊：需要 dbnet 的 .param/.bin 與 manga_seg_s*.onnx")
                     return@launch
                 }
+                if (cseg == null) log("  （沒有 cartoonseg：守護框會從 18 升到 27，速度不變）")
 
                 val recipes = listOf(
-                    Triple("fp16 + fp32", detNcnn to null as String?, yolo32),
-                    Triple("int8 + int8", null as String? to detOnnx, yolo8),
+                    Triple("nightread", detNcnn to null as String?, yoloPath),
                 )
                 val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
                 val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
@@ -744,9 +742,9 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val sheet = composeNightReadSheet(pages, recipes.map { it.first }, results)
-                val name = "nightread_ab_${stamp()}.png"
+                val name = "nightread_${stamp()}.png"
                 saveNamed(tree, name, sheet)
-                addImage("夜讀 A/B", sheet)
+                addImage("夜讀", sheet)
                 log("→ 已存 $name 到所選資料夾")
             } catch (e: Throwable) {
                 log("✗ ${e.message ?: e.javaClass.simpleName}")
@@ -851,7 +849,7 @@ class MainActivity : AppCompatActivity() {
             textSize = size; color = colour; typeface = Typeface.MONOSPACE
         }
         var y = 34f
-        c.drawText("Night reading — quantisation A/B", gap.toFloat(), y, paint(24f, Color.WHITE))
+        c.drawText("Night reading", gap.toFloat(), y, paint(24f, Color.WHITE))
         y += 24
         c.drawText(
             "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE}",

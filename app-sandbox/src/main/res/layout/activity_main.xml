@@ -118,7 +118,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:text="──── 夜讀（跑上方選取的圖）────"
+            android:text="──── 夜讀（跑上方選取的圖·定案配方）────"
             android:textStyle="bold" />
 
         <Button
@@ -126,7 +126,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="夜讀 A/B（未量化 vs 量化·並排 + 分段耗時）" />
+            android:text="夜讀（定案配方·原圖與結果並排 + 分段耗時）" />
 
         <Switch
             android:id="@+id/genLogSwitch"
