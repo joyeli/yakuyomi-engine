@@ -38,6 +38,8 @@ internal object NcnnBackend {
 
     private external fun inpaintAotNative(handle: Long, img: FloatArray, mask: FloatArray, s: Int, out: FloatArray): Int
 
+    private external fun extractNative(handle: Long, chw: FloatArray, inW: Int, inH: Int, inC: Int, outNames: Array<String>, outs: Array<FloatArray>): Int
+
     /** DBNet 偵測（矩形 resize_aspect 輸入，繞開正方形 832-992 crash 帶）：chw=[3,inH,inW] → db 填 [2*inW*inH]（raw logits 2ch 全解析）、mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。序列化（見 [ncnnLock]）。 */
     fun detectDbnet(handle: Long, chw: FloatArray, inW: Int, inH: Int, db: FloatArray, mask: FloatArray): Int {
         EngineTrace.log("ncnn.detectDbnet.enter ${inW}x$inH")
@@ -56,6 +58,19 @@ internal object NcnnBackend {
             EngineTrace.log("ncnn.inpaint.call s=$s")
             val rc = inpaintAotNative(handle, img, mask, s, out)
             EngineTrace.log("ncnn.inpaint.exit rc=$rc")
+            rc
+        }
+    }
+
+    /**
+     * 通用抽取（後處理在 Kotlin 的模型，如人物分割）：chw=[inC,inH,inW] 進 in0，依 [outNames] 抽出各 blob、
+     * 逐 channel 複製進 [outs]（每個陣列大小要等於該 blob 的 w×h×c）。回 0=OK、-2 大小不合、-3 抽取失敗。序列化（見 [ncnnLock]）。
+     */
+    fun extract(handle: Long, chw: FloatArray, inW: Int, inH: Int, inC: Int, outNames: Array<String>, outs: Array<FloatArray>): Int {
+        EngineTrace.log("ncnn.extract.enter ${inW}x$inH x$inC → ${outNames.size} blobs")
+        return synchronized(ncnnLock) {
+            val rc = extractNative(handle, chw, inW, inH, inC, outNames, outs)
+            EngineTrace.log("ncnn.extract.exit rc=$rc")
             rc
         }
     }

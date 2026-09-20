@@ -112,3 +112,55 @@ Java_li_joye_yakuyomi_engine_NcnnBackend_inpaintAotNative(
     env->ReleaseFloatArrayElements(outArr, o, 0);
     return 0;
 }
+
+// 通用抽取（人物分割等「後處理在 Kotlin」的模型）：in0=[c,h,w] → 依 outNames 逐一 extract，
+// 各 blob 逐 channel 複製進 outs[i]（Java 陣列大小必須 == w*h*c，否則回 -2；extract 失敗回 -3）。
+// ★ ncnn::Mat 每個 channel 有對齊 padding（cstep），不能整塊 memcpy，要 m.channel(c) 逐 channel 搬。
+extern "C" JNIEXPORT jint JNICALL
+Java_li_joye_yakuyomi_engine_NcnnBackend_extractNative(
+        JNIEnv* env, jobject, jlong handle,
+        jfloatArray chw, jint inW, jint inH, jint inC,
+        jobjectArray outNames, jobjectArray outs) {
+    if (!handle) return -1;
+    ncnn::Net* net = (ncnn::Net*) handle;
+
+    size_t area = (size_t) inW * inH;
+    jfloat* in = env->GetFloatArrayElements(chw, nullptr);
+    ncnn::Mat inMat(inW, inH, inC);
+    for (int c = 0; c < inC; c++) {
+        memcpy(inMat.channel(c), in + (size_t) c * area, sizeof(float) * area);
+    }
+    env->ReleaseFloatArrayElements(chw, in, JNI_ABORT);
+
+    ncnn::Extractor ex = net->create_extractor();
+    ex.input("in0", inMat);
+    int n = env->GetArrayLength(outNames);
+    for (int i = 0; i < n; i++) {
+        jstring jname = (jstring) env->GetObjectArrayElement(outNames, i);
+        const char* name = env->GetStringUTFChars(jname, nullptr);
+        ncnn::Mat m;
+        int rc = ex.extract(name, m);
+        if (rc != 0) {
+            LOGW("extract %s fail rc=%d", name, rc);
+            env->ReleaseStringUTFChars(jname, name);
+            return -3;
+        }
+        jfloatArray arr = (jfloatArray) env->GetObjectArrayElement(outs, i);
+        size_t need = (size_t) m.w * m.h * m.c;
+        if ((size_t) env->GetArrayLength(arr) != need) {
+            LOGW("extract %s size mismatch: blob %dx%dx%d=%zu java=%d", name, m.w, m.h, m.c, need, env->GetArrayLength(arr));
+            env->ReleaseStringUTFChars(jname, name);
+            return -2;
+        }
+        env->ReleaseStringUTFChars(jname, name);
+        jfloat* out = env->GetFloatArrayElements(arr, nullptr);
+        size_t plane = (size_t) m.w * m.h;
+        for (int c = 0; c < m.c; c++) {
+            memcpy(out + (size_t) c * plane, m.channel(c), sizeof(float) * plane);
+        }
+        env->ReleaseFloatArrayElements(arr, out, 0);
+        env->DeleteLocalRef(arr);
+        env->DeleteLocalRef(jname);
+    }
+    return 0;
+}

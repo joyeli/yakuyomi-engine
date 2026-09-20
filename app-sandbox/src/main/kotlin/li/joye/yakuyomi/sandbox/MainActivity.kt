@@ -25,6 +25,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import li.joye.yakuyomi.engine.CsegSegmenter
 import li.joye.yakuyomi.engine.Detector
 import li.joye.yakuyomi.engine.EngineConfig
 import li.joye.yakuyomi.engine.Grouping
@@ -673,14 +674,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 夜讀上機測試：對選取的每一張圖跑兩套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
+     * 夜讀上機測試：對選取的每一張圖跑幾套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 兩套＝NCNN 偵測（fp16）＋ yoloseg **int8**，差別只在有沒有加 cseg fp32：
-     *   · 「yolo int8」＝之前幾輪真機看的全是這套（模型夾一直沒有 cartoonseg.onnx）
-     *   · 「yolo int8 + cseg」＝桌面定案配方（守護框 18/665；沒 cseg 是 27），代價 239 MB 與載入時間
-     * 這輪就是要在真機上把兩套的畫面與時間並排，讓配方拍板有依據（2026-09-20）。
+     * 這輪（2026-09-21）驗的是 **cseg 搬到 NCNN**：同一顆 RTMDet-Ins，ORT fp32（239MB）vs NCNN fp16（126MB），
+     * 後處理在 Kotlin（引擎 `CsegPost`，JVM parity 逐像素對 numpy／完整 ONNX）。兩套都只用 cseg、不加 yolo，
+     * 看到的差異才純粹是 runtime。上一輪（cseg 有／無）已定：cseg 守得住下巴／脖子／白衣，配方要有它。
      *
-     * 量化那輪的結論不重跑（偵測 int8 比 NCNN fp16 慢 55%、yoloseg int8 只多 1 框、cseg int8 泡破損）。
      * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。模型載入時間另外記。
      */
     private fun runNightReadAb() {
@@ -693,38 +692,36 @@ class MainActivity : AppCompatActivity() {
                 if (picked.isEmpty()) { log("✗ 請先在上方選至少一張圖"); return@launch }
 
                 val detNcnn = resolveDetectorPath(tree)
-                // yoloseg 取 int8（定案），沒有就退回 fp32
-                val yolo = tree.listFiles().firstOrNull {
-                    val n = (it.name ?: "").lowercase()
-                    n.contains("manga_seg") && n.contains("int8") && n.endsWith(".onnx")
-                } ?: findFile(tree, "manga_seg", ".onnx")
-                val yoloPath = yolo?.let { ensureLocal(it) }
-                val cseg = tree.listFiles().firstOrNull {
+                val csegOnnx = tree.listFiles().firstOrNull {
                     val n = (it.name ?: "").lowercase()
                     n.contains("cartoonseg") && !n.contains("int8") && n.endsWith(".onnx")
                 }?.let { ensureLocal(it) }
+                val csegParam = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == "cartoonseg.ncnn.param" }?.let { ensureLocal(it) }
+                val csegBin = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == "cartoonseg.ncnn.bin" }?.let { ensureLocal(it) }
 
-                log("模型：dbnet.param=${detNcnn != null} yoloseg=${yolo?.name} cartoonseg=${cseg != null}")
-                if (detNcnn == null || yoloPath == null) {
-                    log("✗ 模型不齊：需要 dbnet 的 .param/.bin 與 manga_seg_s*.onnx")
+                log("模型：dbnet.param=${detNcnn != null} cseg.onnx=${csegOnnx != null} cseg.ncnn=${csegParam != null && csegBin != null}")
+                if (detNcnn == null) {
+                    log("✗ 模型不齊：需要 dbnet 的 .param/.bin")
                     return@launch
                 }
-                if (cseg == null) log("  （沒有 cartoonseg：只跑 yolo int8 一套）")
-
-                // 配方＝(標籤, 偵測器路徑, yoloseg 路徑, cseg 路徑或 null)
+                // 配方＝(標籤, 偵測器路徑, 開 masker 的工廠)；每套只在自己那輪開、用完關
                 val recipes = buildList {
-                    add(Recipe("yolo int8", detNcnn, yoloPath, null))
-                    if (cseg != null) add(Recipe("yolo int8 + cseg", detNcnn, yoloPath, cseg))
+                    if (csegOnnx != null) add(Recipe("cseg ORT fp32", detNcnn) { CharMaskOrt(null, csegOnnx).let { m -> CharMasker({ _, px, w, h -> m.detect(px, w, h) }, m) } })
+                    if (csegParam != null && csegBin != null) add(Recipe("cseg NCNN fp16", detNcnn) {
+                        val seg = CsegSegmenter(csegParam, csegBin)
+                        CharMasker({ page, _, w, h -> Mask(w, h, seg.segment(page)) }, seg)
+                    })
                 }
+                if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型（cartoonseg.onnx 或 cartoonseg.ncnn.param/.bin）"); return@launch }
                 val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
                 val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
 
-                for ((label, det, yolo, csegPath) in recipes) {
+                for ((label, det, open) in recipes) {
                     log("▶ $label 載入模型…")
                     val tLoad = System.currentTimeMillis()
                     val detector = Detector(det)
                     val detOrt: DbnetOrtSandbox? = null
-                    CharMaskOrt(yolo, csegPath).use { masker ->
+                    open().use { masker ->
                         // 整合時 cseg 是逐章載入，載入成本要知道（session 建立含權重讀取）
                         log("  載入 ${System.currentTimeMillis() - tLoad}ms")
                         for ((name, bmp) in pages) {
@@ -758,15 +755,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 夜讀測試配方：偵測器（NCNN .param）＋ yoloseg ＋ 可選的 cseg。 */
-    private data class Recipe(val label: String, val detector: String, val yoloseg: String, val cseg: String?)
+    /** 夜讀測試配方：偵測器（NCNN .param）＋ 開人物遮罩推論的工廠（每套各自開關）。 */
+    private data class Recipe(val label: String, val detector: String, val open: () -> CharMasker)
+
+    /** 人物遮罩推論的統一介面：ORT（CharMaskOrt）或 NCNN（引擎 CsegSegmenter）都包成這個。 */
+    private class CharMasker(val fn: (Bitmap, IntArray, Int, Int) -> Mask, private val owner: AutoCloseable) : AutoCloseable {
+        fun mask(page: Bitmap, px: IntArray, w: Int, h: Int): Mask = fn(page, px, w, h)
+        override fun close() = owner.close()
+    }
 
     /** 跑一次夜讀，把三段耗時寫進 [t]（detect / mask / render）。 */
     private fun nightReadOnce(
         page: Bitmap,
         detector: Detector?,
         detOrt: DbnetOrtSandbox?,
-        masker: CharMaskOrt,
+        masker: CharMasker,
         t: LongArray,
     ): Bitmap {
         val w = page.width
@@ -787,7 +790,7 @@ class MainActivity : AppCompatActivity() {
         t[0] = System.currentTimeMillis() - ts
 
         ts = System.currentTimeMillis()
-        val chars = masker.detect(px, w, h)
+        val chars = masker.mask(page, px, w, h)
         t[1] = System.currentTimeMillis() - ts
 
         ts = System.currentTimeMillis()
