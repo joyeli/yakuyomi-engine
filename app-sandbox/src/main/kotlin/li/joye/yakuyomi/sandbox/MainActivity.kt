@@ -673,16 +673,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 夜讀上機測試：對選取的每一張圖跑**定案配方**，把結果並排、分段耗時印在同一張大圖上。
+     * 夜讀上機測試：對選取的每一張圖跑兩套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 定案配方＝NCNN 偵測（fp16）＋ cseg fp32 ∪ yoloseg **int8**，理由（2026-09-18 真機量完）：
-     *   · 偵測不量化：int8 在這顆晶片上比 NCNN fp16 **慢 55%**（桌面快 1.78× 的結論不成立）
-     *   · yoloseg 量化：38.9 → 10.5 MB、推論快 31%，守護框只從 18 升到 19
-     *   · cseg 不量化：int8 版要把分數門檻降到遮罩過度覆蓋，泡會被當成人物吃掉
-     *   · cseg 可以不放：省 228 MB 但守護框 18 → 27，那九框是紅線，不拿來換空間
+     * 兩套＝NCNN 偵測（fp16）＋ yoloseg **int8**，差別只在有沒有加 cseg fp32：
+     *   · 「yolo int8」＝之前幾輪真機看的全是這套（模型夾一直沒有 cartoonseg.onnx）
+     *   · 「yolo int8 + cseg」＝桌面定案配方（守護框 18/665；沒 cseg 是 27），代價 239 MB 與載入時間
+     * 這輪就是要在真機上把兩套的畫面與時間並排，讓配方拍板有依據（2026-09-20）。
      *
-     * 量化 A/B 已經跑完並定案，所以這裡只跑一套——兩套要花兩倍時間，而現在的瓶頸是重繪。
-     * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。
+     * 量化那輪的結論不重跑（偵測 int8 比 NCNN fp16 慢 55%、yoloseg int8 只多 1 框、cseg int8 泡破損）。
+     * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。模型載入時間另外記。
      */
     private fun runNightReadAb() {
         binding.nightReadAbButton.isEnabled = false
@@ -710,19 +709,24 @@ class MainActivity : AppCompatActivity() {
                     log("✗ 模型不齊：需要 dbnet 的 .param/.bin 與 manga_seg_s*.onnx")
                     return@launch
                 }
-                if (cseg == null) log("  （沒有 cartoonseg：守護框會從 18 升到 27，速度不變）")
+                if (cseg == null) log("  （沒有 cartoonseg：只跑 yolo int8 一套）")
 
-                val recipes = listOf(
-                    Triple("nightread", detNcnn to null as String?, yoloPath),
-                )
+                // 配方＝(標籤, 偵測器路徑, yoloseg 路徑, cseg 路徑或 null)
+                val recipes = buildList {
+                    add(Recipe("yolo int8", detNcnn, yoloPath, null))
+                    if (cseg != null) add(Recipe("yolo int8 + cseg", detNcnn, yoloPath, cseg))
+                }
                 val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
                 val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
 
-                for ((label, det, yolo) in recipes) {
+                for ((label, det, yolo, csegPath) in recipes) {
                     log("▶ $label 載入模型…")
-                    val detector = det.first?.let { Detector(it) }
-                    val detOrt = det.second?.let { DbnetOrtSandbox(it) }
-                    CharMaskOrt(yolo, cseg).use { masker ->
+                    val tLoad = System.currentTimeMillis()
+                    val detector = Detector(det)
+                    val detOrt: DbnetOrtSandbox? = null
+                    CharMaskOrt(yolo, csegPath).use { masker ->
+                        // 整合時 cseg 是逐章載入，載入成本要知道（session 建立含權重讀取）
+                        log("  載入 ${System.currentTimeMillis() - tLoad}ms")
                         for ((name, bmp) in pages) {
                             repeat(2) { pass ->
                                 val t = LongArray(3)
@@ -741,7 +745,7 @@ class MainActivity : AppCompatActivity() {
                     detOrt?.close()
                 }
 
-                val sheet = composeNightReadSheet(pages, recipes.map { it.first }, results)
+                val sheet = composeNightReadSheet(pages, recipes.map { it.label }, results)
                 val name = "nightread_${stamp()}.png"
                 saveNamed(tree, name, sheet)
                 addImage("夜讀", sheet)
@@ -753,6 +757,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    /** 夜讀測試配方：偵測器（NCNN .param）＋ yoloseg ＋ 可選的 cseg。 */
+    private data class Recipe(val label: String, val detector: String, val yoloseg: String, val cseg: String?)
 
     /** 跑一次夜讀，把三段耗時寫進 [t]（detect / mask / render）。 */
     private fun nightReadOnce(
