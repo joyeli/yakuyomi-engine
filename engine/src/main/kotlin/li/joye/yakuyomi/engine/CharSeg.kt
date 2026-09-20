@@ -315,3 +315,210 @@ object CsegPost {
         return out
     }
 }
+
+/**
+ * yoloseg（YOLO11-seg，manga109 訓練，`manga_seg_s.ncnn.param/.bin`，ultralytics `format=ncnn` 匯出，fp16）。
+ * 規格在 `parity/export_yoloseg_ncnn.py`；後處理由 [YoloSegPost] 移植，JVM 測試逐像素對 fixture。
+ */
+class YoloSegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
+
+    private var handle: Long = 0L
+
+    init {
+        check(NcnnBackend.available) { "NCNN 原生庫未載入，無法做人物分割" }
+        handle = NcnnBackend.createNet(paramPath, binPath)
+        check(handle != 0L) { "NCNN yoloseg 模型載入失敗：$paramPath" }
+    }
+
+    override fun segment(page: Bitmap): BooleanArray {
+        check(handle != 0L) { "YoloSegSegmenter 已關閉" }
+        val w = page.width
+        val h = page.height
+        val px = IntArray(w * h)
+        page.getPixels(px, 0, w, 0, 0, w, h)
+        val pre = YoloSegPost.preprocess(px, w, h)
+        val outs = YoloSegPost.allocOutputs()
+        val rc = NcnnBackend.extract(handle, pre.chw, YoloSegPost.SIZE, YoloSegPost.SIZE, 3, YoloSegPost.OUT_NAMES, outs)
+        check(rc == 0) { "NCNN yoloseg 推論失敗 rc=$rc" }
+        return YoloSegPost.unionMask(outs[0], outs[1], pre, w, h)
+    }
+
+    override fun close() {
+        if (handle != 0L) {
+            NcnnBackend.releaseNet(handle)
+            handle = 0L
+        }
+    }
+}
+
+/**
+ * yoloseg 的前／後處理，純 Kotlin、JVM 可測。規格＝`parity/export_yoloseg_ncnn.py`（＝research 的 run_yoloseg_onnx）：
+ *  - letterbox：等比縮到長邊 1024（雙線性，比照 cv2 INTER_LINEAR）、置中 pad 114、RGB、/255
+ *  - 只取 character 類（索引 2）且分數 > 0.25；NMS IoU 0.45（貪婪、分數遞減）
+ *  - 遮罩：sigmoid(係數·prototypes) [256²] → 裁到 bbox → 雙線性到 1024 → 去 letterbox → 雙線性到原尺寸 → > 0.5 → 聯集
+ * 兩段雙線性只在框的支撐區內算（框外的值恆為 0，> 0.5 不成立），與整張算逐位元相同。
+ */
+object YoloSegPost {
+    const val SIZE = 1024
+    const val CONF = 0.25f
+    const val IOU = 0.45f
+    const val CHAR_CLASS = 2
+    const val MASK_THR = 0.5f
+    const val NC = 3
+    const val NPROTO = 32
+    const val ANCHORS = 21504       // 1024 輸入：(128² + 64² + 32²)
+    const val MW = 256
+    private const val PAD = 114
+    val OUT_NAMES: Array<String> = arrayOf("out0", "out1")
+
+    fun allocOutputs(): Array<FloatArray> = arrayOf(FloatArray((4 + NC + NPROTO) * ANCHORS), FloatArray(NPROTO * MW * MW))
+
+    class Pre(val chw: FloatArray, val nw: Int, val nh: Int, val top: Int, val left: Int)
+
+    /** cv2.resize INTER_LINEAR 的取樣座標：半像素中心，夾在 [0, src−1]。 */
+    private fun lerpIdx(dst: Int, scale: Double, srcN: Int, i0: IntArray, i1: IntArray, f: FloatArray) {
+        var sx = (dst + 0.5) * scale - 0.5
+        if (sx < 0) sx = 0.0
+        val a = min(floor(sx).toInt(), srcN - 1)
+        i0[dst] = a
+        i1[dst] = min(a + 1, srcN - 1)
+        f[dst] = (sx - a).toFloat().coerceIn(0f, 1f)
+    }
+
+    fun preprocess(px: IntArray, w: Int, h: Int): Pre {
+        val r = min(SIZE.toDouble() / h, SIZE.toDouble() / w)
+        val nh = (h * r).roundToInt()
+        val nw = (w * r).roundToInt()
+        val top = (SIZE - nh) / 2
+        val left = (SIZE - nw) / 2
+        val plane = SIZE * SIZE
+        val chw = FloatArray(3 * plane) { PAD / 255f }
+        val x0 = IntArray(nw); val x1 = IntArray(nw); val fx = FloatArray(nw)
+        val y0 = IntArray(nh); val y1 = IntArray(nh); val fy = FloatArray(nh)
+        for (x in 0 until nw) lerpIdx(x, w.toDouble() / nw, w, x0, x1, fx)
+        for (y in 0 until nh) lerpIdx(y, h.toDouble() / nh, h, y0, y1, fy)
+        for (y in 0 until nh) {
+            val ra = y0[y] * w
+            val rb = y1[y] * w
+            val wy = fy[y]
+            val dst = (top + y) * SIZE + left
+            for (x in 0 until nw) {
+                val pa = px[ra + x0[x]]; val pb = px[ra + x1[x]]
+                val pc = px[rb + x0[x]]; val pd = px[rb + x1[x]]
+                val wx = fx[x]
+                for (c in 0 until 3) {
+                    val sh = 16 - 8 * c      // R,G,B
+                    val v = ((pa shr sh) and 0xFF) * (1 - wx) * (1 - wy) + ((pb shr sh) and 0xFF) * wx * (1 - wy) +
+                        ((pc shr sh) and 0xFF) * (1 - wx) * wy + ((pd shr sh) and 0xFF) * wx * wy
+                    chw[c * plane + dst + x] = (v + 0.5f).toInt().coerceIn(0, 255) / 255f   // cv2 縮完是 uint8
+                }
+            }
+        }
+        return Pre(chw, nw, nh, top, left)
+    }
+
+    class Det(val cx: Float, val cy: Float, val bw: Float, val bh: Float, val score: Float, val index: Int)
+
+    /** 篩 character 類 + NMS。[o0] 排列 [39][ANCHORS]。 */
+    fun decode(o0: FloatArray): List<Det> {
+        val n = ANCHORS
+        val cand = ArrayList<Det>()
+        for (i in 0 until n) {
+            var best = 0
+            var bestS = -1f
+            for (c in 0 until NC) {
+                val v = o0[(4 + c) * n + i]
+                if (v > bestS) { bestS = v; best = c }
+            }
+            if (best == CHAR_CLASS && bestS > CONF) cand.add(Det(o0[i], o0[n + i], o0[2 * n + i], o0[3 * n + i], bestS, i))
+        }
+        if (cand.isEmpty()) return emptyList()
+        val order = cand.indices.sortedWith(compareByDescending<Int> { cand[it].score }.thenBy { it })
+        val alive = BooleanArray(cand.size) { true }
+        val keep = ArrayList<Det>()
+        for (oi in order.indices) {
+            val i = order[oi]
+            if (!alive[i]) continue
+            val a = cand[i]
+            keep.add(a)
+            val ax1 = a.cx - a.bw / 2; val ay1 = a.cy - a.bh / 2; val ax2 = ax1 + a.bw; val ay2 = ay1 + a.bh
+            for (oj in oi + 1 until order.size) {
+                val j = order[oj]
+                if (!alive[j]) continue
+                val b = cand[j]
+                val bx1 = b.cx - b.bw / 2; val by1 = b.cy - b.bh / 2
+                val iw = max(0f, min(ax2, bx1 + b.bw) - max(ax1, bx1))
+                val ih = max(0f, min(ay2, by1 + b.bh) - max(ay1, by1))
+                val inter = iw * ih
+                val iou = inter / max(a.bw * a.bh + b.bw * b.bh - inter, 1e-9f)
+                if (iou > IOU) alive[j] = false
+            }
+        }
+        return keep
+    }
+
+    /** 全部實例的聯集遮罩（原尺寸）。 */
+    fun unionMask(o0: FloatArray, o1: FloatArray, pre: Pre, w: Int, h: Int): BooleanArray {
+        val out = BooleanArray(w * h)
+        val dets = decode(o0)
+        if (dets.isEmpty()) return out
+        val n = ANCHORS
+        val mw = MW
+        val mhw = mw * mw
+        val m = FloatArray(mhw)
+        // 第二段（sub → 原尺寸）的取樣表；sub 的座標＝1024 座標減 letterbox 偏移
+        val sx0 = IntArray(w); val sx1 = IntArray(w); val sfx = FloatArray(w)
+        val sy0 = IntArray(h); val sy1 = IntArray(h); val sfy = FloatArray(h)
+        for (x in 0 until w) lerpIdx(x, pre.nw.toDouble() / w, pre.nw, sx0, sx1, sfx)
+        for (y in 0 until h) lerpIdx(y, pre.nh.toDouble() / h, pre.nh, sy0, sy1, sfy)
+        // 第一段（prototype → 1024）的取樣表
+        val px0 = IntArray(SIZE); val px1 = IntArray(SIZE); val pfx = FloatArray(SIZE)
+        for (d in 0 until SIZE) lerpIdx(d, mw.toDouble() / SIZE, mw, px0, px1, pfx)
+        val full = FloatArray(SIZE * SIZE)        // 只在支撐區內寫、用完清回 0
+        for (d in dets) {
+            // sigmoid(係數 · prototypes)，裁到 bbox（crop_mask）
+            val x1 = ((d.cx - d.bw / 2) * mw / SIZE)
+            val x2 = ((d.cx + d.bw / 2) * mw / SIZE)
+            val y1 = ((d.cy - d.bh / 2) * mw / SIZE)
+            val y2 = ((d.cy + d.bh / 2) * mw / SIZE)
+            val cx0 = max(0, x1.toInt()); val cx1 = min(mw, kotlin.math.ceil(x2.toDouble()).toInt())
+            val cy0 = max(0, y1.toInt()); val cy1 = min(mw, kotlin.math.ceil(y2.toDouble()).toInt())
+            if (cx1 <= cx0 || cy1 <= cy0) continue
+            java.util.Arrays.fill(m, 0f)
+            for (yy in cy0 until cy1) for (xx in cx0 until cx1) {
+                val j = yy * mw + xx
+                var v = 0f
+                for (c in 0 until NPROTO) v += o0[(4 + NC + c) * n + d.index] * o1[c * mhw + j]
+                m[j] = 1f / (1f + exp(-v))
+            }
+            // 第一段：只有取樣到裁切區的 1024 像素會非零 → 支撐區 = 來源落在 [cx0−1, cx1] 的目標像素
+            val fxA = max(0, floor((cx0 - 1.0) * SIZE / mw).toInt()); val fxB = min(SIZE, kotlin.math.ceil((cx1 + 1.0) * SIZE / mw).toInt())
+            val fyA = max(0, floor((cy0 - 1.0) * SIZE / mw).toInt()); val fyB = min(SIZE, kotlin.math.ceil((cy1 + 1.0) * SIZE / mw).toInt())
+            for (fy in fyA until fyB) {
+                val ra = px0[fy] * mw; val rb = px1[fy] * mw; val wy = pfx[fy]
+                val row = fy * SIZE
+                for (fx in fxA until fxB) {
+                    val a = px0[fx]; val b = px1[fx]; val wx = pfx[fx]
+                    full[row + fx] = m[ra + a] * (1 - wx) * (1 - wy) + m[ra + b] * wx * (1 - wy) +
+                        m[rb + a] * (1 - wx) * wy + m[rb + b] * wx * wy
+                }
+            }
+            // 第二段：去 letterbox 後放到原尺寸，只算支撐區對應的原圖範圍
+            val oxA = max(0, floor((fxA - pre.left - 1.0) * w / pre.nw).toInt()); val oxB = min(w, kotlin.math.ceil((fxB - pre.left + 1.0) * w / pre.nw).toInt())
+            val oyA = max(0, floor((fyA - pre.top - 1.0) * h / pre.nh).toInt()); val oyB = min(h, kotlin.math.ceil((fyB - pre.top + 1.0) * h / pre.nh).toInt())
+            for (oy in oyA until oyB) {
+                val ra = (sy0[oy] + pre.top) * SIZE + pre.left; val rb = (sy1[oy] + pre.top) * SIZE + pre.left; val wy = sfy[oy]
+                val drow = oy * w
+                for (ox in oxA until oxB) {
+                    val a = sx0[ox]; val b = sx1[ox]; val wx = sfx[ox]
+                    val v = full[ra + a] * (1 - wx) * (1 - wy) + full[ra + b] * wx * (1 - wy) +
+                        full[rb + a] * (1 - wx) * wy + full[rb + b] * wx * wy
+                    if (v > MASK_THR) out[drow + ox] = true
+                }
+            }
+            // 清掉這個實例的支撐區（下一個實例的 full 要從 0 開始）
+            for (fy in fyA until fyB) java.util.Arrays.fill(full, fy * SIZE + fxA, fy * SIZE + fxB, 0f)
+        }
+        return out
+    }
+}

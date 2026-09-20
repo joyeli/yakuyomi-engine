@@ -1,0 +1,8 @@
+w 1351
+h 1920
+nw 721
+nh 1024
+top 0
+left 151
+shapes 39x21504;32x256x256
+instances 38

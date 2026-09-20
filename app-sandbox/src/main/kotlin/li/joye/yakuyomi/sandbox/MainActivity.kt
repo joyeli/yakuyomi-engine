@@ -26,6 +26,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import li.joye.yakuyomi.engine.CsegSegmenter
+import li.joye.yakuyomi.engine.YoloSegSegmenter
 import li.joye.yakuyomi.engine.Detector
 import li.joye.yakuyomi.engine.EngineConfig
 import li.joye.yakuyomi.engine.Grouping
@@ -676,10 +677,11 @@ class MainActivity : AppCompatActivity() {
     /**
      * 夜讀上機測試：對選取的每一張圖跑幾套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 這輪（2026-09-21）驗的是 **cseg 搬到 NCNN**：同一顆 RTMDet-Ins，ORT fp32（239MB）vs NCNN fp16（126MB），
-     * 後處理在 Kotlin（引擎 `CsegPost`，JVM parity 逐像素對 numpy／完整 ONNX）。兩套都只用 cseg、不加 yolo，
-     * 看到的差異才純粹是 runtime。上一輪（cseg 有／無）已定：cseg 守得住下巴／脖子／白衣，配方要有它。
-     *
+     * 第三輪（2026-09-21）：兩顆人物模型都搬到 NCNN 之後的配方比較——
+     *   · 「yolo int8 ORT」＝之前幾輪真機看的那套（基準）
+     *   · 「yolo NCNN fp16」＝同一顆換 runtime，看 mask 時間與畫面
+     *   · 「yolo+cseg NCNN」＝候選的產品配方（聯集），看總成本
+     * cseg 單顆 ORT vs NCNN 上一輪量過（mask 1.72 → 0.83 s，IoU 0.999）。
      * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。模型載入時間另外記。
      */
     private fun runNightReadAb() {
@@ -692,27 +694,39 @@ class MainActivity : AppCompatActivity() {
                 if (picked.isEmpty()) { log("✗ 請先在上方選至少一張圖"); return@launch }
 
                 val detNcnn = resolveDetectorPath(tree)
-                val csegOnnx = tree.listFiles().firstOrNull {
+                fun find(exact: String) = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == exact }?.let { ensureLocal(it) }
+                val yoloOnnx = tree.listFiles().firstOrNull {
                     val n = (it.name ?: "").lowercase()
-                    n.contains("cartoonseg") && !n.contains("int8") && n.endsWith(".onnx")
+                    n.contains("manga_seg") && n.contains("int8") && n.endsWith(".onnx")
                 }?.let { ensureLocal(it) }
-                val csegParam = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == "cartoonseg.ncnn.param" }?.let { ensureLocal(it) }
-                val csegBin = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == "cartoonseg.ncnn.bin" }?.let { ensureLocal(it) }
+                val yoloParam = find("manga_seg_s.ncnn.param")
+                val yoloBin = find("manga_seg_s.ncnn.bin")
+                val csegParam = find("cartoonseg.ncnn.param")
+                val csegBin = find("cartoonseg.ncnn.bin")
 
-                log("模型：dbnet.param=${detNcnn != null} cseg.onnx=${csegOnnx != null} cseg.ncnn=${csegParam != null && csegBin != null}")
+                log("模型：dbnet.param=${detNcnn != null} yolo.onnx(int8)=${yoloOnnx != null} yolo.ncnn=${yoloParam != null && yoloBin != null} cseg.ncnn=${csegParam != null && csegBin != null}")
                 if (detNcnn == null) {
                     log("✗ 模型不齊：需要 dbnet 的 .param/.bin")
                     return@launch
                 }
                 // 配方＝(標籤, 偵測器路徑, 開 masker 的工廠)；每套只在自己那輪開、用完關
                 val recipes = buildList {
-                    if (csegOnnx != null) add(Recipe("cseg ORT fp32", detNcnn) { CharMaskOrt(null, csegOnnx).let { m -> CharMasker({ _, px, w, h -> m.detect(px, w, h) }, m) } })
-                    if (csegParam != null && csegBin != null) add(Recipe("cseg NCNN fp16", detNcnn) {
-                        val seg = CsegSegmenter(csegParam, csegBin)
+                    if (yoloOnnx != null) add(Recipe("yolo int8 ORT", detNcnn) { CharMaskOrt(yoloOnnx, null).let { m -> CharMasker({ _, px, w, h -> m.detect(px, w, h) }, m) } })
+                    if (yoloParam != null && yoloBin != null) add(Recipe("yolo NCNN fp16", detNcnn) {
+                        val seg = YoloSegSegmenter(yoloParam, yoloBin)
                         CharMasker({ page, _, w, h -> Mask(w, h, seg.segment(page)) }, seg)
                     })
+                    if (yoloParam != null && yoloBin != null && csegParam != null && csegBin != null) add(Recipe("yolo+cseg NCNN", detNcnn) {
+                        val yolo = YoloSegSegmenter(yoloParam, yoloBin)
+                        val cseg = CsegSegmenter(csegParam, csegBin)
+                        CharMasker({ page, _, w, h ->
+                            val a = yolo.segment(page)
+                            val b = cseg.segment(page)
+                            Mask(w, h, BooleanArray(w * h) { a[it] || b[it] })
+                        }, AutoCloseable { yolo.close(); cseg.close() })
+                    })
                 }
-                if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型（cartoonseg.onnx 或 cartoonseg.ncnn.param/.bin）"); return@launch }
+                if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型"); return@launch }
                 val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
                 val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
 
