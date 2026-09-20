@@ -58,8 +58,9 @@ SRC = os.environ.get(
 )
 OUTDIR = os.path.join(_OUT, "cseg")
 CUT = os.path.join(OUTDIR, "cartoonseg.onnx")            # 切圖後的 ONNX（pnnx 依此檔名命名輸出）
-PARAM = os.path.join(OUTDIR, "cartoonseg.ncnn.param")
-BIN = os.path.join(OUTDIR, "cartoonseg.ncnn.bin")
+# 驗證可指向別的 param/bin（例如 ncnn2int8 的產物）：YAKU_CSEG_NCNN_PARAM / _BIN
+PARAM = os.environ.get("YAKU_CSEG_NCNN_PARAM", os.path.join(OUTDIR, "cartoonseg.ncnn.param"))
+BIN = os.environ.get("YAKU_CSEG_NCNN_BIN", os.path.join(OUTDIR, "cartoonseg.ncnn.bin"))
 PAGES = sorted(glob.glob(os.path.join(ROOT, "app-sandbox", "src", "main", "assets", "test", "*.*")))
 FIXTURE_DIR = os.path.join(ROOT, "engine", "src", "test", "resources", "charseg")
 

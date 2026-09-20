@@ -42,8 +42,9 @@ _MODELS = os.path.join(os.path.dirname(ROOT), "yakuyomi-nightread", "research", 
 PT = os.environ.get("YAKU_YOLOSEG_PT", os.path.join(_MODELS, "manga_seg_s.pt"))
 ONNX = os.environ.get("YAKU_YOLOSEG_ONNX", os.path.join(_MODELS, "manga_seg_s.onnx"))
 OUTDIR = os.path.join(_OUT, "yoloseg")
-PARAM = os.path.join(OUTDIR, "manga_seg_s.ncnn.param")
-BIN = os.path.join(OUTDIR, "manga_seg_s.ncnn.bin")
+# 驗證可指向別的 param/bin（例如 ncnn2int8 的產物）：YAKU_YOLOSEG_NCNN_PARAM / _BIN
+PARAM = os.environ.get("YAKU_YOLOSEG_NCNN_PARAM", os.path.join(OUTDIR, "manga_seg_s.ncnn.param"))
+BIN = os.environ.get("YAKU_YOLOSEG_NCNN_BIN", os.path.join(OUTDIR, "manga_seg_s.ncnn.bin"))
 PAGES = sorted(glob.glob(os.path.join(ROOT, "app-sandbox", "src", "main", "assets", "test", "*.*")))
 FIXTURE_DIR = os.path.join(ROOT, "engine", "src", "test", "resources", "charseg")
 
