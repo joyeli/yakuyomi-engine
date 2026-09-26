@@ -21,6 +21,8 @@ val models = ModelSet(
     detectorNcnn     = "/path/dbnet_detect.ncnn.param",
     ocr              = "/path/ocr_48px_ctc.ncnn.param",  // 或 _mixed 那份；引擎載入時自己選
     aotInpainterNcnn = "/path/mit_aot_fixed512.ncnn.param",
+    charSegYoloNcnn  = "/path/manga_seg_s.ncnn.param",   // 選配（只有夜讀用）；預設 null
+    charSegCsegNcnn  = "/path/cartoonseg.ncnn.param",    // 選配（只有夜讀用）；預設 null
 )
 
 // 2. 載 OCR 字典（在引擎 assets 裡）跟你的 API key。
@@ -56,15 +58,17 @@ val models = ModelSet.resolve(dir.listFiles()!!.map { it.name to it.absolutePath
 
 **自備模型（BYOM）。** 或自己放檔——放在任何本機路徑，讓 `ModelSet.resolve` 按檔名比對，或明確指定各角色（見[快速開始](#快速開始)）。
 
-兩條路要的是同樣那六個檔，全走 NCNN（`.param` + `.bin`，兩個都要；OCR 有兩份 `.param`——一般版與 `_mixed`——共用一份 `.bin`）：
+兩條路要的是同樣那六個檔（翻譯），全走 NCNN（`.param` + `.bin`，兩個都要；OCR 有兩份 `.param`——一般版與 `_mixed`——共用一份 `.bin`），外加選配的四個檔（夜讀）：
 
 | 角色 | 檔名（常見） | 後端 | 做什麼 | 來源 |
 |---|---|---|---|---|
 | detector | `dbnet_detect.ncnn.param`（+ `.bin`） | NCNN | 文字框 + 筆畫遮罩 | DBNet，出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator)（它的 default 偵測器） |
 | ocr | `ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param`（+ `.bin`） | NCNN | 48px CTC 日文 OCR，fp16/fp32 混合精度 | manga-image-translator |
 | inpainter | `mit_aot_fixed512.ncnn.param`（+ `.bin`） | NCNN | AOT-GAN 去字 | [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| charseg（yolo）→ `charSegYoloNcnn` | `manga_seg_s.ncnn.param`（+ `.bin`） | NCNN | 夜讀用的人物遮罩（YOLO11-seg，只取人物類）——選配 | 權重來自 Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)；非 GPL，見 [docs/MODELS_zh.md](../docs/MODELS_zh.md#夜讀模型) |
+| charseg（cseg）→ `charSegCsegNcnn` | `cartoonseg.ncnn.param`（+ `.bin`） | NCNN | 夜讀用的人物遮罩（CartoonSegmentation RTMDet-Ins）——選配 | 權重來自 Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)；非 GPL，見 [docs/MODELS_zh.md](../docs/MODELS_zh.md#夜讀模型) |
 
-`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.param` 含 `ocr` 是 OCR（兩份 OCR param 給哪份都行——`Ocr` 查過 CPU 後自己切到 `_mixed` 或切回來）。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。注意每個角色都要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin`（OCR 還有另一份 `.param`）請自行確保放在旁邊。
+`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.param` 含 `ocr` 是 OCR（兩份 OCR param 給哪份都行——`Ocr` 查過 CPU 後自己切到 `_mixed` 或切回來）。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。另外兩個關鍵字是選配：`.param` 含 `manga_seg` → `charSegYoloNcnn`、含 `cartoonseg` → `charSegCsegNcnn`。缺了不會讓 `resolve` 回 `null`——翻譯就緒不看夜讀模型——欄位就只是 `null`，`NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)` 拿手上有的建分割器（兩顆 → 聯集、一顆 → 那顆、零顆 → `null`、夜讀不可用）。注意每個角色都要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin`（OCR 還有另一份 `.param`）請自行確保放在旁邊。
 
 路徑必須是本機檔，不能是 SAF/content URI：後端直接從路徑載進 native 記憶體。別用 `readBytes()` 把權重讀進 JVM heap；heap 上限約 512MB（跟裝置 RAM 無關）會 OOM。來源是 SAF 的話，先複製到 `filesDir` 再傳路徑。
 
@@ -90,6 +94,8 @@ Yakuyomi.create(models, alphabet, apiKey, config)
 - `InpainterConfig.method = "aot"`。去字分兩門別：`"boxfill"`（快速去字）把每個字區用就近的背景色平塗——瞬間、平/單色泡泡最乾淨，但壓在畫面上的字會塗成色塊；`"aot"`（AI 去字，預設）用整頁一次的 AOT-GAN pass 重建每個字區底下的背景（`tileSize = 768`）——較慢，但重建畫面而非蓋色塊。
 - `RenderConfig.orientation = AUTO`。跟著每區塊偵測到的方向，再沿區塊傾斜角旋轉。
 - `TranslatorConfig.provider = "deepseek"`，配 `apiBase` 跟 `model`。任何 OpenAI 相容端點。`LlmProviders.ALL` 內建 manga-image-translator 的 LLM 那組外加 OpenRouter 的預設（全 OpenAI 相容；Gemini 走它的 compat 端點），`LlmModels.list()` 撈服務商的即時模型清單。詳見 [`docs/PROVIDERS_zh.md`](../docs/PROVIDERS_zh.md)。
+
+**夜讀**是獨立入口、不在 `translatePage` 裡：`NightReadRenderer.render(page, detector, charSeg, NightReadParams())` 一次跑完偵測、人物分割與夜讀重繪、回一張新 bitmap（超過 `NightReadRenderer.MAX_PIXELS` = 3.5 MPx 的頁會先縮、輸出＝縮後尺寸），`charSeg` 由 `NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)` 建。`NightReadParams()` 的預設就是定案值；一次只跑一頁。夜讀函式庫（`li.joye.yakuyomi:nightread`）是 `:engine` 的 `api` 依賴，型別對使用端可見。
 
 ### 語言對（不寫死日翻繁中）
 

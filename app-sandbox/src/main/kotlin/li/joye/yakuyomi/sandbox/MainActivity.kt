@@ -26,19 +26,14 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import li.joye.yakuyomi.engine.CharSegmenter
-import li.joye.yakuyomi.engine.CsegSegmenter
-import li.joye.yakuyomi.engine.YoloSegSegmenter
 import li.joye.yakuyomi.engine.Detector
 import li.joye.yakuyomi.engine.EngineConfig
 import li.joye.yakuyomi.engine.Grouping
 import li.joye.yakuyomi.engine.InpainterConfig
 import li.joye.yakuyomi.engine.Inpainter
 import li.joye.yakuyomi.engine.ModelSet
-import li.joye.yakuyomi.nightread.Gray
-import li.joye.yakuyomi.nightread.Mask
-import li.joye.yakuyomi.nightread.NightRead
-import li.joye.yakuyomi.nightread.NightReadInput
-import li.joye.yakuyomi.nightread.TextRegion as NrRegion
+import li.joye.yakuyomi.engine.NightReadRenderer
+import li.joye.yakuyomi.engine.NightReadStats
 import li.joye.yakuyomi.engine.OcrConfig
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.RenderConfig
@@ -764,12 +759,16 @@ class MainActivity : AppCompatActivity() {
     /**
      * 夜讀上機測試：對選取的每一張圖跑幾套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 第四輪（2026-09-26）：ORT 整個從引擎拔掉之後只剩 NCNN 兩套——
-     *   · 「yolo NCNN fp16」＝單顆 yoloseg，看 mask 時間與畫面
-     *   · 「yolo+cseg NCNN」＝候選的產品配方（聯集），看總成本
+     * 跑的就是**產品用的同一條膠水**——引擎 [NightReadRenderer]（縮圖上限、偵測→人物分割→夜讀重繪、
+     * 灰階／彩度／文字區換算全在引擎裡），這裡只剩「開哪套分割器、量時間、拼大圖」；測到的數字＝產品會看到的數字。
+     * 配方由 [NightReadRenderer.charSegmenter] 開：
+     *   · 「yolo NCNN fp16」＝單顆 yoloseg（(yolo, null)），看 mask 時間與畫面
+     *   · 「yolo+cseg NCNN」＝定案的產品配方 yolo ∪ cseg（(yolo, cseg)），看總成本
+     * 分割器開好先 [CharSegmenter.warmUp]（NCNN 冷啟在單緒做完），暖機計入「載入」時間、不混進逐頁數字。
      * 之前幾輪當基準的「yolo int8 ORT」（nightread-ort 的 CharMaskOrt）已退役；換 runtime 沒有精度代價，
      * 上一輪量過 cseg 單顆 ORT vs NCNN：mask 1.72 → 0.83 s、IoU 0.999。
-     * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。模型載入時間另外記。
+     * 每張圖仍跑兩次取第二次：暖機只覆蓋分割器，偵測器與重繪第一次仍可能吃到冷啟，不是推論。
+     * 超過 [NightReadRenderer.MAX_PIXELS] 的頁 helper 會先等比縮小再跑（輸出＝縮後尺寸），log 會標 scaled。
      */
     private fun runNightReadAb() {
         binding.nightReadAbButton.isEnabled = false
@@ -781,32 +780,25 @@ class MainActivity : AppCompatActivity() {
                 if (picked.isEmpty()) { log("✗ 請先在上方選至少一張圖"); return@launch }
 
                 val detNcnn = resolveDetectorPath(tree)
-                fun find(exact: String) = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == exact }?.let { ensureLocal(it) }
-                val yoloParam = find("manga_seg_s.ncnn.param")
-                val yoloBin = find("manga_seg_s.ncnn.bin")
-                val csegParam = find("cartoonseg.ncnn.param")
-                val csegBin = find("cartoonseg.ncnn.bin")
+                // 分割器只要 .param 路徑（helper 由同名推 .bin），但 .bin 要跟著進 filesDir → 走與偵測器同一條 ensureNcnnPair；
+                // key 與引擎 ModelSet 的判法一致（檔名含 manga_seg／cartoonseg）
+                val yoloParam = ensureNcnnPair(tree, "manga_seg")
+                val csegParam = ensureNcnnPair(tree, "cartoonseg")
 
-                log("模型：dbnet.param=${detNcnn != null} yolo.ncnn=${yoloParam != null && yoloBin != null} cseg.ncnn=${csegParam != null && csegBin != null}")
+                log("模型：dbnet.param=${detNcnn != null} yolo.ncnn=${yoloParam != null} cseg.ncnn=${csegParam != null}")
                 if (detNcnn == null) {
                     log("✗ 模型不齊：需要 dbnet 的 .param/.bin")
                     return@launch
                 }
-                // 配方＝(標籤, 偵測器路徑, 開分割器的工廠)；每套只在自己那輪開、用完關。分割器直接用引擎的 CharSegmenter
-                // 介面（NCNN yoloseg／cseg 都實作它），聯集配方就是一個把兩顆 OR 起來的匿名 CharSegmenter。
+                // 配方＝(標籤, 偵測器路徑, 開分割器的工廠)；每套只在自己那輪開、用完關。分割器一律由引擎
+                // NightReadRenderer.charSegmenter 開（單顆＝(yolo, null)、聯集＝(yolo, cseg)），聯集邏輯在引擎、這裡不再自己 OR。
+                // yolo 有才排配方，所以工廠回 null 只可能是契約被改，用 checkNotNull 直接炸出來而非靜默略過。
                 val recipes = buildList {
-                    if (yoloParam != null && yoloBin != null) add(Recipe("yolo NCNN fp16", detNcnn) { YoloSegSegmenter(yoloParam, yoloBin) })
-                    if (yoloParam != null && yoloBin != null && csegParam != null && csegBin != null) add(Recipe("yolo+cseg NCNN", detNcnn) {
-                        val yolo = YoloSegSegmenter(yoloParam, yoloBin)
-                        val cseg = CsegSegmenter(csegParam, csegBin)
-                        object : CharSegmenter {
-                            override fun segment(page: Bitmap): BooleanArray {
-                                val a = yolo.segment(page)
-                                val b = cseg.segment(page)
-                                return BooleanArray(a.size) { a[it] || b[it] }
-                            }
-                            override fun close() { yolo.close(); cseg.close() }
-                        }
+                    if (yoloParam != null) add(Recipe("yolo NCNN fp16", detNcnn) {
+                        checkNotNull(NightReadRenderer.charSegmenter(yoloParam, null)) { "charSegmenter(yolo, null) 回 null" }
+                    })
+                    if (yoloParam != null && csegParam != null) add(Recipe("yolo+cseg NCNN", detNcnn) {
+                        checkNotNull(NightReadRenderer.charSegmenter(yoloParam, csegParam)) { "charSegmenter(yolo, cseg) 回 null" }
                     })
                 }
                 if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型（需 manga_seg_s／cartoonseg 的 .ncnn.param/.bin）"); return@launch }
@@ -818,16 +810,19 @@ class MainActivity : AppCompatActivity() {
                     val tLoad = System.currentTimeMillis()
                     Detector(det).use { detector ->
                         open().use { masker ->
-                            // 整合時 cseg 是逐章載入，載入成本要知道（Net 建立含權重讀取）
+                            // 暖機算進載入：NCNN 第一次 extract 才真的建 pipeline，產品也是載完就 warmUp、逐頁數字不含它
+                            masker.warmUp()
+                            // 整合時 cseg 是逐章載入，載入成本要知道（Net 建立含權重讀取＋暖機）
                             log("  載入 ${System.currentTimeMillis() - tLoad}ms")
                             for ((name, bmp) in pages) {
                                 repeat(2) { pass ->
-                                    val t = LongArray(3)
-                                    val out = nightReadOnce(bmp, detector, masker, t)
+                                    val (out, st) = nightReadOnce(bmp, detector, masker)
                                     if (pass == 1) {
+                                        val t = longArrayOf(st.detectMs, st.maskMs, st.renderMs)
                                         results.getOrPut(label) { mutableListOf() }.add(Triple(name, out, t))
+                                        val scaled = st.scaledTo?.let { (sw, sh) -> "  scaled ${sw}×$sh" } ?: ""
                                         log("  $name  detect ${t[0]}ms  mask ${t[1]}ms  render ${t[2]}ms  " +
-                                            "total ${t.sum()}ms")
+                                            "total ${t.sum()}ms$scaled")
                                     } else {
                                         out.recycle()
                                     }
@@ -850,79 +845,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 夜讀測試配方：偵測器（NCNN .param）＋ 開人物分割器的工廠（每套各自開關；引擎 [CharSegmenter]＝NCNN yoloseg／cseg）。 */
+    /** 夜讀測試配方：偵測器（NCNN .param）＋ 開人物分割器的工廠（每套各自開關；分割器由引擎 [NightReadRenderer.charSegmenter] 給）。 */
     private data class Recipe(val label: String, val detector: String, val open: () -> CharSegmenter)
 
-    /** 跑一次夜讀，把三段耗時寫進 [t]（detect / mask / render）。 */
+    /**
+     * 跑一次夜讀＝呼叫產品同一條 [NightReadRenderer.render]（縮圖／偵測／分割／重繪／輸出 Bitmap 全在引擎），
+     * 三段耗時與有無縮圖從 [NightReadStats] 回；sandbox 不再自己做灰階、彩度、文字區、遮罩換算——那些若跟產品不同步，
+     * 這裡量到的就不是產品的數字。
+     */
     private fun nightReadOnce(
         page: Bitmap,
         detector: Detector,
         masker: CharSegmenter,
-        t: LongArray,
-    ): Bitmap {
-        val w = page.width
-        val h = page.height
-        val px = IntArray(w * h)
-        page.getPixels(px, 0, w, 0, 0, w, h)
-
-        var ts = System.currentTimeMillis()
-        val detection = detector.detect(page)
-        val regions = Grouping.group(detection.lines).map {
-            NrRegion(
-                it.x0.toInt().coerceIn(0, w), it.y0.toInt().coerceIn(0, h),
-                it.x1.toInt().coerceIn(0, w), it.y1.toInt().coerceIn(0, h),
-            )
-        }
-        val seg = bitmapToNrMask(detection.textMask, w, h)
-        detection.textMask.recycle()
-        t[0] = System.currentTimeMillis() - ts
-
-        ts = System.currentTimeMillis()
-        val chars = Mask(w, h, masker.segment(page)) // 分割器回 w×h 的 BooleanArray，true＝人物
-        t[1] = System.currentTimeMillis() - ts
-
-        ts = System.currentTimeMillis()
-        val gray = Gray(w, h)
-        val chroma = Gray(w, h)
-        for (i in px.indices) {
-            val p = px[i]
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            // BT.601，與 cv2.imread(IMREAD_GRAYSCALE) 同式：管線所有門檻都在這個灰階空間量的
-            gray.data[i] = ((r * 299 + g * 587 + b * 114 + 500) / 1000).coerceIn(0, 255)
-            chroma.data[i] = maxOf(r, g, b) - minOf(r, g, b)
-        }
-        val res = NightRead.render(NightReadInput(gray, seg, regions, chars, chroma))
-        t[2] = System.currentTimeMillis() - ts
-
-        val outPx = IntArray(w * h)
-        for (i in outPx.indices) {
-            val v = res.out.data[i]
-            outPx[i] = Color.rgb(v, v, v)
-        }
-        return Bitmap.createBitmap(outPx, w, h, Bitmap.Config.ARGB_8888)
-    }
-
-    private fun bitmapToNrMask(bmp: Bitmap, w: Int, h: Int): Mask {
-        val m = Mask(w, h)
-        val px = IntArray(bmp.width * bmp.height)
-        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
-        if (bmp.width == w && bmp.height == h) {
-            for (i in px.indices) m.data[i] = (px[i] and 0xFF) > 127
-        } else {
-            // 筆畫遮罩可能是半解析度，最近鄰放大回原尺寸
-            val sx = bmp.width.toDouble() / w
-            val sy = bmp.height.toDouble() / h
-            for (y in 0 until h) {
-                val my = minOf(bmp.height - 1, (y * sy).toInt())
-                for (x in 0 until w) {
-                    val mx = minOf(bmp.width - 1, (x * sx).toInt())
-                    m.data[y * w + x] = (px[my * bmp.width + mx] and 0xFF) > 127
-                }
-            }
-        }
-        return m
+    ): Pair<Bitmap, NightReadStats> {
+        val stats = NightReadStats()
+        val out = NightReadRenderer.render(page, detector, masker, stats = stats)
+        return out to stats
     }
 
     /** 合成 A/B 大圖：頂部裝置與耗時，其下每列一張圖（原圖｜各配方）。 */

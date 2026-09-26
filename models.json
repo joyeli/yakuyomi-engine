@@ -1,6 +1,6 @@
 {
-  "version": "models-v4",
-  "note": "Auto-download manifest. The engine fetches this (ModelDownloader.fetchManifest), downloads each url into the app's models dir, and verifies sha256. v4 moves OCR to NCNN — mixed precision: fp16 backbone + fp32 transformer via ncnn's per-layer featmask plus an explicit Cast layer; the sinusoidal positional encoding is fed as a second input, so any strip width works. On-device it is ~23% faster than the previous ORT int8 model and reads the small kana int8 got wrong (241/242 lines matching fp32 on 9 pages, vs 223/242 for int8). The engine no longer depends on ONNX Runtime. The _mixed param needs an arm82 (fp16) CPU — the engine falls back to the plain param otherwise; both params share one .bin. Detector (models-v3) and inpaint (models-v2) are unchanged and their urls still point at those releases. NCNN roles ship as .param + .bin (all files required). Weights are GPL-3.0; see docs/MODELS.md. Urls point at this repo's GitHub release assets.",
+  "version": "models-v5",
+  "note": "Auto-download manifest. The engine fetches this (ModelDownloader.fetchManifest), downloads each url into the app's models dir, and verifies sha256. v4 moves OCR to NCNN — mixed precision: fp16 backbone + fp32 transformer via ncnn's per-layer featmask plus an explicit Cast layer; the sinusoidal positional encoding is fed as a second input, so any strip width works. On-device it is ~23% faster than the previous ORT int8 model and reads the small kana int8 got wrong (241/242 lines matching fp32 on 9 pages, vs 223/242 for int8). The engine no longer depends on ONNX Runtime. The _mixed param needs an arm82 (fp16) CPU — the engine falls back to the plain param otherwise; both params share one .bin. Detector (models-v3) and inpaint (models-v2) are unchanged and their urls still point at those releases. NCNN roles ship as .param + .bin (all files required). Translation weights (detector/ocr/inpainter) are GPL-3.0; see docs/MODELS.md. Urls point at this repo's GitHub release assets. v5 adds role \"charseg\" (night-reading character masks, backend ncnn, both fp16): manga_seg_s (YOLO11-seg, 20 MB) + cartoonseg (CartoonSegmentation RTMDet-Ins, 126 MB), unioned on device (~1.2-1.4 s/page). They are downloaded with everything else but only the night-reading renderer (NightReadRenderer) uses them; translation readiness does not depend on them. Their licensing differs from the GPL-3.0 translation weights: see each charseg entry's license/note (redistributed for research/non-commercial use with attribution; removed on rights-holder request; bring-your-own-model works). Translation roles (detector v3, ocr v4, inpainter v2) are unchanged and still point at those releases.",
   "models": [
     {
       "role": "detector",
@@ -76,6 +76,48 @@
       "sha256": "a52db45eafc1dd2aa4ce9a339c711917fa98fefb31ce4506d4c95e8b5e3560b6",
       "license": "GPL-3.0",
       "source": "https://github.com/zyddnys/manga-image-translator"
+    },
+    {
+      "role": "charseg",
+      "backend": "ncnn",
+      "name": "manga_seg_s.ncnn.param",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v5/manga_seg_s.ncnn.param",
+      "size": 25188,
+      "sha256": "b0ed82b88d574b2a36d15cbcb39959091258d341c6d3528199bef06a8bea16cc",
+      "license": "AGPL-3.0 (Ultralytics); weights trained on MangaSeg/Manga109-s — research/non-commercial, see note",
+      "source": "https://huggingface.co/anonimkaq4/manga-page-element-segmentation",
+      "note": "YOLO11-seg (Ultralytics, AGPL-3.0) for manga page elements; weights from the Hugging Face model card anonimkaq4/manga-page-element-segmentation (license: other; trained on MangaSeg / Manga109-s annotations). Attribution required by the model card: \"Copyrighted by Minshan Xie\"; cite the CVPR 2025 MangaSeg paper. The card asks redistributors and commercial users to confirm the MangaSeg, Manga109-s and Ultralytics licenses themselves. Redistributed here for research/non-commercial use only, as a convenience for auto-download; will be removed on rights-holder request; users may supply their own weights (bring-your-own-model). Our own NCNN conversion (ultralytics format=ncnn, fp16, parity/export_yoloseg_ncnn.py). Night-reading only (character mask); the translation pipeline does not use it. Union with cartoonseg is the shipped recipe; yolo alone also works (guard-box violations 18 -> 27 on the fixture set)."
+    },
+    {
+      "role": "charseg",
+      "backend": "ncnn",
+      "name": "manga_seg_s.ncnn.bin",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v5/manga_seg_s.ncnn.bin",
+      "size": 20426200,
+      "sha256": "680ddd6886588fbe128b77e0cebc9036534eb865b226466c0e0e8677a622d71a",
+      "license": "AGPL-3.0 (Ultralytics); weights trained on MangaSeg/Manga109-s — research/non-commercial, see note",
+      "source": "https://huggingface.co/anonimkaq4/manga-page-element-segmentation"
+    },
+    {
+      "role": "charseg",
+      "backend": "ncnn",
+      "name": "cartoonseg.ncnn.param",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v5/cartoonseg.ncnn.param",
+      "size": 37237,
+      "sha256": "e259a57af1dba1149d07fe5f1d096548a78126a695f6708e8217e6a7284b6266",
+      "license": "unspecified (upstream repo has no license file); trained on Manga109 — research/non-commercial, see note",
+      "source": "https://huggingface.co/Jakaline/CartoonSegmentationOnnx",
+      "note": "CartoonSegmentation (RTMDet-Ins) instance segmentation of characters; ONNX weights from Hugging Face Jakaline/CartoonSegmentationOnnx, our own NCNN conversion (pnnx, fp16, parity/export_cseg_ncnn.py). The upstream repo CartoonSegmentation/CartoonSegmentation has no LICENSE file and its README states no license; training data includes Manga109. Redistributed here for research/non-commercial use only, as a convenience for auto-download, with attribution to the CartoonSegmentation authors; will be removed on rights-holder request; users may supply their own weights (bring-your-own-model). Night-reading only (character mask); optional second segmenter, unioned with manga_seg_s."
+    },
+    {
+      "role": "charseg",
+      "backend": "ncnn",
+      "name": "cartoonseg.ncnn.bin",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v5/cartoonseg.ncnn.bin",
+      "size": 126418212,
+      "sha256": "f3bf313fafb21477ffb6aefbbfbafb3d8b96815eff4da153fd3bf2a01cc2d83f",
+      "license": "unspecified (upstream repo has no license file); trained on Manga109 — research/non-commercial, see note",
+      "source": "https://huggingface.co/Jakaline/CartoonSegmentationOnnx"
     }
   ]
 }

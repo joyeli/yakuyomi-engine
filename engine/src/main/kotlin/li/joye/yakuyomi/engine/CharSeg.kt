@@ -1,6 +1,7 @@
 package li.joye.yakuyomi.engine
 
 import android.graphics.Bitmap
+import android.util.Log
 import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.max
@@ -10,11 +11,27 @@ import kotlin.math.roundToInt
 /**
  * 人物語意分割（夜讀用）：把一頁的人物像素標出來，夜讀重繪據此「絕不塗錯」臉／手／白衣／白髮。
  *
- * 模型走 NCNN（與偵測、去字同一個後端、同一把鎖）。回傳與頁面同尺寸的布林遮罩，true＝人物。
+ * 模型走 NCNN（與偵測、去字同一個後端、同一把鎖）。回傳與頁面同尺寸（row-major w×h）的布林遮罩，true＝人物。
  * 這是**模型原輸出**的聯集，貼墨收邊與平滑由夜讀管線負責。
+ * 定案配方＝yolo ∪ cseg（[UnionCharSegmenter]，由 [NightReadRenderer.charSegmenter] 組）。
  */
 interface CharSegmenter : AutoCloseable {
     fun segment(page: Bitmap): BooleanArray
+
+    /**
+     * 暖機：對 64×64 空白圖 segment 一次，讓 NCNN net 的首次 lazy 初始化在單緒做完（對照 [Detector.warmUp]）。
+     * 之後才允許從並發的 coroutine 呼叫——多頁同時打進未初始化的 net 會原生 crash。失敗只記 log（暖機不是正式推論）。
+     */
+    fun warmUp() {
+        val blank = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+        try {
+            segment(blank)
+        } catch (t: Throwable) {
+            Log.w("CharSegmenter", "人物分割暖機失敗：${t.message}")
+        } finally {
+            blank.recycle()
+        }
+    }
 }
 
 /**
@@ -22,6 +39,11 @@ interface CharSegmenter : AutoCloseable {
  *
  * 前處理與後處理的規格在 `parity/export_cseg_ncnn.py`（切圖、blob 契約、numpy 參考實作），
  * 後處理由 [CsegPost] 移植、JVM 測試逐像素對 fixture。輸入固定長邊 640（訓練解析度、實測最佳）。
+ *
+ * **權重來源與授權**（2026-09 查證）：ONNX 權重取自 Hugging Face `Jakaline/CartoonSegmentationOnnx`（本專案再轉 NCNN）；
+ * 上游 GitHub `CartoonSegmentation/CartoonSegmentation` **沒有 LICENSE 檔、README 也未寫授權**，訓練資料含 Manga109
+ * → **再散布授權不明確**（不是 MIT、也不是 GPL）。本專案照散布（models.json role "charseg"）並附 attribution，
+ * 聲明研究／非商業用途、權利人要求即下架、使用者亦可自行取得權重（BYOM 放 `models/`）。
  */
 class CsegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
 
@@ -317,8 +339,15 @@ object CsegPost {
 }
 
 /**
- * yoloseg（YOLO11-seg，manga109 訓練，`manga_seg_s.ncnn.param/.bin`，ultralytics `format=ncnn` 匯出，fp16）。
+ * yoloseg（YOLO11-seg，`manga_seg_s.ncnn.param/.bin`，ultralytics `format=ncnn` 匯出，fp16）。
  * 規格在 `parity/export_yoloseg_ncnn.py`；後處理由 [YoloSegPost] 移植，JVM 測試逐像素對 fixture。
+ *
+ * **權重來源與授權**（2026-09 查證）：權重取自 Hugging Face `anonimkaq4/manga-page-element-segmentation`
+ * （模型卡 license: other；以 MangaSeg／Manga109-s 標註訓練）。架構 YOLO11 為 Ultralytics **AGPL-3.0**（與本專案
+ * GPL-3.0 相容——GPLv3 §13——但相容不等於沒有義務）。模型卡要求：再散布或商用前自行確認 MangaSeg、Manga109-s、
+ * Ultralytics 三方授權、標註 "Copyrighted by Minshan Xie"、引用 CVPR 2025 MangaSeg 論文 → **再散布授權不明確**。
+ * 本專案照散布（models.json role "charseg"）並附上述 attribution，聲明研究／非商業用途、權利人要求即下架、
+ * 使用者亦可自行取得權重（BYOM 放 `models/`）。
  */
 class YoloSegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
 

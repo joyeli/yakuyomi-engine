@@ -5,7 +5,7 @@ plugins {
 
 // Yakuyomi fork 以 Gradle composite build（includeBuild）接此引擎，靠 group:name 替換依賴
 group = "li.joye.yakuyomi"
-version = "0.3.0"
+version = "0.4.0"
 
 android {
     namespace = "li.joye.yakuyomi.engine"
@@ -61,6 +61,9 @@ kotlin {
 dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+    // 夜讀膠水（NightReadRenderer）在引擎：用 api 而非 implementation——fork 要拿到 NightReadParams 等 nightread 型別。
+    // 座標由根 settings 的 includeBuild("yakuyomi-nightread") 以 group:name 替換成 submodule 原始碼（fork 經 includeBuild 本 repo 一併拿到）。
+    api("li.joye.yakuyomi:nightread:0.1.0")
 
     testImplementation("junit:junit:4.13.2")
 }

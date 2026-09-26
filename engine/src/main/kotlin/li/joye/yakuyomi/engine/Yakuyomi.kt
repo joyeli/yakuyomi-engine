@@ -19,6 +19,9 @@ import android.graphics.Typeface
  * ```
  * **進階**（逐元件除錯，如 debug overlay）：可直接 new [Detector]/[Ocr]/[Inpainter]/[LlmTranslator] 再自組 [Pipeline]，
  * 但生命週期得自己管（這條工廠路徑才會幫你 close）。
+ *
+ * **夜讀**（頁面本身變暗的分區重繪）不經 [TranslationEngine]：入口是 [NightReadRenderer]（`charSegmenter` 由 [ModelSet]
+ * 的兩顆選配分割模型建人物分割器、`render` 一條龍），偵測器可與翻譯共用同一顆 [Detector]。
  */
 object Yakuyomi {
     /**

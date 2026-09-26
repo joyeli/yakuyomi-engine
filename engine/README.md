@@ -23,6 +23,8 @@ val models = ModelSet(
     detectorNcnn     = "/path/dbnet_detect.ncnn.param",
     ocr              = "/path/ocr_48px_ctc.ncnn.param",  // or the _mixed one; the engine picks at load
     aotInpainterNcnn = "/path/mit_aot_fixed512.ncnn.param",
+    charSegYoloNcnn  = "/path/manga_seg_s.ncnn.param",   // optional (night reading only); default null
+    charSegCsegNcnn  = "/path/cartoonseg.ncnn.param",    // optional (night reading only); default null
 )
 
 // 2. Load the OCR alphabet (in the engine assets) and your API key.
@@ -58,15 +60,17 @@ val models = ModelSet.resolve(dir.listFiles()!!.map { it.name to it.absolutePath
 
 **Bring your own model (BYOM).** Or supply the files yourself — put them anywhere local and either let `ModelSet.resolve` name-match them, or name each role explicitly (see [Quick start](#quick-start)).
 
-Either way it's the same six files, all NCNN (`.param` + `.bin`, both required; OCR has two `.param` files — plain and `_mixed` — over one `.bin`):
+Either way it's the same six files for translation, all NCNN (`.param` + `.bin`, both required; OCR has two `.param` files — plain and `_mixed` — over one `.bin`), plus an optional four for night reading:
 
 | Role | File (typical name) | Backend | What it does | Source |
 |---|---|---|---|---|
 | detector | `dbnet_detect.ncnn.param` (+ `.bin`) | NCNN | text boxes + stroke mask | DBNet, from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) (its default detector) |
 | ocr | `ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param` (+ `.bin`) | NCNN | 48px CTC Japanese OCR, mixed fp16/fp32 | manga-image-translator |
 | inpainter | `mit_aot_fixed512.ncnn.param` (+ `.bin`) | NCNN | AOT-GAN text removal | [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| charseg (yolo) → `charSegYoloNcnn` | `manga_seg_s.ncnn.param` (+ `.bin`) | NCNN | character mask for night reading (YOLO11-seg, character class) — optional | weights from Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation); not GPL, see [docs/MODELS.md](../docs/MODELS.md#night-reading-models) |
+| charseg (cseg) → `charSegCsegNcnn` | `cartoonseg.ncnn.param` (+ `.bin`) | NCNN | character mask for night reading (CartoonSegmentation RTMDet-Ins) — optional | weights from Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx); not GPL, see [docs/MODELS.md](../docs/MODELS.md#night-reading-models) |
 
-`ModelSet.resolve(files)` maps a flat `(filename, localPath)` listing to the roles by filename and extension: `.param` containing `dbnet` is the detector, `.param` containing `aot` is the inpainter, `.param` containing `ocr` is OCR (either OCR param — `Ocr` switches to `_mixed` or back itself after checking the CPU). It returns `null` if any of the three is missing — use that as your "ready to translate?" check. Note every role needs both files: `resolve` only sees the `.param`, so make sure the matching `.bin` sits next to it (and, for OCR, the other `.param`).
+`ModelSet.resolve(files)` maps a flat `(filename, localPath)` listing to the roles by filename and extension: `.param` containing `dbnet` is the detector, `.param` containing `aot` is the inpainter, `.param` containing `ocr` is OCR (either OCR param — `Ocr` switches to `_mixed` or back itself after checking the CPU). It returns `null` if any of the three is missing — use that as your "ready to translate?" check. Two more keywords are optional: `.param` containing `manga_seg` → `charSegYoloNcnn`, `.param` containing `cartoonseg` → `charSegCsegNcnn`. A missing one never makes `resolve` return `null` — translation readiness does not depend on night reading — the field is simply `null`, and `NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)` builds a segmenter from whatever is there (both → union, one → that one, none → `null`, night reading unavailable). Note every role needs both files: `resolve` only sees the `.param`, so make sure the matching `.bin` sits next to it (and, for OCR, the other `.param`).
 
 Paths must be local files, not SAF/content URIs: the backends load from the path into native memory. Don't read weights into the JVM heap with `readBytes()`; the heap is capped around 512 MB regardless of device RAM and will OOM. If the source is SAF, copy to `filesDir` first and pass the path.
 
@@ -92,6 +96,8 @@ The full list, with ranges and the effect of each, is in [`docs/PARAMETERS.md`](
 - `InpainterConfig.method = "aot"`. Two flavours of text removal: `"boxfill"` (fast text removal) flat-fills every text region with the nearest background colour — instant, cleanest on flat bubbles, but paints a colour block over busy artwork; `"aot"` (AI text removal, default) rebuilds the background under every text region with a whole-page AOT-GAN pass (`tileSize = 768`) — slower, but reconstructs the artwork instead of blocking it.
 - `RenderConfig.orientation = AUTO`. Follows each region's detected direction, then rotates along the region's skew angle.
 - `TranslatorConfig.provider = "deepseek"`, with `apiBase` and `model`. Any OpenAI-compatible endpoint. `LlmProviders.ALL` carries presets for manga-image-translator's LLM set plus OpenRouter (all OpenAI-compatible; Gemini via its compat endpoint), and `LlmModels.list()` fetches a provider's live model list. See [`docs/PROVIDERS.md`](../docs/PROVIDERS.md).
+
+**Night reading** is a separate entry point, not part of `translatePage`: `NightReadRenderer.render(page, detector, charSeg, NightReadParams())` runs detection, character segmentation and the night-read re-render in one call and returns a new bitmap (pages over `NightReadRenderer.MAX_PIXELS` = 3.5 MPx are scaled down first, and the output is the scaled size), where `charSeg` comes from `NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)`. `NightReadParams()` defaults are the settled values; run one page at a time. The night-read library (`li.joye.yakuyomi:nightread`) is an `api` dependency of `:engine`, so its types are visible to consumers.
 
 ### Language pair (not fixed to JP→CHT)
 

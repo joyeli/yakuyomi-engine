@@ -74,6 +74,7 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 - **排版** — 文字框排版，直排或橫排，字級自適應、垂直置中、描邊隨字級、行頭禁則、沿傾斜氣泡角度擺放。文字顏色依去字後的背景決定（亮底黑字、暗底白字）。
 - **重繪（analyze | render 切分）** — 翻好的頁會連同它的分析素材一起回傳：文字遮罩，加上帶著原文與譯文的區塊。之後換去字法、重新排版時不必重跑偵測／OCR／LLM——換去字模式、升級品質只花去字 + 排版兩個階段，不耗 token。
 - **語言** — 開箱即用日翻繁中。換目標語言、來源語言、few-shot 範例就能翻任何語言對。繁中輸出靠 prompt，沒有 OpenCC 後處理。
+- **夜讀（進行中）** — 把頁面本身變暗、同時保護人物：用同一顆偵測器加兩顆裝置端人物分割（YOLO11-seg ∪ CartoonSegmentation，NCNN）；預設關、reader 端整合進行中——見 [docs/MODELS_zh.md](docs/MODELS_zh.md#夜讀模型)。
 
 ## 儲存庫結構
 
@@ -95,15 +96,16 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 | 偵測 | DBNet，ResNet34 + DB head（`.ncnn.param`/`.bin`） | NCNN | 來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator)（它的 default detector） |
 | OCR | 48px CTC，fp16/fp32 混合精度（`.ncnn.param` ×2 + `.bin`） | NCNN | 權重來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | 去字 | AOT-GAN 漫畫 inpaint（`.ncnn.param`/`.bin`） | NCNN | 來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| 人物分割——夜讀（選配、預設關） | YOLO11-seg `manga_seg_s` ∪ CartoonSegmentation RTMDet-Ins `cartoonseg`（各 `.ncnn.param`/`.bin`） | NCNN | 權重來自 Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation) 與 [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)——非 GPL，見 [docs/MODELS_zh.md](docs/MODELS_zh.md#夜讀模型) |
 | 字型 | Noto Sans/Serif CJK、思源 | — | CJK 算繪（OFL / Apache） |
 
-全部都是 NCNN，`.param` + `.bin` 成對（都要）；OCR 是兩份 `.param`（原版與 `_mixed`）共用一份 `.bin`，引擎載入時自己挑。整套約 247 MB，大半是 fp16 偵測器（153 MB）與 fp16 的 OCR 權重（83 MB）。
+全部都是 NCNN，`.param` + `.bin` 成對（都要）；OCR 是兩份 `.param`（原版與 `_mixed`）共用一份 `.bin`，引擎載入時自己挑。整套約 247 MB，大半是 fp16 偵測器（153 MB）與 fp16 的 OCR 權重（83 MB）。選配的夜讀那一對（`models-v5`）另加約 147 MB；翻譯永遠用不到它。
 
 ## 試跑
 
 引擎是 Android library（arm64、NCNN），所以要試跑就是把 sandbox app（`:app-sandbox`）編出來裝上去。**需要真的 arm64 Android 裝置**——sandbox 只打 `arm64-v8a`，x86 模擬器跑不起來。
 
-**1. 拿模型。** 模型不在 repo 裡。把 [`models.json`](models.json) 列的六個檔抓下來——偵測器的 `.param`+`.bin` 在 `models-v3` release、OCR 的兩份 `.param`（原版與 `_mixed`）+ `.bin` 在 `models-v4`、去字的 `.param`+`.bin` 在 `models-v2`——全放進同一個手機讀得到的資料夾。來源、雜湊與授權見 [docs/MODELS_zh.md](docs/MODELS_zh.md)。
+**1. 拿模型。** 模型不在 repo 裡。把 [`models.json`](models.json) 列的十個檔抓下來——偵測器的 `.param`+`.bin` 在 `models-v3` release、OCR 的兩份 `.param`（原版與 `_mixed`）+ `.bin` 在 `models-v4`、去字的 `.param`+`.bin` 在 `models-v2`、兩組人物分割的 `.param`+`.bin` 在 `models-v5`（只有夜讀用得到；翻譯 pipeline 沒有它們照跑）——全放進同一個手機讀得到的資料夾。來源、雜湊與授權見 [docs/MODELS_zh.md](docs/MODELS_zh.md)。
 
 **2.（選配）給 LLM key。** 在 sandbox app 裡填 DeepSeek key（模型資料夾按鈕下方那格，存在 app 的偏好設定——APK 不內建任何 key）。**不給也沒關係**：翻譯就是關著，偵測／OCR／去字照跑。`api-keys.properties`（由 `api-keys.properties.example` 複製）只有桌面 parity 腳本會讀。
 
@@ -140,7 +142,9 @@ reader app（Yakuyomi）在另一個 fork repo。
 
 - [mihon](https://github.com/mihonapp/mihon) — app fork 的來源（Apache-2.0）
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — prompt 與行為參考；DBNet 偵測、OCR 與 AOT-GAN 去字模型權重
-- [ncnn](https://github.com/Tencent/ncnn) — 三顆模型的裝置端推論 runtime
+- [ncnn](https://github.com/Tencent/ncnn) — 所有裝置端模型的推論 runtime
+- [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation) — 夜讀用的 YOLO11-seg 人物分割權重（「Copyrighted by Minshan Xie」；MangaSeg／Manga109-s）
+- [CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation)，權重經 [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx) — 夜讀用的 RTMDet-Ins 人物分割權重
 - Noto Sans/Serif CJK、思源 — 字型
 
 ## 授權
@@ -151,5 +155,7 @@ reader app（Yakuyomi）在另一個 fork repo。
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — GPL-3.0（prompt/協定、偵測/OCR/去字行為、文字行分組；DBNet 偵測模型、48px CTC OCR 模型與 AOT-GAN 去字模型）
 - [ncnn](https://github.com/Tencent/ncnn) — BSD-3-Clause（推論 runtime，靜態連結）
 - [mihon](https://github.com/mihonapp/mihon) — Apache-2.0（reader fork 在另一個產品 repo；Apache-2.0 與 GPL-3.0 相容，故組合後的 app 為 GPL-3.0）
+- YOLO11-seg 人物分割權重（[anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)）— 模型卡 `license: other`；[Ultralytics](https://github.com/ultralytics/ultralytics) AGPL-3.0；以 MangaSeg／Manga109-s 訓練；「Copyrighted by Minshan Xie」（僅夜讀用）
+- CartoonSegmentation 人物分割權重（[Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)）— [上游](https://github.com/CartoonSegmentation/CartoonSegmentation)未寫授權；訓練資料含 Manga109（僅夜讀用）
 
-模型權重皆 GPL-3.0，透過本 repo 的 release **散布**供一鍵自動下載——manifest 是 [`models.json`](models.json)，指向 [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3) 的偵測器、[`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4) 的 OCR，以及 [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) 裡未變動的去字檔（見 [docs/MODELS_zh.md](docs/MODELS_zh.md)）；也可從上述來源自備。字型未 bundle（系統 CJK fallback）。
+翻譯模型權重皆 GPL-3.0，透過本 repo 的 release **散布**供一鍵自動下載——manifest 是 [`models.json`](models.json)，指向 [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3) 的偵測器、[`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4) 的 OCR，以及 [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) 裡未變動的去字檔（見 [docs/MODELS_zh.md](docs/MODELS_zh.md)）；也可從上述來源自備。夜讀那兩顆人物分割模型**不是** GPL-3.0：其 NCNN 轉檔由 [`models-v5`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v5) 散布、僅供研究／非商業用途、附上述出處歸屬，權利人要求即下架——細節見 [docs/MODELS_zh.md](docs/MODELS_zh.md#夜讀模型)。字型未 bundle（系統 CJK fallback）。

@@ -68,4 +68,55 @@ class ModelSetTest {
         assertNull(ModelSet.resolve(listOf("dbnet.param" to "d", "ocr_int8.onnx" to "o", "aot.param" to "a")))
         assertNull(ModelSet.resolve(listOf("dbnet.param" to "d", "ocr_48px_ctc.ncnn.bin" to "o", "aot.param" to "a")))
     }
+
+    /** 夜讀兩顆選配（models-v5 真實檔名）：都在 → 兩欄都填、.bin 不算；翻譯三顆不受夜讀檔干擾。 */
+    @Test fun resolvesCharSeg() {
+        val m = ModelSet.resolve(
+            listOf(
+                "dbnet_detect.ncnn.param" to "/m/det.param",
+                "ocr_48px_ctc.ncnn.param" to "/m/ocr.param",
+                "mit_aot_fixed512.ncnn.param" to "/m/aot.param",
+                "manga_seg_s.ncnn.param" to "/m/yolo.param",
+                "manga_seg_s.ncnn.bin" to "/m/yolo.bin",
+                "cartoonseg.ncnn.param" to "/m/cseg.param",
+                "cartoonseg.ncnn.bin" to "/m/cseg.bin",
+            ),
+        )!!
+        assertEquals("/m/yolo.param", m.charSegYoloNcnn)
+        assertEquals("/m/cseg.param", m.charSegCsegNcnn)
+        assertEquals("/m/det.param", m.detectorNcnn)
+        assertEquals("/m/ocr.param", m.ocr)
+        assertEquals("/m/aot.param", m.aotInpainterNcnn)
+    }
+
+    /** 缺夜讀模型不影響翻譯就緒：resolve 仍成功、兩欄 null；只有一顆也接受（NightReadRenderer 會用單顆）。 */
+    @Test fun charSegOptional() {
+        val base = listOf("dbnet.param" to "d", "ocr.param" to "o", "aot.param" to "a")
+        val none = ModelSet.resolve(base)!!
+        assertNull(none.charSegYoloNcnn)
+        assertNull(none.charSegCsegNcnn)
+        val yoloOnly = ModelSet.resolve(base + ("manga_seg_s.ncnn.param" to "y"))!!
+        assertEquals("y", yoloOnly.charSegYoloNcnn)
+        assertNull(yoloOnly.charSegCsegNcnn)
+        val csegOnly = ModelSet.resolve(base + ("cartoonseg.ncnn.param" to "c"))!!
+        assertNull(csegOnly.charSegYoloNcnn)
+        assertEquals("c", csegOnly.charSegCsegNcnn)
+    }
+
+    /**
+     * 關鍵字不互撞：夜讀檔名（manga_seg／cartoonseg）不含 dbnet/ocr/aot——只有夜讀檔時翻譯三顆仍缺 → null、
+     * 不會被誤認成任何翻譯角色；翻譯檔名（含 mixed OCR）也不含夜讀關鍵字。
+     */
+    @Test fun charSegKeysDoNotCollide() {
+        assertNull(ModelSet.resolve(listOf("manga_seg_s.ncnn.param" to "y", "cartoonseg.ncnn.param" to "c")))
+        val m = ModelSet.resolve(
+            listOf(
+                "dbnet_detect.ncnn.param" to "d",
+                "ocr_48px_ctc_mixed.ncnn.param" to "o",
+                "mit_aot_fixed512.ncnn.param" to "a",
+            ),
+        )!!
+        assertNull(m.charSegYoloNcnn)
+        assertNull(m.charSegCsegNcnn)
+    }
 }

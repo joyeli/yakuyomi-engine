@@ -1,7 +1,8 @@
 package li.joye.yakuyomi.engine
 
 /**
- * 引擎要的三顆模型的本機檔案路徑——**全 NCNN**（偵測 DBNet、OCR 48px CTC、去字 AOT-GAN 各一組 `.param`/`.bin`）。
+ * 引擎要的模型本機檔案路徑——**全 NCNN**、五個角色：翻譯必備三顆（偵測 DBNet、OCR 48px CTC、去字 AOT-GAN）
+ * ＋夜讀選配兩顆（人物分割 YOLO11-seg、CartoonSegmentation RTMDet-Ins），各一組 `.param`/`.bin`。
  * 用 [resolve] 從一堆 (檔名, 本機路徑) 比對出來——把「哪個檔是哪顆模型」的命名知識收進引擎。
  *
  * 路徑必須是**本機檔案路徑**（非 SAF/content uri）：模型走 native 記憶體載入
@@ -20,12 +21,21 @@ data class ModelSet(
     val detectorNcnn: String? = null,
     /** AOT-GAN 去字的 NCNN 版（`.param`，同名 `.bin` 需在旁）。去字純 NCNN（整頁固定 tile 768）。 */
     val aotInpainterNcnn: String? = null,
+    /**
+     * 夜讀人物分割 YOLO11-seg 的 NCNN 版（`manga_seg_s.ncnn.param`，同名 `.bin` 需在旁）。**選配**：缺了翻譯照常，
+     * 只是夜讀少一顆（兩顆都缺＝夜讀不可用）；給 [NightReadRenderer.charSegmenter]。
+     */
+    val charSegYoloNcnn: String? = null,
+    /** 夜讀人物分割 CartoonSegmentation（RTMDet-Ins）的 NCNN 版（`cartoonseg.ncnn.param`，同名 `.bin` 需在旁）。**選配**，同上。 */
+    val charSegCsegNcnn: String? = null,
 ) {
     companion object {
         /**
          * 從 (檔名, 本機路徑) 清單比對出模型；缺 OCR / 偵測 / 去字任一 → 回 null（未備齊，呼叫端略過翻譯）。
          * 比對不分大小寫、只認 `.param`（`.onnx` 不再接受）：ocr＝含 `ocr`（多份時優先檔名**不含** `mixed` 的原版；
          * 只有 mixed 也接受，由 [Ocr] pickParam 決定能不能用）；偵測＝含 `dbnet`；去字＝含 `aot`。
+         * 夜讀兩顆＝含 `manga_seg`（yolo）／`cartoonseg`（cseg），**缺不回 null**——翻譯就緒不受夜讀模型影響。
+         * 關鍵字彼此不撞：`cartoonseg`／`manga_seg` 都不含 `ocr`、`aot`、`dbnet`，翻譯三顆的檔名也不含夜讀關鍵字（有測試守著）。
          */
         fun resolve(files: List<Pair<String, String>>): ModelSet? {
             fun matches(name: String, vararg keys: String): Boolean {
@@ -38,7 +48,13 @@ data class ModelSet(
                 ?: return null
             val detNcnn = find("dbnet") ?: return null
             val aotNcnn = find("aot") ?: return null
-            return ModelSet(ocr = ocr, detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
+            return ModelSet(
+                ocr = ocr,
+                detectorNcnn = detNcnn,
+                aotInpainterNcnn = aotNcnn,
+                charSegYoloNcnn = find("manga_seg"),
+                charSegCsegNcnn = find("cartoonseg"),
+            )
         }
     }
 }

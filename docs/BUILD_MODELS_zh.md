@@ -2,7 +2,7 @@
 
 [English](BUILD_MODELS.md) ｜ 中文
 
-引擎載的三顆模型，都是我們自己對 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 上游 ckpt 的轉檔——沒有上游現成的可散布檔可指，所以由我們自己轉、自己 host。[MODELS_zh.md](MODELS_zh.md) 講這三顆是什麼、怎麼取得；這頁講**怎麼從上游 ckpt 重建它們**，以及**怎麼判斷你重建出來的是對的**。
+引擎載的三顆模型，都是我們自己對 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 上游 ckpt 的轉檔——沒有上游現成的可散布檔可指，所以由我們自己轉、自己 host。[MODELS_zh.md](MODELS_zh.md) 講這三顆是什麼、怎麼取得；這頁講**怎麼從上游 ckpt 重建它們**，以及**怎麼判斷你重建出來的是對的**。夜讀用的那兩顆選配人物分割模型也是轉檔——但來源是第三方權重、不是 manga-image-translator 的——在三條重建路徑之後[另有一節](#人物分割--ncnn夜讀)。
 
 這裡沒有任何需要你自己拼回去的配方——每條路徑就是一支腳本。以下是那些腳本要的環境、判斷產出的準則，以及「不驗證就會安靜出錯」的那些坑。
 
@@ -19,6 +19,7 @@
 | 偵測（DBNet） | **逐位元相同**——sha256 對得上 `models.json` | 實測：冷啟動重跑仍精確重現 `9e6db2f8…` / `f57bdbed…` |
 | OCR（NCNN） | **數值等價**——30 條 fixture 字條解碼文字與 ORT fp32 參考逐行相同、每個 timestep 的 argmax 相同、寬度掃描全過。`models.json` 的雜湊是出貨當時的值 | 與 DBNet 同一條 trace → pnnx 路徑，釘住的 toolchain 應能重現位元，但尚未在冷啟動重跑上確認過——用判準看、別看雜湊 |
 | 去字（AOT-GAN） | **數值等價**——`out0` 逐位元相同 ＋ 逐層權重比對。**sha256 對不上** | 這是預期內、已查清的：pnnx 的層自動命名與排序不同。見下 |
+| 人物分割（yolo／cseg，夜讀） | **數值等價**——NCNN 原始輸出對來源 ONNX 在 fp16 storage 容差內、人物聯集遮罩對 ONNX 路徑在測試頁上的 IoU。`models.json` 的雜湊是出貨當時的值 | 尚未在冷啟動重跑上確認過；yolo 走的是 ultralytics 內建的 pnnx，別指望換版本後位元不變——用判準看 |
 
 **為什麼 AOT 的雜湊永遠對不上。** 我們重建出的 `mit_aot_fixed512.ncnn.param` 是 33,762 B，release 是 33,810 B（差 −48 B）；`.bin` 則是**跟 release 一模一樣的 size、但位元不同**。兩個差異都是 pnnx 版本造成的，而且都追到底了：
 
@@ -187,6 +188,29 @@ ckpt（自動下載）→ 從 clone 取 `AOTGenerator` → `load_state_dict` →
 
 **檔名裡的 `fixed512` 是 trace shape、不是限制。** AOT-GAN 是全卷積的；引擎實跑的是 **tile 768**（`InpainterConfig.tileSize`）。這名字純屬歷史包袱——改名要連 `models.json` 與 release asset 一起換，不值得。@512 trace 的一個副產物是 layer-norm 的元素數被烤成常數（`mul_10 2=16384.0` / `div_11 2=16383.0` ＝ 128×128）。跑 768 時真值該是 36864/36863，但這只讓 Bessel 係數從 1.0000271 變成 1.0000610——相對誤差 ~3e-5，而 reduction 本身仍是動態的。768 的輸出與 release 逐位元相同，就是最實際的背書。
 
+## 人物分割 → NCNN（夜讀）
+
+兩顆選配模型、只有夜讀用得到——裝置上的配方是兩者人物遮罩的聯集（見 [MODELS_zh.md](MODELS_zh.md#夜讀模型)）。跟上面三顆不同：它們的來源不是 manga-image-translator 的 ckpt，腳本也**不會**去抓——權重請自己拿：`manga_seg_s.pt`（加上它的 ONNX 匯出，當驗證參考）來自 Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)、`cartoonseg.onnx` 來自 [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)——再把腳本指過去。預設找的是 `../yakuyomi-nightread/research/out/models/`（放在本 repo 旁邊的夜讀研究 repo）；`YAKU_CSEG_ONNX`、`YAKU_YOLOSEG_PT`、`YAKU_YOLOSEG_ONNX` 可覆蓋。yolo 匯出需要 `ultralytics`，`parity/requirements.txt` 沒有釘它。兩支腳本都會印出產出的 sha256 與大小。
+
+```bash
+python3 parity/export_cseg_ncnn.py                # 切 ONNX 圖 → pnnx → ncnn，+ 三層驗證
+python3 parity/export_cseg_ncnn.py --fixture      # …並寫 JVM 測試 fixture
+python3 parity/export_cseg_ncnn.py --skip-export  # 只驗證，用既有 param/bin
+python3 parity/export_yoloseg_ncnn.py             # ultralytics export format=ncnn → ncnn，+ 驗證
+python3 parity/export_yoloseg_ncnn.py --fixture
+python3 parity/export_yoloseg_ncnn.py --skip-export
+```
+
+**cseg**——CartoonSegmentation 的 RTMDet-Ins，來源 `cartoonseg.onnx`。mmdeploy 匯出的 ONNX 把 NonMaxSuppression、TopK 與逐實例的動態卷積都放在**圖裡**，而 ncnn 沒有這些層。所以腳本把圖切在**原始頭輸出**之後（`onnx.utils.extract_model`）——剩下 CSPNeXt backbone + PAFPN neck + head，全是 Convolution／Swish／Pooling／Interp 這類標準層——把輸入固定成 `[1,3,640,640]`，再跑 pnnx（它的預設 `fp16=1`，即 fp16 storage；不量化）。後處理搬到 Kotlin：`CsegPost` 是腳本 numpy `postprocess()` 的移植，而後者照 mmdet 3.3 的 `RTMDetInsHead`——先驗在 `(col × stride, row × stride)`、row-major 展平，l/t/r/b 解碼框並夾到 `[0, 640]`，score > 0.05 → NMS IoU 0.6 → 最多 100 個實例，再過動態遮罩頭（相對座標 + 8 個遮罩特徵 → 1×1 卷積 10→8→8→1）→ 雙線性 ×8 到 640 → sigmoid。管線取 score > 0.3 的實例、機率 > 0.5 二值化、裁掉 pad、最近鄰放回原尺寸、取聯集。blob 契約（`engine/src/main/cpp/ncnn_jni.cpp:extractNative`；名字與順序不可改）：`in0` = `[3,640,640]` **BGR**、`(x − mean) / std`，mean `(103.53, 116.28, 123.675)`、std `(57.375, 57.12, 58.395)`，等比縮到長邊 640、**右下角** pad 114（在正規化之前填；mmdet 慣例、非置中）；`out0..out2` = `rtm_cls [1,H,W]` 三層 stride 8/16/32（單類別 logit，sigmoid 是分數）、`out3..out5` = `rtm_reg [4,H,W]`（l,t,r,b——relu 後 × stride 才是像素距離，relu 在 Kotlin 做）、`out6..out8` = `rtm_kernel [169,H,W]`（動態卷積 weights `[80,64,8]` 再 biases `[8,8,1]`）、`out9` = `mask_feat [8,80,80]`。產出：`parity/out/cseg/cartoonseg.ncnn.param` + `.bin`。
+
+驗證分三層：(1) 切圖 ONNX（ORT）vs NCNN——十個原始輸出的 max|Δ|、fp16 storage 容差（logit 值域到 ~40）；(2) 切圖 + numpy 後處理 vs **完整 ONNX**（含圖內 NMS）——實例以框 IoU 配對後，比遮罩機率差與二值 IoU；(3) 對 `app-sandbox/src/main/assets/test/` 的測試頁，三條路（完整 ONNX／ORT 切圖 + 後處理／NCNN + 後處理）的**聯集遮罩** IoU，聯集 IoU 偏低的頁腳本會標出來。`--fixture` 把 `ch34_011` 的十個原始輸出（fp16）與期望遮罩寫進 `engine/src/test/resources/charseg/`，給 `CsegPostParityTest` 逐像素比對 Kotlin 後處理。
+
+**yolo**——YOLO11-seg（`manga_seg_s.pt`，以 MangaSeg／Manga109-s 訓練）。整個轉檔就是 ultralytics 自己的匯出器——`YOLO(pt).export(format="ncnn", imgsz=1024, half=True)`——底層是 pnnx、跟 DBNet／AOT 同一條路：一步到位、fp16 storage、不量化。腳本把產出的 `model.ncnn.param` / `.bin` 複製成 `parity/out/yoloseg/manga_seg_s.ncnn.param` + `.bin`。blob 契約（`NcnnBackend.extract`；不可改）：`in0` = `[3,1024,1024]` **RGB**、`/255`、ultralytics letterbox（等比縮到長邊 1024、**置中** pad 114）；`out0` = `[39,21504]`，每個 anchor 是 `cx,cy,w,h`（1024 座標）+ 3 類分數（0 = frame、1 = speech_bubble、2 = character）+ 32 個遮罩係數；`out1` = `[32,256,256]` 遮罩 prototypes。後處理（`YoloSegPost`，移植自腳本的 `postprocess()`，亦即研究端產出桌面守護框數字的 `run_yoloseg_onnx`）：只取 character 類且分數 > 0.25 → NMS IoU 0.45（貪婪、分數遞減）→ `sigmoid(係數 · prototypes)` 在 256×256 → 裁到 bbox（`crop_mask`：行 `[int(y1), ceil(y2))`、列同）→ 雙線性放到 1024 → 去 letterbox → 雙線性放到原尺寸 → > 0.5 → 聯集。兩段雙線性都是 `cv2.resize INTER_LINEAR`（半像素中心、邊界夾住）；Kotlin 只在框的支撐區內算，結果相同。
+
+驗證：NCNN vs ONNX（ORT）的 `out0` 分數通道與 `out1`，再比兩條路經同一套 numpy 後處理後、在測試頁上的**聯集遮罩** IoU。`--fixture` 把 `ch34_011` 的 `out0`／`out1`（fp16）與期望遮罩寫進 `engine/src/test/resources/charseg/`，給 `YoloSegPostParityTest`。
+
+**兩顆都用判準看、別看雜湊。** 兩者都跟 AOT 一樣走過 pnnx（yolo 走的是 ultralytics 內建那份），冷啟動重跑能不能重現雜湊都還沒確認過；`models.json` 的值就是出貨當時的位元。產出檔名本來就對得上 `models.json`，原名直用。
+
 ## 那些坑
 
 這些就是為什麼在此之前，除了當初做的人以外沒人重建得出來。
@@ -253,20 +277,22 @@ ncnn 的 `.bin` 就是照 `.param` 的層順序線性排的權重流。pnnx 版�
 
 ## 上線
 
-產出都落在 `parity/out/`（已 gitignore）。六個檔裡有兩個上線的檔名跟建出來的不一樣：
+產出都落在 `parity/out/`（已 gitignore）。十個檔裡有兩個上線的檔名跟建出來的不一樣：
 
 | 建出來 | 上線名 | `models.json` 角色 |
 |---|---|---|
 | `dbnet.ncnn.param` / `.bin` | **`dbnet_detect.ncnn.param` / `.bin`**——必須改名 | detector |
 | `ocr_48px_ctc.ncnn.param` / `ocr_48px_ctc_mixed.ncnn.param` / `ocr_48px_ctc.ncnn.bin` | 同名——原名直用 | ocr |
 | `mit_aot_fixed512.ncnn.param` / `.bin` | `mit_aot_fixed512.ncnn.param` / `.bin`——原名直用 | inpainter |
+| `cartoonseg.ncnn.param` / `.bin` | 同名——原名直用 | charseg |
+| `manga_seg_s.ncnn.param` / `.bin` | 同名——原名直用（腳本已把 ultralytics 的 `model.ncnn.*` 改好名） | charseg |
 
 ```bash
 cp parity/out/dbnet/dbnet.ncnn.param /tmp/ship/dbnet_detect.ncnn.param
 cp parity/out/dbnet/dbnet.ncnn.bin   /tmp/ship/dbnet_detect.ncnn.bin
 ```
 
-偵測器改名是人工步驟，所以很容易漏。自備模型（BYOM）就算不改名也還是會認得——`ModelSet` 是 substring 比對（`.param` 含 `dbnet` → 偵測、`.param` 含 `aot` → 去字、`.param` 含 `ocr` → OCR——哪份 param 都行，引擎自己挑 `_mixed` 或原版），`.bin` 則靠把副檔名換掉找同名檔——但 **release asset 一定要用 `models.json` 宣告的名字**，否則自動下載會失敗。
+偵測器改名是人工步驟，所以很容易漏。自備模型（BYOM）就算不改名也還是會認得——`ModelSet` 是 substring 比對（`.param` 含 `dbnet` → 偵測、`.param` 含 `aot` → 去字、`.param` 含 `ocr` → OCR——哪份 param 都行，引擎自己挑 `_mixed` 或原版；`manga_seg`／`cartoonseg` → 兩顆選配的夜讀分割器），`.bin` 則靠把副檔名換掉找同名檔——但 **release asset 一定要用 `models.json` 宣告的名字**，否則自動下載會失敗。
 
 如果你發佈的權重跟現行的不同，請在同一個改動裡一起更新 `models.json` 的 `size` 與 `sha256`——manifest 跟檔案一起版本化，這正是那個檢查有意義的原因。
 
@@ -274,7 +300,7 @@ cp parity/out/dbnet/dbnet.ncnn.bin   /tmp/ship/dbnet_detect.ncnn.bin
 
 講明白，免得有人白花一天：
 
-- **效能與精度數字是裝置端量的。** 「比 int8 快 ~23%」、混合精度的 241/242，以及 [MODELS_zh.md](MODELS_zh.md) 裡每頁偵測／OCR 用時（9 頁：0.79 秒／1.25 秒）那組數字，都是在真機（SD 8 Gen 3）上量的。**這條重建流程量不出來。**
+- **效能與精度數字是裝置端量的。** 「比 int8 快 ~23%」、混合精度的 241/242，以及 [MODELS_zh.md](MODELS_zh.md) 裡每頁偵測／OCR 用時（9 頁：0.79 秒／1.25 秒）那組數字，都是在真機（SD 8 Gen 3）上量的，夜讀那組（yolo ~0.46 秒、cseg ~0.83 秒、每頁 6–25 秒）也是。**這條重建流程量不出來。**
 - **混合精度 OCR param 在 x86 上跑不了。** 那裡沒有 fp16 storage，而它的 `Cast` 假設進來的是 fp16（坑 6）。腳本只 parse 與結構檢查它；實際跑的是原版 param。
 - **這些腳本在 x86 上量到的時間是噪音。** 同一顆**逐位元相同**的 OCR 模型（退役的 int8 那顆）跑兩次，量到 1732 ms 與 3336 ms——同一個檔、~2× 的落差。x86 上看到的 fp32 vs int8「~29×」同樣是假象。**別從桌面跑的結果讀出任何速度結論。**
 - **`out1` mask 的解析度隨平台而異，兩端都別寫死。** x86 上回來的是半解析（H/2 × W/2）、arm64 上回來的是全解析。引擎的做法是「配全解析上限的緩衝 + 由 JNI 回實際尺寸」動態讀（commit `7c62f78` 修的就是這個越界）。別讓桌面量到的結果說服你把尺寸寫死在任何一端。

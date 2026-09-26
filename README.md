@@ -74,6 +74,7 @@ Two layers of concurrency. *Within a page*, text removal (CPU) overlaps the tran
 - **Typesetting** — text-box layout, vertical or horizontal, with adaptive font size, vertical centering, outline scaled to the font, line-head kinsoku, and tilt-aware placement (text follows a slanted bubble's angle). Text colour is chosen from the cleaned background (black on light, white on dark).
 - **Re-rendering (analyze | render split)** — a translated page comes back with its analysis: the text mask, plus the regions carrying their source and target text. The text-removal method can then be changed and the page re-typeset without re-running detection, OCR, or the LLM — switching removal mode or upgrading quality costs only the removal and typeset stages, no tokens.
 - **Languages** — Japanese to Traditional Chinese out of the box. Set a different target, source, and few-shot example for any pair. Traditional-Chinese output relies on the prompt; there is no OpenCC post-processing.
+- **Night reading (in progress)** — darkens the page itself while protecting the characters, using the same detector plus two on-device character segmenters (YOLO11-seg ∪ CartoonSegmentation, on NCNN); off by default, reader integration still in progress — see [docs/MODELS.md](docs/MODELS.md#night-reading-models).
 
 ## Repository layout
 
@@ -95,15 +96,16 @@ Weights are not committed and not packed into the APK. The reader can auto-downl
 | Detection | DBNet, ResNet34 + DB head (`.ncnn.param`/`.bin`) | NCNN | from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) (its default detector) |
 | OCR | 48px CTC, mixed fp16/fp32 (`.ncnn.param` ×2 + `.bin`) | NCNN | weights from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | Text removal | AOT-GAN manga inpaint (`.ncnn.param`/`.bin`) | NCNN | from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| Character segmentation — night reading (optional, off by default) | YOLO11-seg `manga_seg_s` ∪ CartoonSegmentation RTMDet-Ins `cartoonseg` (`.ncnn.param`/`.bin` each) | NCNN | weights from Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation) and [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx) — not GPL, see [docs/MODELS.md](docs/MODELS.md#night-reading-models) |
 | Fonts | Noto Sans/Serif CJK, Source Han | — | CJK rendering (OFL / Apache) |
 
-Everything is NCNN, shipped as `.param` + `.bin` (both required); OCR has two `.param` files (plain and `_mixed`) over one `.bin`, and the engine picks between them at load time. The full set is about 247 MB — the fp16 detector (153 MB) and the fp16 OCR weights (83 MB) make up most of it.
+Everything is NCNN, shipped as `.param` + `.bin` (both required); OCR has two `.param` files (plain and `_mixed`) over one `.bin`, and the engine picks between them at load time. The full set is about 247 MB — the fp16 detector (153 MB) and the fp16 OCR weights (83 MB) make up most of it. The optional night-reading pair (`models-v5`) adds about 147 MB; translation never needs it.
 
 ## Try it
 
 The engine is an Android library (arm64, NCNN), so trying it means building the sandbox app (`:app-sandbox`) and installing it. **A real arm64 Android device is required** — the sandbox only builds `arm64-v8a`, so an x86 emulator won't run it.
 
-**1. Get the models.** They aren't in the repo. Fetch the six files listed in [`models.json`](models.json) — the detector `.param`+`.bin` from the `models-v3` release, the OCR `.param` (plain and `_mixed`) + `.bin` from `models-v4`, and the inpaint `.param`+`.bin` from `models-v2` — and put them all in one folder the phone can read. Details, checksums and licensing: [docs/MODELS.md](docs/MODELS.md).
+**1. Get the models.** They aren't in the repo. Fetch the ten files listed in [`models.json`](models.json) — the detector `.param`+`.bin` from the `models-v3` release, the OCR `.param` (plain and `_mixed`) + `.bin` from `models-v4`, the inpaint `.param`+`.bin` from `models-v2`, and the two character-segmentation `.param`+`.bin` pairs from `models-v5` (night reading only; the translation pipeline runs without them) — and put them all in one folder the phone can read. Details, checksums and licensing: [docs/MODELS.md](docs/MODELS.md).
 
 **2. (Optional) Add an LLM key.** Enter your DeepSeek key in the sandbox app itself (the field under the model-folder button; it is stored in the app's preferences — the APK never embeds a key). **Skip this and translation is simply off**: detection, OCR and text removal still run. `api-keys.properties` (copied from `api-keys.properties.example`) is only read by the desktop parity scripts.
 
@@ -140,7 +142,9 @@ The engine is a from-scratch Kotlin implementation. It contains no manga-image-t
 
 - [mihon](https://github.com/mihonapp/mihon) — the reader the app forks (Apache-2.0)
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — prompt and behaviour reference; the DBNet detection, OCR, and AOT-GAN inpaint model weights
-- [ncnn](https://github.com/Tencent/ncnn) — the on-device inference runtime for all three models
+- [ncnn](https://github.com/Tencent/ncnn) — the on-device inference runtime for every on-device model
+- [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation) — YOLO11-seg character-segmentation weights for night reading ("Copyrighted by Minshan Xie"; MangaSeg / Manga109-s)
+- [CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation), weights via [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx) — RTMDet-Ins character-segmentation weights for night reading
 - Noto Sans/Serif CJK, Source Han — fonts
 
 ## License
@@ -151,5 +155,7 @@ Component licenses:
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — GPL-3.0 (prompt/protocol, detection/OCR/removal behaviour, line grouping; DBNet detection model, 48px CTC OCR model, and AOT-GAN inpaint model)
 - [ncnn](https://github.com/Tencent/ncnn) — BSD-3-Clause (inference runtime, statically linked)
 - [mihon](https://github.com/mihonapp/mihon) — Apache-2.0 (reader fork lives in the separate product repo; Apache-2.0 is GPL-3.0-compatible, so the combined app is GPL-3.0)
+- YOLO11-seg character-segmentation weights ([anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)) — model card `license: other`; [Ultralytics](https://github.com/ultralytics/ultralytics) AGPL-3.0; trained on MangaSeg / Manga109-s; "Copyrighted by Minshan Xie" (night reading only)
+- CartoonSegmentation character-segmentation weights ([Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)) — no license stated by [upstream](https://github.com/CartoonSegmentation/CartoonSegmentation); training data includes Manga109 (night reading only)
 
-Model weights are all GPL-3.0 and are **redistributed** through this repo's releases for one-tap auto-download — the manifest is [`models.json`](models.json), pointing at the detector in [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3), the OCR in [`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4), and the unchanged inpaint assets in [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) (see [docs/MODELS.md](docs/MODELS.md)); you can also bring your own from the sources above. Fonts are not bundled (system CJK fallback).
+The translation model weights are GPL-3.0 and are **redistributed** through this repo's releases for one-tap auto-download — the manifest is [`models.json`](models.json), pointing at the detector in [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3), the OCR in [`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4), and the unchanged inpaint assets in [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) (see [docs/MODELS.md](docs/MODELS.md)); you can also bring your own from the sources above. The two night-reading character-segmentation models are **not** GPL-3.0: their NCNN conversions are redistributed from [`models-v5`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v5) for research / non-commercial use with the attribution above, and will be taken down on a rights holder's request — details in [docs/MODELS.md](docs/MODELS.md#night-reading-models). Fonts are not bundled (system CJK fallback).
