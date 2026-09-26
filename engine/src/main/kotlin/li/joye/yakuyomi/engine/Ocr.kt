@@ -69,6 +69,8 @@ class Ocr(
         ncnnHandle = NcnnBackend.createNetEx(param, bin, threads, cfg.ncnnFp16Storage, cfg.ncnnFp16Arith)
         check(ncnnHandle != 0L) { "NCNN OCR 模型載入失敗：$param（bin=$bin）" }
         backend = if (mixed) "NCNN-mixed" else "NCNN"
+        // 進診斷紀錄（fork 的 TraceLog 收 EngineTrace）：無 adb 也能確認產品實際載的是哪份 param／精度組合
+        EngineTrace.log("ocr.load $backend ${java.io.File(param).name} threads=$threads fp16=${cfg.ncnnFp16Storage}/${cfg.ncnnFp16Arith} cpuFp16=${NcnnBackend.cpuSupportsFp16}")
         Log.i(TAG, "NCNN ocr loaded $param (threads=$threads fp16 storage=${cfg.ncnnFp16Storage} arith=${cfg.ncnnFp16Arith} cpuFp16=${NcnnBackend.cpuSupportsFp16} mixed=$mixed)")
     }
 
