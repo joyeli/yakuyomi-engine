@@ -274,7 +274,7 @@ If you publish weights that differ from the current ones, update `models.json`'s
 
 Being explicit, so nobody burns a day trying:
 
-- **Performance and precision numbers are device-side.** "~23% faster than int8", the 241/242 mixed-precision read rate, and the 10.3 s / 6 pages figures in [MODELS.md](MODELS.md) were measured on real hardware (SD 8 Gen 3). They cannot be reproduced by this build process.
+- **Performance and precision numbers are device-side.** "~23% faster than int8", the 241/242 mixed-precision read rate, and the per-page detection / OCR times in [MODELS.md](MODELS.md) (0.79 s / 1.25 s over 9 pages) were measured on real hardware (SD 8 Gen 3). They cannot be reproduced by this build process.
 - **The mixed-precision OCR param cannot be executed on x86.** No fp16 storage there, and its `Cast` assumes fp16 input (trap 6). The scripts parse and structure-check it; the plain param is what they run.
 - **x86 timings from these scripts are noise.** Two runs of a *bit-identical* OCR model (the retired int8 one) measured 1732 ms and 3336 ms — a ~2× spread on the same file. The fp32-vs-int8 "~29×" seen on x86 is likewise an artifact. Don't read any speed conclusion out of a desktop run.
 - **`out1` mask resolution differs by platform and must not be hard-coded.** On x86 it comes back half-resolution (H/2 × W/2); on arm64 it comes back full-resolution. The engine allocates for the full-resolution worst case and reads the actual dimensions back from JNI (commit `7c62f78` fixed exactly this overrun). Don't let a desktop measurement talk you into fixing a size at either end.

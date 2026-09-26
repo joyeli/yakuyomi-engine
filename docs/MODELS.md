@@ -21,7 +21,7 @@ The engine ships no model weights. It needs three models — a detector, an OCR 
 
 The fp16 `.bin` is ~83 MB against the retired int8 model's 44 MB; the precision, not the size, is what recovers the small kana.
 
-**v3 detector.** comic-text-detector is retired and removed; DBNet (manga-image-translator's default detector) replaces it, reading 1.6–2.5× more text correctly on device. It is kept in fp16 storage — int8 quantization makes it emit no boxes at all and is no faster on ARM, so it is not used, which is why the detector alone is ~153 MB of the ~247 MB of on-device weights. Input is `resize_aspect` to 1024 padded to a multiple of 256; the resulting rectangular input also steers clear of an ncnn heap-corruption bug on square 832–992 inputs. On an SD 8 Gen 3, detection + OCR over 6 representative pages (161 boxes) took 10.3 s and read 160 of them — 99.4% (measured with the v3 int8 OCR; v4 takes ~23% off the OCR share).
+**v3 detector.** comic-text-detector is retired and removed; DBNet (manga-image-translator's default detector) replaces it, reading 1.6–2.5× more text correctly on device. It is kept in fp16 storage — int8 quantization makes it emit no boxes at all and is no faster on ARM, so it is not used, which is why the detector alone is ~153 MB of the ~247 MB of on-device weights. Input is `resize_aspect` to 1024 padded to a multiple of 256; the resulting rectangular input also steers clear of an ncnn heap-corruption bug on square 832–992 inputs. On an SD 8 Gen 3, over 9 pages / 242 detected lines, detection averages 0.79 s per page and the v4 OCR 1.25 s per page (23% less than the v3 int8 OCR); all 242 lines are read, 241 identical to an fp32 reference.
 
 Exact bytes and checksums are pinned in [`models.json`](../models.json):
 

@@ -197,7 +197,7 @@ The pipeline mirrors manga-image-translator, but every parameter is re-tuned aga
 | OCR crop box | detection quad as-is | **quad + 4px pad** | thin boxes clip the last glyph → CTC returns empty → the region is dropped and left untranslated. On 6 pages: 2 rescued, **0 regressions**, and OCR ~20% faster |
 | text removal | LaMa / per-region AOT | **AOT-GAN, whole-page tile 768** | 5–9× faster on CPU at equal or better quality; per-region AOT can't parallelise on CPU |
 
-Current numbers (6 representative pages, 161 detected boxes): **160 read — 99.4%**; detection + OCR **10.3 s** total on-device (measured with the previous int8 OCR; the NCNN OCR takes ~23% off its share).
+Current numbers (9 pages, 242 detected lines, on-device): **all 242 read**, 241 identical to an fp32 reference; detection averages **0.79 s/page**, mixed-precision OCR **1.25 s/page** — 23% less than the int8 OCR it replaced.
 
 Two things measurement said *not* to do, kept here so they aren't re-attempted:
 

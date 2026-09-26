@@ -67,7 +67,7 @@ Yakuyomi 怎麼翻一頁、專案為什麼這樣切、裝置端引擎跟桌面�
 - **模型載 native 記憶體。** NCNN 的 Net 直接從檔案路徑把 `.param`/`.bin` 讀進 native；用 `readBytes()` 讀進 JVM heap 會撞到每 app 的 heap 上限（約 512MB，跟裝置 RAM 無關）而 OOM。BYOM 先把選的檔複製到 `filesDir` 再傳路徑。
 - **前處理要跟 Python 匯出完全一致** — resize、normalize、NCHW 順序。這是最大的隱形分歧來源，也是 parity 工具大半的存在理由。
 - **推論執行緒。** 偵測跟 AOT-GAN 去字用對齊裝置大核數的緒數（測試機 Snapdragon 8 Gen 3 是 6），把慢的小核加進去會讓一次推論更慢而不是更快。
-- **GPU/NPU 試過、對這些模型不管用——全部跑 CPU。** NCNN 的 Vulkan 把 AOT-GAN 去字模型**算錯**（fp16/fp32 都輸出垃圾、tile 越大越糟——Adreno 上這組 op 的 shader 級 bug），偵測器在 Vulkan 上也輸給 CPU；LiteRT 連把這些模型編到 GPU 都失敗；NPU（Hexagon）後端需要 int8 QDQ、被 OCR 模型的動態寬度堵住。偵測器的 int8 量化也試過：完全吐不出框、在 ARM 上也沒更快，所以維持 fp16。所以三顆模型都跑 CPU、都走 NCNN 的手機核心（NEON/Winograd；安全的地方用 fp16、OCR 的 transformer 用 fp32）——而這夠快（Snapdragon 8 Gen 3、6 張代表頁：偵測 + OCR 合計約 10.3 秒——以 v3 的 int8 OCR 量的、NCNN OCR 那份再快 ~23%——161 個偵測框讀出 160）。
+- **GPU/NPU 試過、對這些模型不管用——全部跑 CPU。** NCNN 的 Vulkan 把 AOT-GAN 去字模型**算錯**（fp16/fp32 都輸出垃圾、tile 越大越糟——Adreno 上這組 op 的 shader 級 bug），偵測器在 Vulkan 上也輸給 CPU；LiteRT 連把這些模型編到 GPU 都失敗；NPU（Hexagon）後端需要 int8 QDQ、被 OCR 模型的動態寬度堵住。偵測器的 int8 量化也試過：完全吐不出框、在 ARM 上也沒更快，所以維持 fp16。所以三顆模型都跑 CPU、都走 NCNN 的手機核心（NEON/Winograd；安全的地方用 fp16、OCR 的 transformer 用 fp32）——而這夠快（Snapdragon 8 Gen 3、9 頁 242 個偵測行：偵測平均每頁 0.79 秒、混合精度 OCR 每頁 1.25 秒——比 v3 的 int8 OCR 少 23%——242 行全部讀出、241 行與 fp32 參考一致）。
 
 ## Repo 結構
 

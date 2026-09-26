@@ -21,7 +21,7 @@
 
 fp16 的 `.bin` 約 83 MB，退役的 int8 是 44 MB；救回小假名的是精度、不是體積。
 
-**v3 偵測器。** comic-text-detector 已退役、整條移除；改用 manga-image-translator 的 default detector（DBNet：ResNet34 + DB head），真機讀對的文字多 **1.6–2.5×**。權重維持 fp16 storage——int8 量化實測**完全吐不出框**、在 ARM 上也沒有比較快，因此不採用；這也是為什麼光偵測器就佔了裝置端 ~247 MB 權重裡的 ~153 MB。前處理是 resize_aspect 到 1024、再 pad 到 256 的倍數；這樣得到的**矩形**輸入同時繞開 ncnn 對 832–992 正方形尺寸的 heap corruption。SD 8 Gen 3 上的實測：6 張代表頁、161 個偵測框，偵測 + OCR 共 10.3 秒、讀出其中 160——99.4%（以 v3 的 int8 OCR 量的；v4 讓 OCR 那份再快 ~23%）。
+**v3 偵測器。** comic-text-detector 已退役、整條移除；改用 manga-image-translator 的 default detector（DBNet：ResNet34 + DB head），真機讀對的文字多 **1.6–2.5×**。權重維持 fp16 storage——int8 量化實測**完全吐不出框**、在 ARM 上也沒有比較快，因此不採用；這也是為什麼光偵測器就佔了裝置端 ~247 MB 權重裡的 ~153 MB。前處理是 resize_aspect 到 1024、再 pad 到 256 的倍數；這樣得到的**矩形**輸入同時繞開 ncnn 對 832–992 正方形尺寸的 heap corruption。SD 8 Gen 3 上的實測：9 頁、242 個偵測行，偵測平均每頁 0.79 秒、v4 OCR 每頁 1.25 秒（比 v3 的 int8 OCR 少 23%）；242 行全部讀出、241 行與 fp32 參考一致。
 
 精確 bytes 與雜湊釘在 [`models.json`](../models.json)：
 

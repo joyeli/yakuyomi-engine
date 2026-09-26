@@ -5,7 +5,7 @@ plugins {
 
 // Yakuyomi fork 以 Gradle composite build（includeBuild）接此引擎，靠 group:name 替換依賴
 group = "li.joye.yakuyomi"
-version = "0.2.0"
+version = "0.3.0"
 
 android {
     namespace = "li.joye.yakuyomi.engine"

@@ -35,7 +35,7 @@ The engine exposes one call, `translatePage(page): PageResult` (translated / ski
 
 ![Performance comparison](docs/img/showcase.png)
 
-From the sandbox app: one page taken through the pipeline — detection, removal mask, the two text-removal modes with their detected regions, and the finished typeset — with a table breaking down each stage's time and peak memory, and a banner recording the device, the active settings, and the LLM.
+From the sandbox app: one page taken through the pipeline — detection, removal mask, the two text-removal modes with their detected regions, and the finished typeset — with a table breaking down each stage's time and peak memory, and a banner recording the device, the active settings, and the LLM. (Chart from the previous int8-OCR build — its banner still says ORT-int8; the stage times differ slightly with the NCNN OCR, see the numbers under Goals.)
 
 ![Text removal vs box-fill](docs/img/removal-compare.png)
 
@@ -48,7 +48,7 @@ Text over artwork is the hard case. A box-fill (what most overlay translators do
   - **Detection and text removal** likewise on NCNN's mobile kernels (NEON/Winograd). The detector runs in fp16 — int8 quantization was tried and produced no boxes at all, with no speedup on ARM.
   - **Text removal at tile 768** — whole-page AOT-GAN, the point where quality is good *and* the work stays hidden under the translation wait (see Concurrency). A larger tile or per-region reconstruction is marginally sharper but pokes above that wait; LaMa is slower and blurrier. **GPU/NPU was tried and does not work for these models** — NCNN's Vulkan path miscomputes the AOT-GAN (garbage output), and LiteRT cannot compile it — so everything runs on the **CPU**, which turned out to be enough.
 
-  Measured on a Snapdragon 8 Gen 3: detection + OCR take **10.3 s across 6 representative pages** — 161 detected boxes, 160 read back (99.4%); that was with the previous int8 OCR, and the NCNN OCR takes ~23% off the OCR share. Translation and text removal come on top of that, and overlap each other (see Concurrency). Peak memory ~1.9–2.1 GB — no GPU, nowhere near 16 GB of RAM.
+  Measured on a Snapdragon 8 Gen 3, over 9 pages / 242 detected lines: detection averages **0.79 s per page** and the mixed-precision OCR **1.25 s per page** (23% less than the int8 OCR it replaced); all 242 lines are read, 241 of them identical to an fp32 reference. Translation and text removal come on top of that, and overlap each other (see Concurrency). Peak memory was ~1.9–2.1 GB with the previous build (not yet re-measured after the OCR change) — no GPU, nowhere near 16 GB of RAM.
 - **Concurrency, two layers.**
   - *Within a page* — text removal needs only the OCR'd regions, known before the LLM replies, so it runs on a background coroutine while the translate request is in flight; a page pays only the longer of the two. (This is why a failed block keeps its re-pasted source text rather than the untouched image — decoupling removal from the translation result is what lets them overlap.)
   - *Across pages* — `translatePage` is safe to call concurrently on one warm engine (shared detection / OCR / translator / removal sessions; benchmarked on device — no crash, no corruption). So the reader can pipeline: page N's network translate overlaps page N+1's on-device detect/OCR. With the cheap box-fill removal the pipeline reaches the network-bound ceiling — about **2× the sequential rate** at a shallow depth (~4). Pages read first at box-fill quality, then upgrade to full AOT-GAN removal when idle (re-render, below).
