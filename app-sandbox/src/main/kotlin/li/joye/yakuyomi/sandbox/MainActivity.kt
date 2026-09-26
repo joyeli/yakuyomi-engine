@@ -25,6 +25,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import li.joye.yakuyomi.engine.CharSegmenter
 import li.joye.yakuyomi.engine.CsegSegmenter
 import li.joye.yakuyomi.engine.YoloSegSegmenter
 import li.joye.yakuyomi.engine.Detector
@@ -38,13 +39,14 @@ import li.joye.yakuyomi.nightread.Mask
 import li.joye.yakuyomi.nightread.NightRead
 import li.joye.yakuyomi.nightread.NightReadInput
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
-import li.joye.yakuyomi.nightread.ort.CharMaskOrt
 import li.joye.yakuyomi.engine.OcrConfig
 import li.joye.yakuyomi.engine.PageResult
 import li.joye.yakuyomi.engine.RenderConfig
 import li.joye.yakuyomi.engine.TextOrientation
 import li.joye.yakuyomi.engine.LlmTranslator
 import li.joye.yakuyomi.engine.Ocr
+import li.joye.yakuyomi.engine.OcrAbResult
+import li.joye.yakuyomi.engine.OcrCandidate
 import li.joye.yakuyomi.engine.Renderer
 import li.joye.yakuyomi.engine.TranslatorConfig
 import li.joye.yakuyomi.engine.Yakuyomi
@@ -96,10 +98,48 @@ class MainActivity : AppCompatActivity() {
         updateButtons()
         val t = currentTree()
         binding.logText.text =
-            if (t == null) "① 先按「選擇模型資料夾」選含 3 個 *.onnx 的資料夾\n② 點縮圖選圖 → 診斷（多選）／效能比較（單選）"
+            if (t == null) "① 先按「選擇模型資料夾」選含 dbnet／ocr_48px_ctc／aot 的 .ncnn.param+.bin 的資料夾\n② 點縮圖選圖 → 診斷（多選）／效能比較（單選）"
             else "資料夾：${t.name}（點縮圖選圖 → 診斷／效能比較）"
         // 開機 Toast 標 build 版本：手動安裝後一眼確認裝對版本（沒看到＝還是舊 APK / 同步未完成）
         Toast.makeText(this, "Yakuyomi sandbox $BUILD_TAG", Toast.LENGTH_LONG).show()
+        dumpLastExit(t)
+    }
+
+    /**
+     * 上次行程死亡若是原生 crash／被信號殺／ANR／低記憶體，把系統保留的 ApplicationExitInfo（reason、desc、tombstone
+     * backtrace）落成模型夾裡的 `<stamp>_exit.txt`——無 adb 時唯一能拿到 SIGSEGV/abort 堆疊的路（照 fork 的
+     * NativeCrashReporter）。同一次死亡只寫一次（prefs 記時間戳）。
+     */
+    private fun dumpLastExit(tree: DocumentFile?) {
+        if (tree == null || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return
+        runCatching {
+            val am = getSystemService(android.app.ActivityManager::class.java) ?: return
+            val exit = am.getHistoricalProcessExitReasons(packageName, 0, 5).firstOrNull {
+                it.reason != android.app.ApplicationExitInfo.REASON_USER_REQUESTED &&
+                    it.reason != android.app.ApplicationExitInfo.REASON_EXIT_SELF &&
+                    it.reason != android.app.ApplicationExitInfo.REASON_OTHER
+            } ?: return
+            if (exit.timestamp <= prefs.getLong(PREF_LAST_EXIT, 0L)) return
+            // ★ 原生 crash 的 trace 是 tombstone **protobuf 二進位**（非文字）：必須存 raw bytes，當文字 readText 會把非法
+            //   UTF-8 換成 U+FFFD、rel_pc 等 varint 全爛（第一版就這樣毀了一份）。桌面用 NDK llvm-symbolizer + 未 strip .so 解。
+            val raw = runCatching { exit.traceInputStream?.use { it.readBytes() } }.getOrNull()
+            val text = buildString {
+                appendLine("上次行程死亡（ApplicationExitInfo）：reason=${exit.reason} desc=${exit.description} status=${exit.status}")
+                appendLine("time=${java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.US).format(java.util.Date(exit.timestamp))} pss=${exit.pss / 1024}MB rss=${exit.rss / 1024}MB build=$BUILD_TAG")
+                appendLine(if (raw == null || raw.isEmpty()) "(系統未附 tombstone trace)" else "tombstone protobuf ${raw.size} bytes → 同名 .pb")
+            }
+            val base = "${stamp()}_exit"
+            tree.createFile("text/plain", "$base.txt")?.uri?.let { uri ->
+                contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+            }
+            if (raw != null && raw.isNotEmpty()) {
+                tree.createFile("application/octet-stream", "$base.pb")?.uri?.let { uri ->
+                    contentResolver.openOutputStream(uri)?.use { it.write(raw) }
+                }
+            }
+            prefs.edit().putLong(PREF_LAST_EXIT, exit.timestamp).apply()
+            Toast.makeText(this, "上次 crash 已寫 $base.txt/.pb", Toast.LENGTH_LONG).show()
+        }.onFailure { Log.w(TAG, "dumpLastExit 失敗", it) }
     }
 
     // ===== 縮圖多選 =====
@@ -180,7 +220,7 @@ class MainActivity : AppCompatActivity() {
             // 方向鎖 AUTO、效能用引擎最優預設（OCR 並發/8、intraThreads 6、RenderConfig 預設 AUTO）→ 只設去字方法。
             val cfg = EngineConfig(inpainter = InpainterConfig(method = method, tileSize = tileSize))
             // 記憶體峰值取樣：背景每 150ms 抽「總 PSS（含 native）」與 native heap，記 max。
-            // 量的是 runtime 真峰值（3 顆 ONNX session + ORT 工作記憶體 + bitmap），不是模型檔大小。
+            // 量的是 runtime 真峰值（3 顆 NCNN Net + 推論工作記憶體 + bitmap），不是模型檔大小。
             // 要乾淨的「單頁峰值」就只選 1 張圖（多選會累積結果 bitmap 在 UI、把峰值墊高）。
             val memBasePss = android.os.Debug.getPss() // KB，載入模型前基線
             val memPeakPss = java.util.concurrent.atomic.AtomicLong(memBasePss)
@@ -197,19 +237,19 @@ class MainActivity : AppCompatActivity() {
                 val tree = runTree
                 if (tree == null) { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 if (imgs.isEmpty()) { log("✗ 請先點縮圖選至少一張測試圖"); return@launch }
-                // 定案：偵測 + 去字純 NCNN（.param/.bin），OCR = int8 量化 ONNX。
-                val ocrF = findOnnx(tree, "ocr")
+                // 定案：偵測 + OCR + 去字全走 NCNN（.param/.bin）。OCR 的 mixed param 由引擎 Ocr.pickParam 自己挑（見 ensureOcrNcnn）。
+                val ocrNcnn = ensureOcrNcnn(tree)
                 val detNcnn = ensureNcnnPair(tree, "dbnet")
                 val aotNcnn = ensureNcnnPair(tree, "aot")
-                if (ocrF == null) { log("✗ 缺 OCR 模型（ocr .onnx）"); return@launch }
+                if (ocrNcnn == null) { log("✗ 缺 NCNN OCR 模型（ocr_48px_ctc.ncnn.param/.bin）"); return@launch }
                 if (detNcnn == null) { log("✗ 缺 NCNN 偵測模型（detector*.ncnn.param）"); return@launch }
                 if (aotNcnn == null) { log("✗ 缺 NCNN 去字模型（*aot*.ncnn.param）"); return@launch }
                 log("▶ 診斷 ${imgs.size} 張｜去字=$modeLabel")
                 log("… 載入模型（首次複製到 filesDir 較久）")
                 val alphabet = assets.open(ALPHABET).bufferedReader().use { it.readLines() }
                 val tf = runCatching { Typeface.createFromAsset(assets, FONT) }.getOrNull()
-                log("後端：偵測=NCNN｜去字=NCNN AOT｜OCR=ORT-int8")
-                val models = ModelSet(ocr = ensureLocal(ocrF), detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
+                log("後端：偵測=NCNN｜去字=NCNN AOT｜OCR=NCNN（CPU 有 asimdhp 就載 mixed 精度）")
+                val models = ModelSet(ocr = ocrNcnn, detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
                 log("✓ 模型就緒，開跑")
                 Yakuyomi.create(models, alphabet, BuildConfig.DEEPSEEK_API_KEY, cfg, tf).use { engine ->
                     var total = 0L
@@ -277,9 +317,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * OCR 裁切內插 A/B（bilinear vs bicubic）：對選取測試圖跑 [Yakuyomi.ocrAbTest]，log 效能（各內插法
-     * recognize 耗時）+ 品質（逐行 OCR 讀取對照、只列兩者不同的行）。真機驗證 bicubic 是否把被縮放糊掉的
-     * 小假名（句尾否定→意思相反）讀回來、及其效能代價。選 demo06（第 013 頁）最能看差異。
+     * OCR 精度 A/B（NCNN fp32 真值 / NCNN fp16sa / NCNN mixed）：對選取測試圖跑 [Yakuyomi.ocrAbTest]，log 效能（各候選的
+     * 載入＋recognize 耗時）+ 品質（逐行 OCR 讀取對照、只列候選間不同的行）。三個候選共用同一份 .bin，差別只在 param 與
+     * fp16 開關：fp32＝全域 fp32（最穩，放第一欄當真值）；fp16sa＝全域 fp16 storage+arith（最快，但 transformer 零星讀錯）；
+     * mixed＝backbone fp16 + transformer/char_pred fp32（parity/export_ocr_ncnn.py：per-layer featmask 31=7 + 手插 Cast 層），
+     * 產品實際載的就是它。ORT 已整個從引擎拔掉、舊的 ORT fp32/int8 候選不再列，真機數據留在這裡當基準：
+     * vivo V2429（SD 8 Gen 3）9 頁 242 行、真值＝ORT fp32：NCNN mixed 241/242（唯一不同那行其實是真值錯、mixed 對）、
+     * NCNN fp32 242/242、ORT int8 223/242、NCNN 全 fp16 219/242；mixed 的 OCR 時間比 ORT int8 快 ~23%（1256 vs 1669 ms/頁）、
+     * 載入 ~300–400ms；並發 8 行、num_threads=1 不進全域鎖。int8 常把小假名讀錯（なぃ／か6／だろぅ／やは自），mixed 讀對。
+     * 選 demo06（第 013 頁）行數多、最能看差異。
      */
     private fun runOcrAb() {
         binding.ocrAbButton.isEnabled = false
@@ -287,43 +333,56 @@ class MainActivity : AppCompatActivity() {
         val imgs = sel.map { TEST_IMAGES[it] }
         lifecycleScope.launch(Dispatchers.Default) {
             clearOutputs()
-            runTree = currentTree()
+            logBuf.clear(); runImgIdx = 0; runTree = currentTree(); runStamp = stamp()   // 結果落 <stamp>_log.txt + 成果圖（無 adb 靠 OneDrive 同步回來看）
             try {
                 val tree = runTree
                 if (tree == null) { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 if (imgs.isEmpty()) { log("✗ 請先點縮圖選至少一張測試圖"); return@launch }
-                val ocrF = findOnnx(tree, "ocr")
+                // NCNN fp32（同一份 param、fp16 全關）＝標準答案放第一欄；其餘各欄印「與第一欄相同行數」
+                val ocrNcnn = ensureNcnnPair(tree, "ocr_48px_ctc.ncnn")   // key 含 ".ncnn" 才不會誤抓 _mixed 那份
+                // 混合精度 param（backbone fp16、transformer+head fp32，per-layer featmask）共用同一份 .bin：
+                // 引擎 Ocr 由 param 名去掉 _mixed 推 .bin（兩份 param 共用 ocr_48px_ctc.ncnn.bin），mixed 只要複製 param 本身
+                val ocrMixed = findFile(tree, "ocr_48px_ctc_mixed", ".param")?.let { ensureLocal(it) }?.takeIf { ocrNcnn != null }
                 val detNcnn = ensureNcnnPair(tree, "dbnet")
-                val aotNcnn = ensureNcnnPair(tree, "aot")
-                if (ocrF == null) { log("✗ 缺 OCR 模型（ocr .onnx）"); return@launch }
                 if (detNcnn == null) { log("✗ 缺 NCNN 偵測模型（detector*.ncnn.param）"); return@launch }
-                if (aotNcnn == null) { log("✗ 缺 NCNN 去字模型（*aot*.ncnn.param）"); return@launch }
+                val candidates = buildList {
+                    if (ocrNcnn != null) add(OcrCandidate("NCNN fp32", ocrNcnn, OcrConfig(ncnnFp16Storage = false, ncnnFp16Arith = false, ncnnMixed = false)))   // 真值（第一欄）
+                    if (ocrNcnn != null) add(OcrCandidate("NCNN fp16sa", ocrNcnn, OcrConfig(ncnnMixed = false)))   // 全 fp16：最快，但 transformer 零星讀錯（219/242）
+                    if (ocrMixed != null) add(OcrCandidate("NCNN mixed", ocrMixed))  // backbone fp16 + transformer/head fp32（featmask + Cast）＝產品配方
+                    // fp16 storage-only（arith 關）已測：慢 10×（每層來回 cast），不再列
+                }
+                if (candidates.isEmpty()) { log("✗ 缺 OCR 模型（ocr_48px_ctc.ncnn.param/.bin；mixed 另需 ocr_48px_ctc_mixed.ncnn.param）"); return@launch }
                 val alphabet = assets.open(ALPHABET).bufferedReader().use { it.readLines() }
-                val models = ModelSet(ocr = ensureLocal(ocrF), detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
-                log("▶ OCR 內插比較（bilinear vs bicubic）｜${imgs.size} 張")
+                log("▶ OCR 精度比較（${candidates.joinToString(" / ") { it.label }}）｜${imgs.size} 張｜CPU fp16=${Yakuyomi.ncnnCpuSupportsFp16()}")
                 imgs.forEachIndexed { i, asset ->
                     val tag = "圖${sel[i] + 1}"
                     val page = loadAssetBitmap(asset)
-                    val r = Yakuyomi.ocrAbTest(models, alphabet, page)
-                    val delta = if (r.bilinearMs > 0) (r.bicubicMs - r.bilinearMs) / r.bilinearMs * 100 else 0.0
-                    log(
-                        "[$tag] 偵測 ${"%.0f".format(r.detectMs)}ms｜OCR bilinear ${"%.0f".format(r.bilinearMs)}ms → " +
-                            "bicubic ${"%.0f".format(r.bicubicMs)}ms（${"%+.0f".format(delta)}%）｜${r.rows.size} 行",
-                    )
+                    val r = Yakuyomi.ocrAbTest(detNcnn, alphabet, page, candidates)
+                    val base = r.recognizeMs.first()
+                    val summary = r.labels.indices.joinToString("｜") { k ->
+                        val delta = if (k > 0 && base > 0) "（${"%+.0f".format((r.recognizeMs[k] - base) / base * 100)}%）" else ""
+                        val same = if (k > 0) " 同第一欄 ${r.rows.count { it[k] == it[0] }}/${r.rows.size}" else ""
+                        "${r.labels[k]}[${r.backends[k]}] 載入 ${"%.0f".format(r.loadMs[k])}ms OCR ${"%.0f".format(r.recognizeMs[k])}ms$delta$same"
+                    }
+                    log("[$tag] 偵測 ${"%.0f".format(r.detectMs)}ms｜${r.rows.size} 行｜$summary")
                     var diff = 0
                     r.rows.forEachIndexed { j, row ->
-                        if (row.bilinear != row.bicubic) {
+                        if (row.any { it != row[0] }) {
                             diff++
-                            log("  L$j bilin：${row.bilinear.ifBlank { "∅" }}")
-                            log("      bicub：${row.bicubic.ifBlank { "∅" }}")
+                            row.forEachIndexed { k, text -> log("  L$j ${r.labels[k]}：${text.ifBlank { "∅" }}") }
                         }
                     }
-                    log("[$tag] 兩者不同 $diff / ${r.rows.size} 行（相同的略）")
+                    log("[$tag] 候選間不同 $diff / ${r.rows.size} 行（相同的略）")
+                    saveImage(tree, composeOcrAbSheet(asset.substringAfterLast('/'), page, r))
+                    log("📁 成果圖 ${runStamp}_img${"%02d".format(runImgIdx)}.png")
+                    writeLog()
                 }
-                log("★ OCR 內插比較完成")
+                log("★ OCR 精度比較完成")
+                if (writeLog()) log("📁 已寫入：${runStamp}_log.txt")
             } catch (t: Throwable) {
                 Log.e(TAG, "OCR A/B 失敗", t)
                 log("✗✗ 例外：${t.javaClass.simpleName}: ${t.message}")
+                log(Log.getStackTraceString(t)); writeLog()
             } finally {
                 runOnUiThread { binding.ocrAbButton.isEnabled = selected.isNotEmpty() }
             }
@@ -355,10 +414,9 @@ class MainActivity : AppCompatActivity() {
                 val tree = runTree ?: run { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 val dbnetPath = ensureNcnnPair(tree, "dbnet")
                     ?: run { log("✗ 缺 DBNet 模型（需 dbnet*.ncnn.param/.bin 放模型資料夾）"); writeLog(); return@launch }
-                val ocrF = findOnnx(tree, "ocr")
-                    ?: run { log("✗ 缺 OCR 模型（ocr .onnx）"); writeLog(); return@launch }
+                val ocrLocal = ensureOcrNcnn(tree)
+                    ?: run { log("✗ 缺 NCNN OCR 模型（ocr_48px_ctc.ncnn.param/.bin）"); writeLog(); return@launch }
                 val alphabet = assets.open(ALPHABET).bufferedReader().use { it.readLines() }
-                val ocrLocal = ensureLocal(ocrF)
                 // 內建測試圖＝章 34.1 的代表頁（006 有瘦框「その通りじゃ」/ 010 有手寫「商人」/ 011 稀疏 /
                 // 013(demo06) 密集 / 014 中等 / 015 長對話）。改動引擎後跑這個當回歸檢驗。
                 val imgs = listOf(
@@ -432,10 +490,10 @@ class MainActivity : AppCompatActivity() {
                 val tree = runTree
                 if (tree == null) { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 if (imgPath == null) { log("✗ 效能比較需選「單一」張測試圖"); return@launch }
-                val ocrF = findOnnx(tree, "ocr")
-                val detPath = resolveDetectorPath(tree) // NCNN 優先、ORT 備援
-                if (detPath == null || ocrF == null) {
-                    log("✗ 模型不齊（需偵測 .ncnn.param/.onnx + ocr .onnx）"); return@launch
+                val ocrPath = ensureOcrNcnn(tree)
+                val detPath = resolveDetectorPath(tree) // 純 NCNN
+                if (detPath == null || ocrPath == null) {
+                    log("✗ 模型不齊（需 dbnet + ocr_48px_ctc 的 .ncnn.param/.bin）"); return@launch
                 }
                 val orient = TextOrientation.AUTO // 鎖定
                 log("▶ 去字全比較（原圖/偵測/遮罩/最佳成果 + 全去字法 boxfill·auto·AOT + 時間表）— $imgPath（需連網翻譯）")
@@ -450,7 +508,7 @@ class MainActivity : AppCompatActivity() {
                 val tDetect = System.currentTimeMillis() - tD0
                 detector.close()
                 val tO0 = System.currentTimeMillis()
-                val ocr = Ocr(ensureLocal(ocrF), alphabet, OcrConfig()) // 並發鎖最優預設(concurrent/8)
+                val ocr = Ocr(ocrPath, alphabet, OcrConfig()) // 並發鎖最優預設(concurrent/8)
                 ocr.recognize(page, detection.lines)
                 ocr.close()
                 val regions = Grouping.group(detection.lines)
@@ -601,11 +659,11 @@ class MainActivity : AppCompatActivity() {
             try {
                 val tree = runTree ?: run { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 if (imgPath == null) { log("✗ repo demo 需選「單一」張測試圖"); return@launch }
-                val ocrF = findOnnx(tree, "ocr")
-                val detPath = resolveDetectorPath(tree) // NCNN 優先、ORT 備援
+                val ocrPath = ensureOcrNcnn(tree)
+                val detPath = resolveDetectorPath(tree) // 純 NCNN
                 val inpaintBase = resolveInpaintPath(tree) // NCNN AOT 優先
-                if (detPath == null || ocrF == null) {
-                    log("✗ 模型不齊（需偵測 .ncnn.param/.onnx + ocr .onnx）"); return@launch
+                if (detPath == null || ocrPath == null) {
+                    log("✗ 模型不齊（需 dbnet + ocr_48px_ctc 的 .ncnn.param/.bin）"); return@launch
                 }
                 if (inpaintBase == null) {
                     log("✗ 缺去字模型（需 *aot*.ncnn.param）"); return@launch
@@ -618,7 +676,7 @@ class MainActivity : AppCompatActivity() {
                 // 前段：偵測 → OCR → 分群 → 翻譯 → 過濾（與「效能比較」同一套）
                 val detector = Detector(detPath) // NCNN 偵測（.param→NCNN 後端）
                 val detection = detector.detect(page); detector.close()
-                val ocr = Ocr(ensureLocal(ocrF), alphabet, OcrConfig())
+                val ocr = Ocr(ocrPath, alphabet, OcrConfig())
                 ocr.recognize(page, detection.lines); ocr.close()
                 val regions = Grouping.group(detection.lines)
                 val translator = LlmTranslator(BuildConfig.DEEPSEEK_API_KEY, TranslatorConfig())
@@ -677,11 +735,11 @@ class MainActivity : AppCompatActivity() {
     /**
      * 夜讀上機測試：對選取的每一張圖跑幾套人物遮罩配方，把結果並排、分段耗時印在同一張大圖上。
      *
-     * 第三輪（2026-09-21）：兩顆人物模型都搬到 NCNN 之後的配方比較——
-     *   · 「yolo int8 ORT」＝之前幾輪真機看的那套（基準）
-     *   · 「yolo NCNN fp16」＝同一顆換 runtime，看 mask 時間與畫面
+     * 第四輪（2026-09-26）：ORT 整個從引擎拔掉之後只剩 NCNN 兩套——
+     *   · 「yolo NCNN fp16」＝單顆 yoloseg，看 mask 時間與畫面
      *   · 「yolo+cseg NCNN」＝候選的產品配方（聯集），看總成本
-     * cseg 單顆 ORT vs NCNN 上一輪量過（mask 1.72 → 0.83 s，IoU 0.999）。
+     * 之前幾輪當基準的「yolo int8 ORT」（nightread-ort 的 CharMaskOrt）已退役；換 runtime 沒有精度代價，
+     * 上一輪量過 cseg 單顆 ORT vs NCNN：mask 1.72 → 0.83 s、IoU 0.999。
      * 每張圖跑兩次取第二次：第一次吃到的是模型冷啟，不是推論。模型載入時間另外記。
      */
     private fun runNightReadAb() {
@@ -695,65 +753,59 @@ class MainActivity : AppCompatActivity() {
 
                 val detNcnn = resolveDetectorPath(tree)
                 fun find(exact: String) = tree.listFiles().firstOrNull { (it.name ?: "").lowercase() == exact }?.let { ensureLocal(it) }
-                val yoloOnnx = tree.listFiles().firstOrNull {
-                    val n = (it.name ?: "").lowercase()
-                    n.contains("manga_seg") && n.contains("int8") && n.endsWith(".onnx")
-                }?.let { ensureLocal(it) }
                 val yoloParam = find("manga_seg_s.ncnn.param")
                 val yoloBin = find("manga_seg_s.ncnn.bin")
                 val csegParam = find("cartoonseg.ncnn.param")
                 val csegBin = find("cartoonseg.ncnn.bin")
 
-                log("模型：dbnet.param=${detNcnn != null} yolo.onnx(int8)=${yoloOnnx != null} yolo.ncnn=${yoloParam != null && yoloBin != null} cseg.ncnn=${csegParam != null && csegBin != null}")
+                log("模型：dbnet.param=${detNcnn != null} yolo.ncnn=${yoloParam != null && yoloBin != null} cseg.ncnn=${csegParam != null && csegBin != null}")
                 if (detNcnn == null) {
                     log("✗ 模型不齊：需要 dbnet 的 .param/.bin")
                     return@launch
                 }
-                // 配方＝(標籤, 偵測器路徑, 開 masker 的工廠)；每套只在自己那輪開、用完關
+                // 配方＝(標籤, 偵測器路徑, 開分割器的工廠)；每套只在自己那輪開、用完關。分割器直接用引擎的 CharSegmenter
+                // 介面（NCNN yoloseg／cseg 都實作它），聯集配方就是一個把兩顆 OR 起來的匿名 CharSegmenter。
                 val recipes = buildList {
-                    if (yoloOnnx != null) add(Recipe("yolo int8 ORT", detNcnn) { CharMaskOrt(yoloOnnx, null).let { m -> CharMasker({ _, px, w, h -> m.detect(px, w, h) }, m) } })
-                    if (yoloParam != null && yoloBin != null) add(Recipe("yolo NCNN fp16", detNcnn) {
-                        val seg = YoloSegSegmenter(yoloParam, yoloBin)
-                        CharMasker({ page, _, w, h -> Mask(w, h, seg.segment(page)) }, seg)
-                    })
+                    if (yoloParam != null && yoloBin != null) add(Recipe("yolo NCNN fp16", detNcnn) { YoloSegSegmenter(yoloParam, yoloBin) })
                     if (yoloParam != null && yoloBin != null && csegParam != null && csegBin != null) add(Recipe("yolo+cseg NCNN", detNcnn) {
                         val yolo = YoloSegSegmenter(yoloParam, yoloBin)
                         val cseg = CsegSegmenter(csegParam, csegBin)
-                        CharMasker({ page, _, w, h ->
-                            val a = yolo.segment(page)
-                            val b = cseg.segment(page)
-                            Mask(w, h, BooleanArray(w * h) { a[it] || b[it] })
-                        }, AutoCloseable { yolo.close(); cseg.close() })
+                        object : CharSegmenter {
+                            override fun segment(page: Bitmap): BooleanArray {
+                                val a = yolo.segment(page)
+                                val b = cseg.segment(page)
+                                return BooleanArray(a.size) { a[it] || b[it] }
+                            }
+                            override fun close() { yolo.close(); cseg.close() }
+                        }
                     })
                 }
-                if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型"); return@launch }
+                if (recipes.isEmpty()) { log("✗ 沒有任何人物遮罩模型（需 manga_seg_s／cartoonseg 的 .ncnn.param/.bin）"); return@launch }
                 val pages = picked.map { it.substringAfterLast('/') to loadAssetBitmap(it) }
                 val results = LinkedHashMap<String, MutableList<Triple<String, Bitmap, LongArray>>>()
 
                 for ((label, det, open) in recipes) {
                     log("▶ $label 載入模型…")
                     val tLoad = System.currentTimeMillis()
-                    val detector = Detector(det)
-                    val detOrt: DbnetOrtSandbox? = null
-                    open().use { masker ->
-                        // 整合時 cseg 是逐章載入，載入成本要知道（session 建立含權重讀取）
-                        log("  載入 ${System.currentTimeMillis() - tLoad}ms")
-                        for ((name, bmp) in pages) {
-                            repeat(2) { pass ->
-                                val t = LongArray(3)
-                                val out = nightReadOnce(bmp, detector, detOrt, masker, t)
-                                if (pass == 1) {
-                                    results.getOrPut(label) { mutableListOf() }.add(Triple(name, out, t))
-                                    log("  $name  detect ${t[0]}ms  mask ${t[1]}ms  render ${t[2]}ms  " +
-                                        "total ${t.sum()}ms")
-                                } else {
-                                    out.recycle()
+                    Detector(det).use { detector ->
+                        open().use { masker ->
+                            // 整合時 cseg 是逐章載入，載入成本要知道（Net 建立含權重讀取）
+                            log("  載入 ${System.currentTimeMillis() - tLoad}ms")
+                            for ((name, bmp) in pages) {
+                                repeat(2) { pass ->
+                                    val t = LongArray(3)
+                                    val out = nightReadOnce(bmp, detector, masker, t)
+                                    if (pass == 1) {
+                                        results.getOrPut(label) { mutableListOf() }.add(Triple(name, out, t))
+                                        log("  $name  detect ${t[0]}ms  mask ${t[1]}ms  render ${t[2]}ms  " +
+                                            "total ${t.sum()}ms")
+                                    } else {
+                                        out.recycle()
+                                    }
                                 }
                             }
                         }
                     }
-                    detector?.close()
-                    detOrt?.close()
                 }
 
                 val sheet = composeNightReadSheet(pages, recipes.map { it.label }, results)
@@ -769,21 +821,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 夜讀測試配方：偵測器（NCNN .param）＋ 開人物遮罩推論的工廠（每套各自開關）。 */
-    private data class Recipe(val label: String, val detector: String, val open: () -> CharMasker)
-
-    /** 人物遮罩推論的統一介面：ORT（CharMaskOrt）或 NCNN（引擎 CsegSegmenter）都包成這個。 */
-    private class CharMasker(val fn: (Bitmap, IntArray, Int, Int) -> Mask, private val owner: AutoCloseable) : AutoCloseable {
-        fun mask(page: Bitmap, px: IntArray, w: Int, h: Int): Mask = fn(page, px, w, h)
-        override fun close() = owner.close()
-    }
+    /** 夜讀測試配方：偵測器（NCNN .param）＋ 開人物分割器的工廠（每套各自開關；引擎 [CharSegmenter]＝NCNN yoloseg／cseg）。 */
+    private data class Recipe(val label: String, val detector: String, val open: () -> CharSegmenter)
 
     /** 跑一次夜讀，把三段耗時寫進 [t]（detect / mask / render）。 */
     private fun nightReadOnce(
         page: Bitmap,
-        detector: Detector?,
-        detOrt: DbnetOrtSandbox?,
-        masker: CharMasker,
+        detector: Detector,
+        masker: CharSegmenter,
         t: LongArray,
     ): Bitmap {
         val w = page.width
@@ -792,7 +837,7 @@ class MainActivity : AppCompatActivity() {
         page.getPixels(px, 0, w, 0, 0, w, h)
 
         var ts = System.currentTimeMillis()
-        val detection = detector?.detect(page) ?: detOrt!!.detect(page)
+        val detection = detector.detect(page)
         val regions = Grouping.group(detection.lines).map {
             NrRegion(
                 it.x0.toInt().coerceIn(0, w), it.y0.toInt().coerceIn(0, h),
@@ -804,7 +849,7 @@ class MainActivity : AppCompatActivity() {
         t[0] = System.currentTimeMillis() - ts
 
         ts = System.currentTimeMillis()
-        val chars = masker.mask(page, px, w, h)
+        val chars = Mask(w, h, masker.segment(page)) // 分割器回 w×h 的 BooleanArray，true＝人物
         t[1] = System.currentTimeMillis() - ts
 
         ts = System.currentTimeMillis()
@@ -905,6 +950,107 @@ class MainActivity : AppCompatActivity() {
                 )
             }
             top += rowH[i] + gap
+        }
+        return sheet
+    }
+
+    /**
+     * OCR 後端 A/B 成果圖（給使用者看圖判「誰讀對」）：左＝頁面疊偵測框＋行號（候選間讀出不同的行畫紅）；
+     * 右＝逐行列第一欄（真值）的讀法，不同的行貼原圖裁片＋各候選讀法（與真值同者綠、不同者紅）。
+     */
+    private fun composeOcrAbSheet(pageName: String, page: Bitmap, r: OcrAbResult): Bitmap {
+        val leftW = 900
+        val rightW = 1100
+        val gap = 12
+        val scale = leftW.toFloat() / page.width
+        val leftH = (page.height * scale).toInt()
+        fun paint(size: Float, colour: Int, mono: Boolean = true, bold: Boolean = false) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = size; color = colour; typeface = if (mono) Typeface.MONOSPACE else Typeface.DEFAULT; isFakeBoldText = bold
+        }
+        val truth = 0
+        val diffRows = r.rows.indices.filter { i -> r.rows[i].any { it != r.rows[i][0] } }.toSet()
+        class Row(val i: Int, val crop: Bitmap?, val h: Int)
+        val rows = r.rows.indices.map { i ->
+            if (i !in diffRows) return@map Row(i, null, 30)
+            val q = r.quads[i]
+            val x0 = q.minOf { it.x }.toInt().coerceIn(0, page.width - 2)
+            val y0 = q.minOf { it.y }.toInt().coerceIn(0, page.height - 2)
+            val x1 = q.maxOf { it.x }.toInt().coerceIn(x0 + 1, page.width)
+            val y1 = q.maxOf { it.y }.toInt().coerceIn(y0 + 1, page.height)
+            val crop = Bitmap.createBitmap(page, x0, y0, x1 - x0, y1 - y0)
+            val maxW = 560
+            val maxH = if (crop.height > crop.width) 420 else 200
+            val sc = minOf(maxW.toFloat() / crop.width, maxH.toFloat() / crop.height, 2.5f)
+            val scaled = Bitmap.createScaledBitmap(crop, (crop.width * sc).toInt().coerceAtLeast(1), (crop.height * sc).toInt().coerceAtLeast(1), true)
+            if (scaled !== crop) crop.recycle() // 同尺寸時 createScaledBitmap 回同一物件（memory：recycle 坑）
+            Row(i, scaled, 30 + maxOf(scaled.height, 26 * r.labels.size) + 16)
+        }
+        val headerH = 40 + 22 * (r.labels.size + 1) + 20
+        val rightH = rows.sumOf { it.h } + 20
+        val sheet = Bitmap.createBitmap(leftW + rightW + 3 * gap, headerH + maxOf(leftH, rightH) + gap, Bitmap.Config.ARGB_8888)
+        val c = Canvas(sheet)
+        c.drawColor(Color.rgb(18, 18, 18))
+        var y = 30f
+        c.drawText(
+            "OCR 後端比較 · $pageName · ${r.rows.size} 行 · 偵測 ${"%.0f".format(r.detectMs)}ms · 紅框＝候選讀法不同",
+            gap.toFloat(), y, paint(22f, Color.WHITE, mono = false, bold = true),
+        )
+        y += 26
+        r.labels.forEachIndexed { k, l ->
+            val same = r.rows.count { it[k] == it[truth] }
+            c.drawText(
+                "${l.padEnd(12)}[${r.backends[k]}]  載入 ${"%.0f".format(r.loadMs[k])}ms  OCR ${"%.0f".format(r.recognizeMs[k])}ms  同真值 $same/${r.rows.size}",
+                gap.toFloat(), y, paint(17f, if (k == truth) Color.WHITE else Color.rgb(190, 210, 235)),
+            )
+            y += 22
+        }
+        val top = headerH.toFloat()
+        c.drawBitmap(page, null, android.graphics.RectF(gap.toFloat(), top, (gap + leftW).toFloat(), top + leftH), Paint(Paint.FILTER_BITMAP_FLAG))
+        val boxOk = Paint().apply { color = Color.rgb(80, 200, 120); style = Paint.Style.STROKE; strokeWidth = 2f }
+        val boxDiff = Paint().apply { color = Color.rgb(255, 80, 80); style = Paint.Style.STROKE; strokeWidth = 4f }
+        val lblBg = Paint().apply { color = Color.argb(200, 0, 0, 0) }
+        r.quads.forEachIndexed { i, q ->
+            val path = android.graphics.Path()
+            q.forEachIndexed { j, p ->
+                val px = gap + p.x * scale
+                val py = top + p.y * scale
+                if (j == 0) path.moveTo(px, py) else path.lineTo(px, py)
+            }
+            path.close()
+            c.drawPath(path, if (i in diffRows) boxDiff else boxOk)
+            val lx = gap + q[0].x * scale
+            val ly = top + q[0].y * scale
+            c.drawRect(lx, ly - 18, lx + 34, ly + 2, lblBg)
+            c.drawText("$i", lx + 2, ly - 2, paint(16f, if (i in diffRows) Color.rgb(255, 120, 120) else Color.rgb(160, 255, 180), bold = true))
+        }
+        val rx = (2 * gap + leftW).toFloat()
+        var ry = top
+        for (row in rows) {
+            val i = row.i
+            val head = "L${"%02d".format(i)}"
+            if (row.crop == null) {
+                c.drawText(head, rx, ry + 22, paint(17f, Color.rgb(160, 160, 160)))
+                c.drawText(r.rows[i][truth].ifBlank { "∅" }, rx + 60, ry + 22, paint(20f, Color.rgb(220, 220, 220), mono = false))
+            } else {
+                c.drawRect(rx - 4, ry + 2, rx + rightW - 4, ry + row.h - 4, Paint().apply { color = Color.rgb(40, 28, 28) })
+                c.drawText(head, rx, ry + 22, paint(17f, Color.rgb(255, 120, 120), bold = true))
+                c.drawBitmap(row.crop, rx + 60, ry + 28, null)
+                var ty = ry + 28 + 22
+                val tx = rx + 60 + row.crop.width + 20
+                r.labels.forEachIndexed { k, l ->
+                    val t = r.rows[i][k]
+                    val col = when {
+                        k == truth -> Color.WHITE
+                        t == r.rows[i][truth] -> Color.rgb(160, 255, 180)
+                        else -> Color.rgb(255, 120, 120)
+                    }
+                    c.drawText(l.padEnd(12), tx, ty, paint(16f, Color.rgb(170, 170, 170)))
+                    c.drawText(t.ifBlank { "∅" }, tx + 150, ty, paint(22f, col, mono = false))
+                    ty += 26
+                }
+                row.crop.recycle()
+            }
+            ry += row.h
         }
         return sheet
     }
@@ -1072,7 +1218,7 @@ class MainActivity : AppCompatActivity() {
             BUILD_TAG,
             "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · $soc · %d核 · %.1fGB".format(cores, ramGB),
             "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) · $abi",
-            "效能：OCR並發 x%d · 偵測/去字 NCNN CPU · OCR ORT-int8".format(OcrConfig().concurrency),
+            "效能：OCR並發 x%d · 偵測/去字/OCR 全 NCNN CPU（OCR mixed：backbone fp16＋transformer fp32）".format(OcrConfig().concurrency),
             "去字與翻譯並發重疊 → 整張＝牆鐘(非各段相加)",
             "LLM：${tc.provider} · ${tc.model}",
         )
@@ -1246,7 +1392,7 @@ class MainActivity : AppCompatActivity() {
 
     /** SAF 模型串流複製到 filesDir（64KB 緩衝、不佔 heap），回傳路徑；已存在且同大小則跳過。 */
     private fun ensureLocal(doc: DocumentFile): String {
-        val name = doc.name ?: "model.onnx"
+        val name = doc.name ?: "model.bin"
         val out = java.io.File(filesDir, name)
         if (out.exists() && out.length() == doc.length()) return out.absolutePath
         contentResolver.openInputStream(doc.uri)!!.use { input ->
@@ -1281,14 +1427,14 @@ class MainActivity : AppCompatActivity() {
             try {
                 val tree = runTree ?: run { log("✗ 請先按「選擇模型資料夾」"); return@launch }
                 if (imgPath == null) { log("✗ 跨頁測試需選單張測試圖"); return@launch }
-                val ocrF = findOnnx(tree, "ocr") ?: run { log("✗ 缺 OCR"); return@launch }
+                val ocrNcnn = ensureOcrNcnn(tree) ?: run { log("✗ 缺 NCNN OCR 模型（ocr_48px_ctc.ncnn.param/.bin）"); return@launch }
                 val detNcnn = ensureNcnnPair(tree, "dbnet")
                 val aotNcnn = ensureNcnnPair(tree, "aot")
                 if (detNcnn == null || aotNcnn == null) { log("✗ 缺 NCNN 偵測/去字 .param"); return@launch }
                 val alphabet = assets.open(ALPHABET).bufferedReader().use { it.readLines() }
                 val tf = runCatching { Typeface.createFromAsset(assets, FONT) }.getOrNull()
                 val cfg = EngineConfig(inpainter = InpainterConfig(method = method, tileSize = 768))
-                val models = ModelSet(ocr = ensureLocal(ocrF), detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
+                val models = ModelSet(ocr = ocrNcnn, detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
                 val page = loadAssetBitmap(imgPath)
                 log("▶ 跨頁吞吐測試（同一圖·併發 D=1→5·需連網翻譯·去字=$methodLabel）— $imgPath")
                 Yakuyomi.create(models, alphabet, BuildConfig.DEEPSEEK_API_KEY, cfg, tf).use { engine ->
@@ -1326,6 +1472,18 @@ class MainActivity : AppCompatActivity() {
         return ensureLocal(param)
     }
 
+    /**
+     * OCR 模型路徑（產品配方）：主檔 `ocr_48px_ctc.ncnn.param`+`.bin`（key 故意含 ".ncnn" 才不會誤抓 `_mixed` 那份），並把同夾的
+     * `ocr_48px_ctc_mixed.ncnn.param`（backbone fp16、transformer/char_pred fp32；共用同一份 .bin）一起放進 filesDir——
+     * 引擎 [Ocr] 由主檔路徑推 mixed 路徑、CPU 有 asimdhp 才載，跟產品一樣；夾裡沒 mixed 就退回全域精度 param（全 fp16，
+     * 小假名零星讀錯）。只給主檔而不帶 mixed 會讓「診斷」量到的不是產品精度，所以集中在這裡處理。回主檔 .param 的本機路徑；缺主檔回 null。
+     */
+    private fun ensureOcrNcnn(tree: DocumentFile): String? {
+        val base = ensureNcnnPair(tree, "ocr_48px_ctc.ncnn") ?: return null
+        findFile(tree, "ocr_48px_ctc_mixed", ".param")?.let { ensureLocal(it) }
+        return base
+    }
+
     /** 偵測模型路徑：NCNN `.param`（純 NCNN）；缺回 null。給直接建 Detector 的 dev 工具用。 */
     private fun resolveDetectorPath(tree: DocumentFile): String? = ensureNcnnPair(tree, "dbnet")
 
@@ -1337,18 +1495,13 @@ class MainActivity : AppCompatActivity() {
         return runCatching { DocumentFile.fromTreeUri(this, Uri.parse(s)) }.getOrNull()
     }
 
-    private fun findOnnx(tree: DocumentFile, vararg keywords: String): DocumentFile? =
-        tree.listFiles().firstOrNull { f ->
-            val n = f.name?.lowercase() ?: return@firstOrNull false
-            n.endsWith(".onnx") && keywords.any { n.contains(it) }
-        }
-
     private fun loadAssetBitmap(path: String): Bitmap =
         assets.open(path).use { BitmapFactory.decodeStream(it) }
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val BUILD_TAG = "v2.1-dbnet" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
+        private const val BUILD_TAG = "v2.3-ncnn-only" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
+        private const val PREF_LAST_EXIT = "last_exit_ts_v2" // v2＝raw .pb 版；換 key 讓上一版毀掉的那次 crash 重吐一次
         // NCNN 推論由引擎 NcnnBackend（libyakuyomi_ncnn）負責；sandbox 不再自帶 benchmark 用的 libncnn_jni。
 
         private const val PREF_TREE = "modelTree"

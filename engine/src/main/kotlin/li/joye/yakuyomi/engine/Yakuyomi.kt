@@ -38,7 +38,7 @@ object Yakuyomi {
         config: EngineConfig = EngineConfig(),
         typeface: Typeface? = null,
     ): TranslationEngine {
-        // 偵測 + 去字皆純 NCNN（產品 arm64、NCNN 必在；ORT 備援與 LaMa 已退役移除）。
+        // 三顆模型（偵測／OCR／去字）全 NCNN（產品 arm64、NCNN 必在；ORT 已整個從引擎拔除、LaMa 退役）。
         check(NcnnBackend.available) { "NCNN 原生庫未載入（arm64 應可用）" }
         EngineTrace.log("create.detector")
         val detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
@@ -52,54 +52,76 @@ object Yakuyomi {
         return Pipeline(detector, ocr, translator, inpainter, config, typeface)
     }
 
+    /** 這顆 CPU 有 fp16 storage/arithmetic（arm82 asimdhp）——決定 OCR 能不能用混合精度 param（見 [Ocr]、[OcrConfig.ncnnMixed]）。 */
+    fun ncnnCpuSupportsFp16(): Boolean = NcnnBackend.cpuSupportsFp16
+
     /**
-     * 診斷（sandbox 用）：對一頁跑偵測 → 每行分別以 bilinear / bicubic 裁切做 OCR，回逐行讀取對照 + 各自 recognize 耗時。
-     * 真機 A/B 驗證「bicubic 前處理救回被縮放糊掉的小假名（句尾否定→意思相反）」的品質提升與效能代價。
-     * 兩者共用同一 ORT session（只差裁切內插法）；計時前先暖跑兩條路徑（session lazy init + JIT），數字才可靠。
+     * 診斷（sandbox 用）：對一頁跑一次偵測 → 同一批行框，逐個 [candidates]（OCR 模型路徑 + 設定）各建一個 [Ocr]
+     * 做 OCR，回逐行讀取對照 + 各自的載入／recognize 耗時。用來真機 A/B NCNN 各精度組合（mixed／全 fp16／fp32，
+     * 靠 [OcrCandidate.config] 的 ncnnMixed／ncnnFp16Storage／ncnnFp16Arith 切）。
+     * 每個候選：暖跑（warmUp + 一輪不計時的 recognize，吃掉首次 forward 配置／JIT／冷啟）→ 正式計時一輪 → close。
+     * 候選逐個開關（同時只有一顆 OCR 模型在記憶體）。
      */
     suspend fun ocrAbTest(
-        models: ModelSet,
+        detectorPath: String,
         alphabet: List<String>,
         page: Bitmap,
-        config: EngineConfig = EngineConfig(),
+        candidates: List<OcrCandidate>,
+        detectorConfig: DetectorConfig = DetectorConfig(),
     ): OcrAbResult {
         check(NcnnBackend.available) { "NCNN 原生庫未載入" }
-        val detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
-        val ocr = Ocr(models.ocr, alphabet, config.ocr)
+        val detector = Detector(detectorPath, detectorConfig)
         try {
             val tDet = System.nanoTime()
             val det = detector.detect(page)
             val detectMs = (System.nanoTime() - tDet) / 1e6
             val clone = { det.lines.map { TextLine(it.quad, it.score) } } // recognize 就地寫 text → 每次跑用新副本
-            // 暖跑兩條路徑（不計時）：session 首次 run 的 lazy init + bicubic 迴圈 JIT
-            ocr.warmUp()
-            ocr.recognize(page, clone(), bicubic = false)
-            ocr.recognize(page, clone(), bicubic = true)
-            // 正式計時
-            val linesBil = clone()
-            val t0 = System.nanoTime()
-            ocr.recognize(page, linesBil, bicubic = false)
-            val bilinearMs = (System.nanoTime() - t0) / 1e6
-            val linesBic = clone()
-            val t1 = System.nanoTime()
-            ocr.recognize(page, linesBic, bicubic = true)
-            val bicubicMs = (System.nanoTime() - t1) / 1e6
-            val rows = linesBil.indices.map { OcrAbRow(linesBil[it].text, linesBic[it].text) }
-            return OcrAbResult(rows, bilinearMs, bicubicMs, detectMs)
+            val perCandidate = mutableListOf<List<String>>()
+            val loadMs = mutableListOf<Double>()
+            val recognizeMs = mutableListOf<Double>()
+            val backends = mutableListOf<String>()
+            for (c in candidates) {
+                val tLoad = System.nanoTime()
+                val ocr = Ocr(c.modelPath, alphabet, c.config)
+                loadMs += (System.nanoTime() - tLoad) / 1e6
+                backends += ocr.backend
+                try {
+                    ocr.warmUp()
+                    ocr.recognize(page, clone())
+                    val lines = clone()
+                    val t0 = System.nanoTime()
+                    ocr.recognize(page, lines)
+                    recognizeMs += (System.nanoTime() - t0) / 1e6
+                    perCandidate += lines.map { it.text }
+                } finally {
+                    runCatching { ocr.close() }
+                }
+            }
+            val rows = det.lines.indices.map { i -> perCandidate.map { it[i] } }
+            return OcrAbResult(candidates.map { it.label }, backends, rows, loadMs, recognizeMs, detectMs, det.lines.map { it.quad })
         } finally {
             runCatching { detector.close() }
-            runCatching { ocr.close() }
         }
     }
 }
 
-/** [Yakuyomi.ocrAbTest] 結果：逐行 bilinear vs bicubic OCR 讀取 [rows] + 各內插法 recognize 總耗時（ms）+ 偵測耗時。 */
-class OcrAbResult(
-    val rows: List<OcrAbRow>,
-    val bilinearMs: Double,
-    val bicubicMs: Double,
-    val detectMs: Double,
-)
+/**
+ * [Yakuyomi.ocrAbTest] 的一個候選：標籤 + OCR 模型路徑（NCNN `.param`；給原版或 `_mixed` 版皆可，實際載哪份由 [Ocr] 的
+ * pickParam 依 config 決定）+ 設定（如 [OcrConfig.ncnnMixed]／[OcrConfig.ncnnFp16Storage]／[OcrConfig.ncnnFp16Arith]）。
+ */
+class OcrCandidate(val label: String, val modelPath: String, val config: OcrConfig = OcrConfig())
 
-/** 單行對照：同一行框，[bilinear] 與 [bicubic] 裁切各自 OCR 讀出的文字（空＝低於信心門檻被丟）。 */
-class OcrAbRow(val bilinear: String, val bicubic: String)
+/**
+ * [Yakuyomi.ocrAbTest] 結果：[labels]／[backends] 對應各候選；[rows] 逐行、每行是各候選讀出的文字（空＝低於信心門檻被丟）；
+ * [loadMs]／[recognizeMs] 各候選的模型載入與正式一輪 recognize 耗時；[detectMs] 偵測耗時（只跑一次）；
+ * [quads] 每行的偵測四邊形（與 [rows] 同序，給成果圖裁圖／畫框）。
+ */
+class OcrAbResult(
+    val labels: List<String>,
+    val backends: List<String>,
+    val rows: List<List<String>>,
+    val loadMs: List<Double>,
+    val recognizeMs: List<Double>,
+    val detectMs: Double,
+    val quads: List<List<Pt>>,
+)

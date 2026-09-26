@@ -1,6 +1,6 @@
 # Yakuyomi — manga translation engine
 
-On-device detection and text removal (NCNN) and OCR (ONNX Runtime, int8), plus cloud-LLM translation. Japanese to Traditional Chinese by default; any source and target language can be set.
+On-device detection, OCR and text removal (all on NCNN), plus cloud-LLM translation. Japanese to Traditional Chinese by default; any source and target language can be set.
 
 English ｜ [中文](README_zh.md)
 
@@ -18,12 +18,12 @@ This repo is the **engine** (`yakuyomi-engine`) — the translation library, not
 
 ## What it is
 
-Yakuyomi translates manga pages. Four of the five stages run on the device (NCNN for detection and text removal, ONNX Runtime for OCR, Canvas for typesetting); only translation calls out to a network LLM:
+Yakuyomi translates manga pages. Four of the five stages run on the device (NCNN for detection, OCR and text removal, Canvas for typesetting); only translation calls out to a network LLM:
 
 ```
 page bitmap
   detect    (NCNN)   text-line boxes + per-pixel stroke mask
-  OCR       (ONNX·int8)  one forward per line  ->  source text
+  OCR       (NCNN)   one forward per line  ->  source text
   group             merge aligned lines into bubble regions
   translate (LLM)   one request per page
   remove    (NCNN)   erase the original text (flat-fill or AOT-GAN reconstruction)
@@ -44,11 +44,11 @@ Text over artwork is the hard case. A box-fill (what most overlay translators do
 ## Goals
 
 - **Speed over maximal quality — a deliberate tradeoff for a phone.** The first instinct was to chase image quality: LaMa inpainting, per-region native-resolution reconstruction, the sharpest text removal possible. On a phone that is a dead end — those cost seconds per page and gigabytes of memory, and the reader stalls. On an end device the goal is not the last few percent of quality but *speed*: a page has to appear while you read. So every stage is settled at the quality/efficiency knee, not the quality ceiling:
-  - **OCR** int8-quantized (~3.6× faster than fp32 on ARM, 96.7% parity, a quarter the size).
-  - **Detection and text removal** on NCNN's mobile kernels (NEON/Winograd). The detector runs in fp16 — int8 quantization was tried and produced no boxes at all, with no speedup on ARM.
+  - **OCR** on NCNN in mixed precision — fp16 backbone, fp32 transformer head. All-fp16 misreads small kana (219 of 242 lines on 9 pages), and so did the int8 ONNX Runtime model it replaces (223/242); mixed reads 241/242 while running ~23% faster than that int8 model.
+  - **Detection and text removal** likewise on NCNN's mobile kernels (NEON/Winograd). The detector runs in fp16 — int8 quantization was tried and produced no boxes at all, with no speedup on ARM.
   - **Text removal at tile 768** — whole-page AOT-GAN, the point where quality is good *and* the work stays hidden under the translation wait (see Concurrency). A larger tile or per-region reconstruction is marginally sharper but pokes above that wait; LaMa is slower and blurrier. **GPU/NPU was tried and does not work for these models** — NCNN's Vulkan path miscomputes the AOT-GAN (garbage output), and LiteRT cannot compile it — so everything runs on the **CPU**, which turned out to be enough.
 
-  Measured on a Snapdragon 8 Gen 3: detection + OCR take **10.3 s across 6 representative pages** — 161 detected boxes, 160 read back (99.4%). Translation and text removal come on top of that, and overlap each other (see Concurrency). Peak memory ~1.9–2.1 GB — no GPU, nowhere near 16 GB of RAM.
+  Measured on a Snapdragon 8 Gen 3: detection + OCR take **10.3 s across 6 representative pages** — 161 detected boxes, 160 read back (99.4%); that was with the previous int8 OCR, and the NCNN OCR takes ~23% off the OCR share. Translation and text removal come on top of that, and overlap each other (see Concurrency). Peak memory ~1.9–2.1 GB — no GPU, nowhere near 16 GB of RAM.
 - **Concurrency, two layers.**
   - *Within a page* — text removal needs only the OCR'd regions, known before the LLM replies, so it runs on a background coroutine while the translate request is in flight; a page pays only the longer of the two. (This is why a failed block keeps its re-pasted source text rather than the untouched image — decoupling removal from the translation result is what lets them overlap.)
   - *Across pages* — `translatePage` is safe to call concurrently on one warm engine (shared detection / OCR / translator / removal sessions; benchmarked on device — no crash, no corruption). So the reader can pipeline: page N's network translate overlaps page N+1's on-device detect/OCR. With the cheap box-fill removal the pipeline reaches the network-bound ceiling — about **2× the sequential rate** at a shallow depth (~4). Pages read first at box-fill quality, then upgrade to full AOT-GAN removal when idle (re-render, below).
@@ -62,7 +62,7 @@ Two layers of concurrency. *Within a page*, text removal (CPU) overlaps the tran
 ## What it can do
 
 - **Detection** — DBNet (ResNet34 + DB head, manga-image-translator's default detector) on NCNN. It replaced comic-text-detector, which is gone: DBNet reads **1.6–2.5× more text correctly** on device. Pages are resized aspect-preserving to 1024 and padded to a multiple of 256 — a rectangular input, which also avoids an ncnn heap-corruption bug on square sizes between 832 and 992. Returns text-line quads and a per-pixel stroke mask used to limit text removal to the glyphs.
-- **OCR** — a 48px CTC model on ONNX Runtime, **int8 dynamic-quantized** (~3.6× faster on ARM, 96.7% CTC parity vs fp32, and a quarter the size). One forward per line, decoded greedily; lines are recognized concurrently. Runs on pure CPU MLAS (XNNPACK miscomputes this model).
+- **OCR** — a 48px CTC model on NCNN in **mixed precision**: the convolutional backbone runs fp16, the transformer and character head fp32 (ncnn's per-layer featmask plus an explicit Cast layer between them). The sinusoidal positional encoding is computed per strip and fed as a second input rather than traced into the graph, so any strip width works. On device it reads 241 of 242 lines identically to fp32 (int8: 223, all-fp16: 219 — both misread small kana) and is ~23% faster than the int8 ONNX Runtime model it replaced. One forward per line, decoded greedily; lines are recognized concurrently. The mixed-precision param needs an ARMv8.2 fp16 CPU; elsewhere the engine loads the plain param and runs fp32.
 - **Translation** — a cloud LLM with the line-numbered protocol from manga-image-translator. Any OpenAI-compatible provider works; presets cover manga-image-translator's set (OpenAI, DeepSeek, Gemini, Groq, Qwen, Sakura, custom) plus OpenRouter, each with its model list fetched live. DeepSeek by default. The engine sends one request per page; running pages concurrently (and rate-limiting them) is the caller's job — the reader does it with a semaphore, see Concurrency above. A failed line falls back to its source text rather than breaking the page. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
 - **Text removal** — two modes on NCNN. Speech bubbles are always flat-filled (clean, no halo); the modes differ in how text drawn over artwork is handled:
 
@@ -93,17 +93,17 @@ Weights are not committed and not packed into the APK. The reader can auto-downl
 | Stage | Model | Backend | Source |
 |---|---|---|---|
 | Detection | DBNet, ResNet34 + DB head (`.ncnn.param`/`.bin`) | NCNN | from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) (its default detector) |
-| OCR | 48px CTC, int8-quantized (`.onnx`) | ONNX Runtime | weights from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| OCR | 48px CTC, mixed fp16/fp32 (`.ncnn.param` ×2 + `.bin`) | NCNN | weights from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | Text removal | AOT-GAN manga inpaint (`.ncnn.param`/`.bin`) | NCNN | from [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | Fonts | Noto Sans/Serif CJK, Source Han | — | CJK rendering (OFL / Apache) |
 
-NCNN roles ship as a `.param` + `.bin` pair (both required). The full set is about 208 MB, most of it the fp16 detector (153 MB).
+Everything is NCNN, shipped as `.param` + `.bin` (both required); OCR has two `.param` files (plain and `_mixed`) over one `.bin`, and the engine picks between them at load time. The full set is about 247 MB — the fp16 detector (153 MB) and the fp16 OCR weights (83 MB) make up most of it.
 
 ## Try it
 
-The engine is an Android library (arm64 NCNN + ONNX Runtime), so trying it means building the sandbox app (`:app-sandbox`) and installing it. **A real arm64 Android device is required** — the sandbox only builds `arm64-v8a`, so an x86 emulator won't run it.
+The engine is an Android library (arm64, NCNN), so trying it means building the sandbox app (`:app-sandbox`) and installing it. **A real arm64 Android device is required** — the sandbox only builds `arm64-v8a`, so an x86 emulator won't run it.
 
-**1. Get the models.** They aren't in the repo. Fetch the five files listed in [`models.json`](models.json) — the detector `.param`+`.bin` from the `models-v3` release, the OCR `.onnx` and the inpaint `.param`+`.bin` from `models-v2` — and put them all in one folder the phone can read. Details, checksums and licensing: [docs/MODELS.md](docs/MODELS.md).
+**1. Get the models.** They aren't in the repo. Fetch the six files listed in [`models.json`](models.json) — the detector `.param`+`.bin` from the `models-v3` release, the OCR `.param` (plain and `_mixed`) + `.bin` from `models-v4`, and the inpaint `.param`+`.bin` from `models-v2` — and put them all in one folder the phone can read. Details, checksums and licensing: [docs/MODELS.md](docs/MODELS.md).
 
 **2. (Optional) Add an LLM key.** Copy `api-keys.properties.example` to `api-keys.properties` and fill in `DEEPSEEK_API_KEY`. **Skip this and translation is simply skipped** — you still get detection, OCR and text removal, which is enough to watch the pipeline work.
 
@@ -140,7 +140,7 @@ The engine is a from-scratch Kotlin implementation. It contains no manga-image-t
 
 - [mihon](https://github.com/mihonapp/mihon) — the reader the app forks (Apache-2.0)
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — prompt and behaviour reference; the DBNet detection, OCR, and AOT-GAN inpaint model weights
-- [ncnn](https://github.com/Tencent/ncnn) — the on-device inference runtime for detection and removal
+- [ncnn](https://github.com/Tencent/ncnn) — the on-device inference runtime for all three models
 - Noto Sans/Serif CJK, Source Han — fonts
 
 ## License
@@ -150,7 +150,6 @@ The engine is a from-scratch Kotlin implementation. It contains no manga-image-t
 Component licenses:
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — GPL-3.0 (prompt/protocol, detection/OCR/removal behaviour, line grouping; DBNet detection model, 48px CTC OCR model, and AOT-GAN inpaint model)
 - [ncnn](https://github.com/Tencent/ncnn) — BSD-3-Clause (inference runtime, statically linked)
-- [ONNX Runtime](https://github.com/microsoft/onnxruntime) — MIT (OCR inference runtime)
 - [mihon](https://github.com/mihonapp/mihon) — Apache-2.0 (reader fork lives in the separate product repo; Apache-2.0 is GPL-3.0-compatible, so the combined app is GPL-3.0)
 
-Model weights are all GPL-3.0 and are **redistributed** through this repo's releases for one-tap auto-download — the manifest is [`models.json`](models.json), pointing at the detector in [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3) and the unchanged OCR and inpaint assets in [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) (see [docs/MODELS.md](docs/MODELS.md)); you can also bring your own from the sources above. Fonts are not bundled (system CJK fallback).
+Model weights are all GPL-3.0 and are **redistributed** through this repo's releases for one-tap auto-download — the manifest is [`models.json`](models.json), pointing at the detector in [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3), the OCR in [`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4), and the unchanged inpaint assets in [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) (see [docs/MODELS.md](docs/MODELS.md)); you can also bring your own from the sources above. Fonts are not bundled (system CJK fallback).

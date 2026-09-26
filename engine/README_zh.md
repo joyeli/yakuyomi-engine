@@ -2,7 +2,7 @@
 
 [English](README.md) ｜ 中文
 
-裝置端漫畫翻譯 library（Android，Kotlin、NCNN + ONNX Runtime）。給它一張頁 bitmap，回一張翻好的頁 bitmap。偵測、OCR、去字在裝置上跑（偵測與去字走 NCNN、OCR 走 ONNX Runtime）；翻譯呼叫雲端 LLM（OpenAI 相容）。
+裝置端漫畫翻譯 library（Android，Kotlin、NCNN）。給它一張頁 bitmap，回一張翻好的頁 bitmap。偵測、OCR、去字在裝置上跑、全走 NCNN；翻譯呼叫雲端 LLM（OpenAI 相容）。
 
 這個 module 跟 reader 無關，只做一件事：`translatePage(bitmap) -> PageResult`。覆蓋檔案、標記、續傳、跨頁批次是呼叫端的事（見[結果處理](#結果處理)）。reader app（[Yakuyomi](https://github.com/joyeli/Yakuyomi) mihon fork）用 Gradle composite build 引入。
 
@@ -13,13 +13,13 @@ Group：`li.joye.yakuyomi:engine`。Min SDK 26。
 ## 快速開始
 
 ```kotlin
-// 1. 指向本機模型檔（見模型）。偵測與去字走 NCNN（.param + .bin 成對），
-//    OCR 走 ONNX Runtime（.onnx）。最省事是讓引擎從資料夾清單裡挑：
+// 1. 指向本機模型檔（見模型）。三顆全走 NCNN（.param + .bin 成對）；
+//    OCR 有兩份 .param（一般版與 _mixed）共用一份 .bin。最省事是讓引擎從資料夾清單裡挑：
 val models = ModelSet.resolve(localModelFiles) ?: return // null = 沒到齊
 // 或明確指定各檔（NCNN 角色給 .param 路徑，對應的 .bin 要放在旁邊）：
 val models = ModelSet(
     detectorNcnn     = "/path/dbnet_detect.ncnn.param",
-    ocr              = "/path/ocr_int8.onnx",
+    ocr              = "/path/ocr_48px_ctc.ncnn.param",  // 或 _mixed 那份；引擎載入時自己選
     aotInpainterNcnn = "/path/mit_aot_fixed512.ncnn.param",
 )
 
@@ -27,7 +27,7 @@ val models = ModelSet(
 val alphabet: List<String> = assets.open("models/alphabet-all-v5.txt").bufferedReader().readLines()
 val apiKey = "<deepseek key>"   // null/空 = 只偵測+OCR+去字、不翻譯（debug）
 
-// 3. 建引擎、翻譯。use { } 會釋放 native ONNX session。
+// 3. 建引擎、翻譯。use { } 會釋放 native NCNN net。
 Yakuyomi.create(models, alphabet, apiKey).use { engine ->
     when (val r = engine.translatePage(pageBitmap)) {
         is PageResult.Translated -> writeBack(r.page)   // 成功：覆蓋 + 標記完成
@@ -56,15 +56,15 @@ val models = ModelSet.resolve(dir.listFiles()!!.map { it.name to it.absolutePath
 
 **自備模型（BYOM）。** 或自己放檔——放在任何本機路徑，讓 `ModelSet.resolve` 按檔名比對，或明確指定各角色（見[快速開始](#快速開始)）。
 
-兩條路要的是同樣那五個檔。偵測與去字走 NCNN（各是 `.param` + `.bin` 一對，兩個都要）；OCR 走 ONNX Runtime：
+兩條路要的是同樣那六個檔，全走 NCNN（`.param` + `.bin`，兩個都要；OCR 有兩份 `.param`——一般版與 `_mixed`——共用一份 `.bin`）：
 
 | 角色 | 檔名（常見） | 後端 | 做什麼 | 來源 |
 |---|---|---|---|---|
 | detector | `dbnet_detect.ncnn.param`（+ `.bin`） | NCNN | 文字框 + 筆畫遮罩 | DBNet，出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator)（它的 default 偵測器） |
-| ocr | `ocr_int8.onnx` | ONNX Runtime | 48px CTC 日文 OCR，int8 動態量化 | manga-image-translator |
+| ocr | `ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param`（+ `.bin`） | NCNN | 48px CTC 日文 OCR，fp16/fp32 混合精度 | manga-image-translator |
 | inpainter | `mit_aot_fixed512.ncnn.param`（+ `.bin`） | NCNN | AOT-GAN 去字 | [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 
-`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.onnx` 含 `ocr` 是 OCR。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。注意 NCNN 角色要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin` 請自行確保放在旁邊。
+`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.param` 含 `ocr` 是 OCR（兩份 OCR param 給哪份都行——`Ocr` 查過 CPU 後自己切到 `_mixed` 或切回來）。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。注意每個角色都要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin`（OCR 還有另一份 `.param`）請自行確保放在旁邊。
 
 路徑必須是本機檔，不能是 SAF/content URI：後端直接從路徑載進 native 記憶體。別用 `readBytes()` 把權重讀進 JVM heap；heap 上限約 512MB（跟裝置 RAM 無關）會 OOM。來源是 SAF 的話，先複製到 `filesDir` 再傳路徑。
 
@@ -84,8 +84,8 @@ Yakuyomi.create(models, alphabet, apiKey, config)
 
 完整清單、值域、各參數的效果在 [`docs/PARAMETERS_zh.md`](../docs/PARAMETERS_zh.md)。幾個值得知道的預設：
 
-- `OcrConfig.useXnnpack = false`。必須關：XNNPACK 在真機上會把 48px CTC 算錯、OCR 吐空。OCR 是唯一的 ONNX Runtime 模型；偵測器跟去字都跑 NCNN。
-- `OcrConfig.concurrent = true`、`concurrency = 8`。OCR 把文字行並發辨識；8 核手機上 OCR 時間大約砍半，輸出不變。
+- `OcrConfig.ncnnMixed = true`、`ncnnFp16Storage = true`、`ncnnFp16Arith = true`。OCR 走混合精度——backbone fp16、transformer fp32——用的是 `_mixed` 那份 param；引擎只在這三個都開**且** CPU 有 ARMv8.2 fp16（`NcnnBackend.cpuSupportsFp16`）時才載它，否則用同一份 `.bin` 載一般版 param。全 fp16 會讀錯小假名（真機 242 行只對 219）、全 fp32 慢 32–45%；混合精度讀對 241/242，比它取代的 int8 ONNX Runtime 模型快 ~23%。維持開著。
+- `OcrConfig.concurrent = true`、`concurrency = 8`。OCR 在單緒的 net 上把文字行並發辨識；8 核手機上 OCR 時間大約砍半，輸出不變。
 - `OcrConfig.stripPad = 4`。裁 OCR 條之前把偵測四邊形往外擴 4px（**偵測框本身不動**，所以去字不受影響）。不擴的話瘦框會把最後一個字切掉、CTC 吐空字串 → 整區被丟掉不翻，見[為何是這些預設](#為何是這些預設)。
 - `InpainterConfig.method = "aot"`。去字分兩門別：`"boxfill"`（快速去字）把每個字區用就近的背景色平塗——瞬間、平/單色泡泡最乾淨，但壓在畫面上的字會塗成色塊；`"aot"`（AI 去字，預設）用整頁一次的 AOT-GAN pass 重建每個字區底下的背景（`tileSize = 768`）——較慢，但重建畫面而非蓋色塊。
 - `RenderConfig.orientation = AUTO`。跟著每區塊偵測到的方向，再沿區塊傾斜角旋轉。
@@ -120,10 +120,10 @@ translator = TranslatorConfig(
 
 ## 生命週期與執行緒
 
-- `TranslationEngine : AutoCloseable`。`close()` 釋放 detector、OCR、inpainter 的 native session（OCR 的 ONNX Runtime session 加偵測器與去字的 NCNN net）。一律 `use { }` 或 `close()`。
+- `TranslationEngine : AutoCloseable`。`close()` 釋放 detector、OCR、inpainter 的 NCNN net。一律 `use { }` 或 `close()`。
 - `translatePage` 是 `suspend`，且**對同一個 warm 實例並發呼叫是安全的**——reader 就是靠這個做跨頁流水線（第 N 頁的網路翻譯疊上第 N+1 頁的 detect/OCR）。它內部也用 coroutines（並發 OCR、去字跟翻譯重疊）。並發之所以安全：
   - **翻譯是 per-call。** `LlmTranslator.translateDetailed` 全程走區域變數、把結果（translations／usage／error／raw）從呼叫回傳，所以併發的頁不會互相覆蓋。單值診斷欄位 `lastError` / `lastRaw` **會** race，只給單執行緒呼叫端（如 sandbox）用；pipeline 不讀它們。
-  - **NCNN 推論被序列化。** 偵測與去字在後端拿一把全域鎖：ncnn 用 OpenMP 平行化，兩條緒同時進 forward 會直接 abort 行程（`__kmp_abort_process`）。序列化幾乎不損吞吐——這兩段都是 CPU-bound、本來就塞在翻譯的網路等待窗內，CPU 也無法真的同時跑兩份。OCR（ONNX Runtime）與翻譯（網路）維持併發。
+  - **多緒 NCNN 推論被序列化。** 偵測與去字在後端拿一把全域鎖：ncnn 用 OpenMP 平行化，兩條緒同時進 forward 會直接 abort 行程（`__kmp_abort_process`）。序列化幾乎不損吞吐——這兩段都是 CPU-bound、本來就塞在翻譯的網路等待窗內，CPU 也無法真的同時跑兩份。OCR 也是 NCNN，但它的 net 是單緒建的（沒有 OpenMP 緒團可撞），所以逐行 forward 不過這把鎖、維持併發；翻譯（網路）亦然。
   - **但要 warm。** 引擎不會自己預熱：多頁同時打進剛載好、lazy init 還沒跑過的原生 session 會在真機上閃退。reader 的做法是載完後第一頁單緒跑完，之後才放行併發。
 - 引擎不回收輸入 bitmap。`Translated.page` 是新的 bitmap。
 
@@ -148,10 +148,10 @@ flowchart TD
     DET --> MASK["筆畫遮罩<br/>（原圖尺寸·二值）"]
 
     LINES --> OCR
-    subgraph OCR["② Ocr — ONNX Runtime·int8"]
+    subgraph OCR["② Ocr — NCNN·fp16/fp32 混合精度"]
         direction TB
         O1["四邊形 + 4px 外擴 → perspective<br/>bicubic warp → 48px 條 + 16px 白邊"]
-        O2["48px CTC forward<br/>並發：每行 1 緒 × 8 行"]
+        O2["48px CTC forward（位置編碼 PE 當第二輸入）<br/>並發：每行 1 緒 × 8 行"]
         O3["CTC decode → 文字 + prob<br/>prob &lt; 0.5 丟掉"]
         O1 --> O2 --> O3
     end
@@ -190,12 +190,12 @@ Pipeline 對齊 manga-image-translator，但每個參數都在真機（Snapdrago
 | | manga-image-translator | 本引擎 | 實測理由 |
 |---|---|---|---|
 | 偵測尺寸 | 2048（它的預設） | **1024** | 每次 forward 比上游預設少 4 倍像素。這是抽樣查證、不是通則：在 m-i-t 自己的 pipeline 上，006 頁的「その通りじゃ」@1024 有框但 OCR 讀出空字串、要到 @1536／@2048 才讀得出來；本引擎配上下面的 OCR 裁切修正，@1024 就讀得出來。（放大不是免費的：1280+ 開始字誤變多又更慢。） |
-| OCR 權重 | 48px CTC fp32、165 MB | **int8、44 MB** | ARM 上快 3.6×，CTC parity 96.7% |
+| OCR 精度 | fp32 torch | **NCNN 混合精度：backbone fp16、transformer fp32** | 全 fp16 與 int8 都會讀錯小假名（242 行分別只對 219、223）；混合精度讀對 241/242，比先前出貨的 int8 ONNX Runtime 模型快 ~23% |
 | OCR 裁切內插 | bilinear | **手刻 bicubic perspective warp** | 救回小假名——包括句尾否定，漏掉它會讓整句**意思相反** |
 | OCR 裁切框 | 直接用偵測四邊形 | **四邊形 + 4px 外擴** | 瘦框會切掉最後一個字 → CTC 吐空 → 整區被丟掉不翻。6 頁實測：救回 2、**弄壞 0**，OCR 還快 ~20% |
 | 去字 | LaMa／逐區 AOT | **AOT-GAN 整頁 tile 768** | CPU 上快 5–9× 且品質相當或更好；逐區 AOT 在 CPU 無法並行 |
 
-目前數字（6 張代表頁、161 個偵測框）：**讀出 160 — 99.4%**；裝置端偵測 + OCR 共 **10.3 秒**。
+目前數字（6 張代表頁、161 個偵測框）：**讀出 160 — 99.4%**；裝置端偵測 + OCR 共 **10.3 秒**（以先前的 int8 OCR 量的；NCNN OCR 把 OCR 那份再砍 ~23%）。
 
 另外兩件「量測說不要做」的事，記在這免得重蹈：
 

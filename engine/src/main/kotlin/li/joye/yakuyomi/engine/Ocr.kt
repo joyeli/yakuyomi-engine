@@ -1,9 +1,5 @@
 package li.joye.yakuyomi.engine
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
-import ai.onnxruntime.TensorInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
@@ -15,7 +11,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -25,7 +20,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 48px CTC OCR。
+ * 48px CTC OCR（NCNN 後端）。
  *
  * ported from manga_translator/ocr/model_48px_ctc.py (+ ocr/common.py, utils/generic.py) @ d5a3eee
  *   裁切：sortPnts 定直/橫書 + get_transformed_region（findHomography→warpPerspective→48px 條，直書轉90°）
@@ -34,6 +29,16 @@ import kotlin.math.roundToInt
  *   解碼：greedy CTC（blank=0、收合重複+去blank）→ 查字典。
  *   ignore_bubble（cfg.ignoreBubble，ported from utils/bubble.py）：跳過彩色/非氣泡 SFX 類文字。
  *   顏色 head 不採用（彩底太雜）；文字色改由 [Renderer] 取去字後背景亮度判黑/白。
+ *
+ * 推論只有 NCNN 一條路（[modelPath] 必須是 `.param`，parity/export_ocr_ncnn.py 轉出；ORT `.onnx` 路徑 2026-09-26 連同
+ * ONNX Runtime 一起從引擎拔除——三顆模型全 NCNN）：
+ *   · 寬度牆的繞法＝正弦位置編碼不烤進圖、當第二個輸入每條現算（[sinusoidalPe]，T=floor(W/4)−1），
+ *     argmax／log_softmax 在 JNI 算完只回 idx+logp（[NcnnBackend.ocrCtc]），Kotlin 只做 CTC 收合（[ctcCollapse]）。
+ *   · 精度＝混合精度優先：`<name>_mixed.ncnn.param`（backbone fp16、transformer+char_pred fp32，靠 per-layer featmask
+ *     + 手插 Cast 層）與原 `<name>.ncnn.param` 共用同一份 `.bin`。[pickParam] 只在 fp16 storage 開且 CPU 有 asimdhp 時
+ *     載 mixed，否則退回原 param（依 [OcrConfig.ncnnFp16Storage]／[OcrConfig.ncnnFp16Arith] 跑全 fp16 或 fp32）。
+ *     真機 9 頁 242 行 A/B（真值 ORT fp32）：mixed 241、fp32 242、全 fp16 219（小假名讀錯）；mixed 比舊 ORT int8 快 ~23%。
+ *   · 並發模式下 Net 以 1 緒建、逐條 forward 不進 ncnn 全域鎖（原因見 [NcnnBackend.ocrCtc]）。
  */
 class Ocr(
     modelPath: String,
@@ -41,27 +46,56 @@ class Ocr(
     private val cfg: OcrConfig = OcrConfig(),
 ) : AutoCloseable {
 
-    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
-    private val session: OrtSession
+    /** 實際生效的精度組合："NCNN"（原 param：全 fp16／fp32 依 cfg）或 "NCNN-mixed"（無 adb 時由呼叫端寫進 log 確認）。 */
+    val backend: String
+    private var ncnnHandle: Long = 0L
+    // 並發模式：每行單緒（Net num_threads=1）、靠 N 行並發填核；序列模式：單行用滿 NUM_THREADS。
+    private val threads = if (cfg.concurrent) 1 else NUM_THREADS
 
     init {
-        // 並發模式：每行單緒（intra-op=1）、靠 N 行並發填核；序列模式：單行用滿 NUM_THREADS（現狀）。
-        val threads = if (cfg.concurrent) 1 else NUM_THREADS
-        val options = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(threads)
-            if (cfg.useXnnpack) {
-                try {
-                    addXnnpack(mapOf("intra_op_num_threads" to threads.toString()))
-                } catch (t: Throwable) {
-                    Log.w(TAG, "XNNPACK 不可用，退回 CPU：${t.message}")
-                }
-            }
+        require(modelPath.endsWith(".param")) {
+            "OCR 模型只支援 NCNN `.param`（同名 `.ncnn.bin` 需在旁；ORT `.onnx` 路徑已拔除）：$modelPath"
         }
-        session = env.createSession(modelPath, options) // 路徑載入＝native 記憶體、不佔 JVM heap
+        check(NcnnBackend.available) { "NCNN 原生庫未載入，無法 OCR" }
+        val (param, mixed) = pickParam(modelPath)
+        // 兩份 param 共用同一份 .bin：不論給的是原版還是 _mixed，bin 都是「原版 param 去掉 .param 加 .bin」（與偵測／去字
+        // 同一條命名規則：`<name>.ncnn.param` ↔ `<name>.ncnn.bin`）。路徑載入＝native 記憶體、不佔 JVM heap。
+        val bin = baseParam(modelPath).removeSuffix(".param") + ".bin"
+        if (!mixed && !java.io.File(param).exists()) {
+            // ModelSet 允許只有 mixed 版在場；但 mixed 的 Cast 層要 fp16 storage + asimdhp 才正確，條件不成立又沒原版可退
+            // → 與其載成垃圾（不 crash、OCR 全錯）不如明講。
+            error("缺 OCR 原版 param $param：只有 mixed 版、但目前不能用 mixed（ncnnMixed=${cfg.ncnnMixed} fp16Storage=${cfg.ncnnFp16Storage} cpuFp16=${NcnnBackend.cpuSupportsFp16}）")
+        }
+        ncnnHandle = NcnnBackend.createNetEx(param, bin, threads, cfg.ncnnFp16Storage, cfg.ncnnFp16Arith)
+        check(ncnnHandle != 0L) { "NCNN OCR 模型載入失敗：$param（bin=$bin）" }
+        backend = if (mixed) "NCNN-mixed" else "NCNN"
+        Log.i(TAG, "NCNN ocr loaded $param (threads=$threads fp16 storage=${cfg.ncnnFp16Storage} arith=${cfg.ncnnFp16Arith} cpuFp16=${NcnnBackend.cpuSupportsFp16} mixed=$mixed)")
+    }
+
+    /** 給的是 `_mixed` 就還原成原版 param 路徑，否則原樣。 */
+    private fun baseParam(given: String): String =
+        if (given.endsWith(MIXED_SUFFIX)) given.removeSuffix(MIXED_SUFFIX) + ".ncnn.param" else given
+
+    /**
+     * 決定實際載哪份 param：`<name>.ncnn.param`（全域精度）或 `<name>_mixed.ncnn.param`（backbone fp16、transformer fp32，
+     * parity/export_ocr_ncnn.py write_mixed_param）。兩份共用 `<name>.ncnn.bin`。
+     * mixed 的前提＝[OcrConfig.ncnnMixed] 且 fp16 storage 開且 CPU 有 asimdhp：mixed param 裡的 Cast 層宣告「進來的是
+     * fp16」，任一條件不成立時 conv 吐的是 fp32、Cast 會靜默讀成垃圾（不 crash、OCR 全錯）→ 一律退回原 param。
+     * 給的是哪一份都行（sandbox A/B 會直接指 mixed）；回 (param 路徑, 是否 mixed)。
+     */
+    private fun pickParam(given: String): Pair<String, Boolean> {
+        val base = baseParam(given)
+        val mixedPath = base.removeSuffix(".ncnn.param").removeSuffix(".param") + MIXED_SUFFIX
+        val canMixed = cfg.ncnnMixed && cfg.ncnnFp16Storage && NcnnBackend.cpuSupportsFp16
+        val useMixed = canMixed && java.io.File(mixedPath).exists()
+        if (given.endsWith(MIXED_SUFFIX) && !useMixed) {
+            Log.w(TAG, "指定 mixed param 但條件不符（mixed=${cfg.ncnnMixed} fp16Storage=${cfg.ncnnFp16Storage} cpuFp16=${NcnnBackend.cpuSupportsFp16}），退回 $base")
+        }
+        return if (useMixed) mixedPath to true else base to false
     }
 
     /**
-     * 對每條文字行做 OCR，就地填入 direction 與 text。每條右側加 [PAD_MARGIN] 白邊（見 [stripToTensor]）讓 CTC 不截尾字。
+     * 對每條文字行做 OCR，就地填入 direction 與 text。每條右側加 [PAD_MARGIN] 白邊（見 [stripToChw]）讓 CTC 不截尾字。
      * [OcrConfig.concurrent]＝true：多行並發（小圖塊吃不滿 intra-op→改單緒、並發填核，見 init）；false：逐行序列（現狀）。
      * 批次 padding 已否決（寬度差→padding 浪費）；此處是「並發」（零 padding），與批次不同。
      */
@@ -70,27 +104,24 @@ class Ocr(
         lines: List<TextLine>,
         bicubic: Boolean = cfg.useBicubic, // 裁切縮放內插法：true=手刻 bicubic（救小假名漏讀）、false=Canvas bilinear（現行）
     ): Unit = coroutineScope {
-        val inputName = session.inputNames.first()
         if (cfg.concurrent && lines.size > 1) {
             val sem = Semaphore(cfg.concurrency.coerceAtLeast(1))
             lines.map { line ->
-                async(Dispatchers.Default) { sem.withPermit { recognizeOne(page, line, inputName, bicubic) } }
+                async(Dispatchers.Default) { sem.withPermit { recognizeOne(page, line, bicubic) } }
             }.awaitAll()
         } else {
-            for (line in lines) recognizeOne(page, line, inputName, bicubic)
+            for (line in lines) recognizeOne(page, line, bicubic)
         }
     }
 
     /**
-     * 暖機：對空白 strip 跑一次 OCR session，讓 ORT session 首次 run 的 lazy 初始化（arena/EP 配置）在單緒完成。
-     * 併發翻多頁前先呼叫一次；strip 內容不重要（只為觸發一次 run）。
+     * 暖機：對空白 strip 跑一次 OCR，讓 NCNN 首次 forward 的一次性配置（blob／workspace allocator、共用 PE 表 lazy 建表）
+     * 先在單緒做完。併發翻多頁前先呼叫一次；strip 內容不重要（只為觸發一次 forward）。
      */
     fun warmUp() {
         val strip = Bitmap.createBitmap(160, cfg.textHeight, Bitmap.Config.ARGB_8888)
         try {
-            stripToTensor(strip).use { input ->
-                session.run(mapOf(session.inputNames.first() to input)).use { }
-            }
+            infer(stripToChw(strip))
         } catch (t: Throwable) {
             Log.w(TAG, "OCR 暖機失敗：${t.message}")
         } finally {
@@ -98,8 +129,8 @@ class Ocr(
         }
     }
 
-    /** 單行 OCR：裁切→前處理→CTC→填 text。thread-safe：只寫自己的 line、session.run 可並發、其餘皆 local/唯讀。 */
-    private fun recognizeOne(page: Bitmap, line: TextLine, inputName: String, bicubic: Boolean) {
+    /** 單行 OCR：裁切→前處理→CTC→填 text。thread-safe：只寫自己的 line、JNI forward 可並發（1 緒 Net 不進全域鎖）、其餘皆 local/唯讀。 */
+    private fun recognizeOne(page: Bitmap, line: TextLine, bicubic: Boolean) {
         // ★ 先外擴、再 sortPnts：sortPnts 定的點序是 warp 要的，擴完才排才不會亂序（擴張本身不改直/橫書判定）。
         val quad = if (cfg.stripPad > 0) expandQuad(line.quad, cfg.stripPad, page.width, page.height) else line.quad
         val (ordered, isV) = sortPnts(quad)
@@ -110,20 +141,34 @@ class Ocr(
             return
         }
         try {
-            stripToTensor(strip).use { input ->
-                session.run(mapOf(inputName to input)).use { res ->
-                    val logits = res.get(OUT_LOGITS).orElseThrow {
-                        IllegalStateException("缺輸出 $OUT_LOGITS")
-                    } as OnnxTensor
-                    val (text, prob) = ctcDecode(logits)
-                    if (prob >= cfg.minProb) line.text = text  // 低信心誤讀 → 丟
-                }
-            }
+            val (text, prob) = infer(stripToChw(strip))
+            if (prob >= cfg.minProb) line.text = text  // 低信心誤讀 → 丟
         } catch (t: Throwable) {
             Log.w(TAG, "OCR 單行失敗：${t.message}")
         } finally {
             strip.recycle()
         }
+    }
+
+    /** 前處理好的一條：[chw]=[3,h,w]。 */
+    private class Chw(val chw: FloatArray, val w: Int, val h: Int)
+
+    /**
+     * 一條 → (text, prob)。T=floor(W/4)−1（backbone 下採樣，parity 逐寬驗過），PE 用共用正弦表的前 T 列；JNI 回每時步
+     * argmax+logp，這裡收合。T 超過表長（W>8196px 的字條）＝模型自己的 max_len 也裝不下 → 當空讀。
+     */
+    private fun infer(x: Chw): Pair<String, Float> {
+        val t = x.w / 4 - 1
+        if (t < 1) return "" to 0f
+        if (t > PE_ROWS) {
+            Log.w(TAG, "OCR 字條太寬（W=${x.w} → T=$t > $PE_ROWS），略過")
+            return "" to 0f
+        }
+        val idx = IntArray(t)
+        val logp = FloatArray(t)
+        val rc = NcnnBackend.ocrCtc(ncnnHandle, x.chw, x.w, x.h, PE, t, idx, logp, serialize = threads > 1)
+        check(rc == t) { "NCNN OCR 失敗 rc=$rc（W=${x.w} T=$t）" }
+        return ctcCollapse(idx, logp, t, dictionary)
     }
 
     /**
@@ -344,7 +389,7 @@ class Ocr(
         }
     }
 
-    private fun stripToTensor(strip: Bitmap): OnnxTensor {
+    private fun stripToChw(strip: Bitmap): Chw {
         val sw = strip.width
         val h = strip.height
         val w = sw + PAD_MARGIN // 右側白邊：避免 CTC 截掉尾字（坂→坂本、ねえね→ねえねえ）
@@ -363,48 +408,7 @@ class Ocr(
                 chw[2 * area + outRow + x] = ((p and 0xFF) - 127.5f) / 127.5f
             }
         }
-        return OnnxTensor.createTensor(
-            env, FloatBuffer.wrap(chw), longArrayOf(1, 3, h.toLong(), w.toLong()),
-        )
-    }
-
-    /** greedy CTC（單條 [1,T,d]）→ 讀出 arr 後交給 [ctcDecodeArr]。 */
-    private fun ctcDecode(logits: OnnxTensor): Pair<String, Float> {
-        val shape = (logits.info as TensorInfo).shape // [1, T, dict]
-        val t = shape[1].toInt()
-        val d = shape[2].toInt()
-        val arr = FloatArray(t * d)
-        logits.floatBuffer.get(arr, 0, t * d)
-        return ctcDecodeArr(arr, t, d)
-    }
-
-    /** greedy CTC（blank=0、收合重複）+ 平均信心，對齊 decode_ctc_top1。回傳 (text, prob)。 */
-    private fun ctcDecodeArr(arr: FloatArray, t: Int, d: Int): Pair<String, Float> {
-        val sb = StringBuilder()
-        var last = BLANK
-        var logpSum = 0.0
-        var nChars = 0
-        for (ti in 0 until t) {
-            val base = ti * d
-            var best = 0
-            var bestV = arr[base]
-            for (c in 1 until d) {
-                val v = arr[base + c]
-                if (v > bestV) { bestV = v; best = c }
-            }
-            if (best != last && best != BLANK) {
-                val ch = dictionary[best]
-                sb.append(if (ch == "<SP>") " " else ch)
-                // top-1 的 log_softmax＝bestV − logsumexp(row)＝−ln(Σ exp(x−bestV))
-                var s = 0.0
-                for (c in 0 until d) s += Math.exp((arr[base + c] - bestV).toDouble())
-                logpSum += -Math.log(s)
-                nChars++
-            }
-            last = best
-        }
-        val prob = if (nChars > 0) Math.exp(logpSum / nChars).toFloat() else 0f
-        return sb.toString() to prob
+        return Chw(chw, w, h)
     }
 
     /** SFX/非氣泡文字判定（ported from utils/bubble.py:is_ignore @ d5a3eee）：邊框混色（非乾淨氣泡底）或彩色 → 跳過。 */
@@ -446,14 +450,65 @@ class Ocr(
     }
 
     override fun close() {
-        session.close()
+        if (ncnnHandle != 0L) {
+            NcnnBackend.releaseNet(ncnnHandle)
+            ncnnHandle = 0L
+        }
     }
 
     companion object {
         private const val TAG = "Ocr"
         private const val NUM_THREADS = 4
         private const val BLANK = 0
-        private const val OUT_LOGITS = "char_logits"
         private const val PAD_MARGIN = 16  // 每條右側白邊：讓 CTC 有 context、不截尾字
+        private const val D_MODEL = 320   // transformer 寬度（PE 列寬）
+        private const val PE_ROWS = 2048  // 上游 PositionalEncoding(max_len=2048)；共用表一次算好（2.6MB）
+        private const val MIXED_SUFFIX = "_mixed.ncnn.param"
+
+        /** 共用的正弦位置表（[PE_ROWS]×[D_MODEL]，模型第二個輸入 `in1` 的來源），第一次用到才算。 */
+        private val PE: FloatArray by lazy { sinusoidalPe(PE_ROWS) }
+
+        /**
+         * 正弦位置編碼（model_48px_ctc.py:PositionalEncoding 逐式照抄）：pe[t,2i]=sin(t·div_i)、pe[t,2i+1]=cos(t·div_i)、
+         * div_i=exp(2i·(−ln 10000/320))。回 [rows×320] row-major。parity fixture（ocr/strip0_pe.bin）逐值對過。
+         */
+        internal fun sinusoidalPe(rows: Int): FloatArray {
+            val pe = FloatArray(rows * D_MODEL)
+            val half = D_MODEL / 2
+            val div = DoubleArray(half) { i -> Math.exp((2 * i) * (-Math.log(10000.0) / D_MODEL)) }
+            for (t in 0 until rows) {
+                val base = t * D_MODEL
+                for (i in 0 until half) {
+                    val a = t * div[i]
+                    pe[base + 2 * i] = Math.sin(a).toFloat()
+                    pe[base + 2 * i + 1] = Math.cos(a).toFloat()
+                }
+            }
+            return pe
+        }
+
+        /**
+         * greedy CTC 收合（對齊 decode_ctc_top1）：[idx]=每時步 argmax、[logp]=該時步 top-1 log_softmax；
+         * blank=0、與前一時步相同者收掉，留下的字查 [dictionary]（`<SP>`→空白）；prob＝exp(留下字的 logp 平均)。
+         * idx／logp 由 JNI（[NcnnBackend.ocrCtc]：逐時步 argmax + top-1 log_softmax）算；JVM parity 測試拿 fixture 的逐時步值直接餵這裡。
+         */
+        internal fun ctcCollapse(idx: IntArray, logp: FloatArray, t: Int, dictionary: List<String>): Pair<String, Float> {
+            val sb = StringBuilder()
+            var last = BLANK
+            var logpSum = 0.0
+            var nChars = 0
+            for (ti in 0 until t) {
+                val best = idx[ti]
+                if (best != last && best != BLANK) {
+                    val ch = dictionary[best]
+                    sb.append(if (ch == "<SP>") " " else ch)
+                    logpSum += logp[ti]
+                    nChars++
+                }
+                last = best
+            }
+            val prob = if (nChars > 0) Math.exp(logpSum / nChars).toFloat() else 0f
+            return sb.toString() to prob
+        }
     }
 }

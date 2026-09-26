@@ -12,10 +12,11 @@ CTC 解碼複製自 model_48px_ctc.py:decode_ctc_top1（greedy, blank=0, 收合�
   quad   parity/fixtures/faithful_boxes.json（paths.FAITHFUL_BOXES；30 框，來歷見該檔 _provenance）
   字表   engine/src/main/assets/models/alphabet-all-v5.txt（paths.ALPHABET 缺 ckpt 時自動退回這份）
 
-模型（不入庫，兩條路擇一）：
-  重建   python3 parity/export_ocr_onnx.py     → parity/out/ocr_48px_ctc.onnx（fp32，需 ckpt）
-         python3 parity/quantize_ocr_int8.py   → parity/out/ocr_int8.onnx（int8）
-  下載   從 models-v2 release 抓 ocr_int8.onnx（fp32 沒發佈 ⇒ parity 數字要自己重建 fp32）
+模型（不入庫，兩顆都要自己重建）：
+  fp32   python3 parity/export_ocr_onnx.py     → parity/out/ocr_48px_ctc.onnx（需 ckpt）
+  int8   python3 parity/quantize_ocr_int8.py   → parity/out/ocr_int8.onnx
+  ⚠ int8 ONNX 已不出貨（models-v4 起 OCR 走 NCNN 混合精度，release 不再掛 ocr_int8.onnx），
+    這支的 int8 對照只剩歷史／參考用途；要跑就自己用 quantize_ocr_int8.py 重建。
 
 用法：
   python3 parity/ocr_parity.py                       # 有 int8 就自動一起跑並印 parity

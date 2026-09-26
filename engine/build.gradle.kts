@@ -10,13 +10,13 @@ version = "0.2.0"
 android {
     namespace = "li.joye.yakuyomi.engine"
     compileSdk = 37
-    ndkVersion = "28.2.13676358" // NCNN 原生層（Detector/Inpainter）；釘住版本讓 CI/fork submodule 建置一致
+    ndkVersion = "28.2.13676358" // NCNN 原生層（Detector/Ocr/Inpainter）；釘住版本讓 CI/fork submodule 建置一致
 
     defaultConfig {
         minSdk = 26
         consumerProguardFiles("consumer-rules.pro")
 
-        // NCNN 原生後端（P1 去字 + P2 偵測）：只出 arm64（ncnn 預編庫即 arm64-v8a Vulkan 版）
+        // NCNN 原生後端（去字／偵測／OCR，引擎唯一的推論 runtime；ORT 2026-09-26 拔除）：只出 arm64（ncnn 預編庫即 arm64-v8a Vulkan 版）
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -33,11 +33,6 @@ android {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
         }
-    }
-
-    // 90MB 的 .onnx 不要壓縮：ORT 直接 mmap，省記憶體也較快
-    androidResources {
-        noCompress += "onnx"
     }
 
     buildTypes {
@@ -64,7 +59,6 @@ kotlin {
 }
 
 dependencies {
-    implementation(libs.onnxruntime.android)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
 

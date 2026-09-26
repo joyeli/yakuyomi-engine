@@ -50,10 +50,9 @@ data class OcrConfig(
     //   pad=8/12 開始退步（8：弄壞 2；12：弄壞 1）⇒ 4 是甜蜜點。桌面 m-i-t warp 模擬曾給 +15% 讀出，真機只 +2
     //   （引擎自刻 bicubic warp 的 baseline 已達 98%），故真機定值不可照抄桌面。
     val stripPad: Int = 4,
-    val useXnnpack: Boolean = false,  // ★預設關：XNNPACK 會把 48px CTC OCR 模型算錯（真機實證吐空），改純 CPU 才正確
     // 逐行並發 OCR：小圖塊（48px 高、窄）吃不滿 intra-op 4 緒 → 改「每行單緒、N 行並發」把核填滿。
-    // concurrent=true → session intra-op 設 1（單行單緒）、靠 Semaphore(concurrency) 並發；false → 單行用滿 NUM_THREADS、序列（現狀）。
-    // 純 CPU、ORT 共享 thread pool ⇒ 收益需實測（sandbox 去背比較 OCR 列 A/B）。與「批次 padding」不同：零 padding 浪費。
+    // concurrent=true → NCNN Net num_threads 設 1（單行單緒、逐條 forward 不進 ncnn 全域鎖）、靠 Semaphore(concurrency) 並發；
+    // false → 單行用滿 NUM_THREADS、序列。純 CPU ⇒ 收益需實測（sandbox 去背比較 OCR 列 A/B）。與「批次 padding」不同：零 padding 浪費。
     val concurrent: Boolean = true,   // 預設開：真機 8.9s→4.8s(快46%)、零品質風險(每行邏輯不變)、8 核全填滿
     val concurrency: Int = 8,         // 同時在飛的行數上限（＝核數，全核並發；conc=核數為甜蜜點，再高無核可用）
     // 裁切縮放內插法：true=手刻 perspective bicubic（救小假名漏讀→句尾否定不再翻反）、false=Canvas bilinear（舊）。
@@ -64,6 +63,15 @@ data class OcrConfig(
     // 救回被糊掉漏讀的小假名（v0.16.9 加）。★預設開＝實測救回小假名（對本就讀對 p≈1.0 的乾淨行無副作用）；
     // 關＝退回無銳化（strip 較糊、小假名可能漏讀）。原本硬編碼永遠開，2026-07-16 抽成設定（進階玩家可關）。
     val ocrUnsharp: Boolean = true,
+    // OCR 半精度，兩段分開開：storage＝權重/中間值存 fp16（省一半記憶體頻寬）；arith＝用 fp16 指令算。
+    // 真機 A/B（2026-09-21）：兩者全開快 27–32% 但 transformer 零星讀錯字、全關同 fp32 但慢 32–45%；storage-only（fp16s）
+    // 是第三條路。產品解法＝下面的 ncnnMixed（backbone 吃 fp16 的速度、transformer 留 fp32 的準度）；這兩個仍是 mixed 的前提。
+    val ncnnFp16Storage: Boolean = true,
+    val ncnnFp16Arith: Boolean = true,
+    // 混合精度（backbone fp16、transformer+char_pred fp32）：模型旁有 `<name>_mixed.ncnn.param` 就優先用它（同一份 .bin）。
+    // 只在 ncnnFp16Storage 開且 CPU 有 asimdhp 時生效（否則 mixed param 裡的 Cast 會把 fp32 讀成垃圾），Ocr 會自動退回原 param。
+    // 真機 9 頁 242 行：mixed 241（唯一不同那行是真值錯）、全 fp16 219 → 預設開；A/B 想固定跑「全 fp16」時關掉。
+    val ncnnMixed: Boolean = true,
 )
 
 // 預設 few-shot（日→繁中）：示範 <|i|> 逐行格式。改語言對時連同 toLangName/fromLangName 一起換成對應譯文。

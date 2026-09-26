@@ -10,14 +10,14 @@ Nothing here is a recipe you have to reconstruct by hand — each path is one sc
 
 ## What "reproducible" means here
 
-Read this before you compare any hashes, because the obvious check is wrong for one of the three models.
+Read this before you compare any hashes, because the obvious check is wrong for one of the three models and unconfirmed for another.
 
 **The sha256 values in [`models.json`](../models.json) are a distribution integrity check, not a reproducibility criterion.** They exist so the app can confirm the file it downloaded is the file we published. They are not a definition of "correctly rebuilt" — a rebuild can be numerically identical and still hash differently.
 
 | Model | Criterion | Notes |
 |---|---|---|
 | Detector (DBNet) | **Bit-identical** — sha256 matches `models.json` | Verified: reproduces `9e6db2f8…` / `f57bdbed…` exactly, on a cold rerun |
-| OCR (int8) | **Bit-identical** — sha256 matches `models.json` | Verified: reproduces `353e68a5…29fa4c5c` exactly. Quantization is deterministic |
+| OCR (NCNN) | **Numerical equivalence** — all 30 fixture strips decode identically to the ORT fp32 reference, argmax agrees on every timestep, the width sweep is clean. The `models.json` hashes are what shipped | Same trace → pnnx path as DBNet, so the pinned toolchain is expected to reproduce the bytes, but that has not been re-checked on a cold rerun — judge by the criterion, not the hash |
 | Inpaint (AOT-GAN) | **Numerical equivalence** — `out0` bit-identical + per-layer weight compare. **The sha256 will not match** | Expected and understood: pnnx's layer auto-naming and ordering differ. See below |
 
 **Why AOT's hash never matches.** Our rebuild produces `mit_aot_fixed512.ncnn.param` at 33,762 B against the released 33,810 B (−48 B), and a `.bin` of exactly the released size but different bytes. Both differences are pnnx version artifacts, and both were traced to the end:
@@ -27,7 +27,7 @@ Read this before you compare any hashes, because the obvious check is wrong for 
 
 The check that matters is behavioural, and the script runs it once you give it the released weights to compare against: on a real page, `out0` is bit-identical at both s=512 and s=768 (`np.array_equal` true, max|d| = 0.0).
 
-**Bit-identity is bound to the pinned versions.** The DBNet and OCR results above hold for torch 2.1.1 + pnnx 1.0.20260526 on x86 Linux. On other versions they will most likely degrade to numerical equivalence — **that is expected, not a failure**. Judge those rebuilds by the same tolerances listed per model below.
+**Bit-identity is bound to the pinned versions.** The DBNet result above holds for torch 2.1.1 + pnnx 1.0.20260526 on x86 Linux. On other versions they will most likely degrade to numerical equivalence — **that is expected, not a failure**. Judge those rebuilds by the same tolerances listed per model below.
 
 ## Prerequisites
 
@@ -43,18 +43,18 @@ The model-build section of that file is **pinned on purpose** — bit-for-bit re
 |---|---|---|
 | torch | 2.1.1 | all three export paths |
 | torchvision | 0.16.1 | DBNet — ResNet34 backbone |
-| onnx | 1.17.0 | OCR — `quant_pre_process` |
-| onnxruntime | 1.23.0 | OCR — `quantize_dynamic`, verification |
+| onnx | 1.17.0 | OCR — the retired int8 path only (`quantize_ocr_int8.py`) |
+| onnxruntime | 1.23.0 | OCR — runs the fp32 ONNX reference the NCNN export is verified against (and the retired int8 path) |
 | pnnx | 1.0.20260526 | torch → ncnn |
 | ncnn | 1.0.20260526 | verification: load the exported model and compare forward |
 
 Verified on Python 3.10.12 / numpy 1.26.4 / opencv 4.11, x86 Linux (WSL2).
 
-**pnnx is a pip package, not a binary you have to build.** `pip install pnnx` gives you both the Python module (`import pnnx`, used by the AOT script) and a console script at `~/.local/bin/pnnx` (invoked as a subprocess by the DBNet script). Override the binary path with `YAKU_PNNX` if yours lands elsewhere.
+**pnnx is a pip package, not a binary you have to build.** `pip install pnnx` gives you both the Python module (`import pnnx`, used by the AOT script) and a console script at `~/.local/bin/pnnx` (invoked as a subprocess by the DBNet and OCR scripts). Override the binary path with `YAKU_PNNX` if yours lands elsewhere.
 
 ### The upstream clone
 
-All three scripts read the model definitions out of a manga-image-translator clone rather than vendoring copies:
+All the export scripts read the model definitions out of a manga-image-translator clone rather than vendoring copies:
 
 ```bash
 git clone https://github.com/zyddnys/manga-image-translator
@@ -65,7 +65,7 @@ export YAKU_MIT_CLONE=/path/to/manga-image-translator   # default: /mnt/d/Gits/m
 
 ### A note on `.upstream-ref`
 
-There is a discrepancy worth stating plainly. [`.upstream-ref`](../.upstream-ref) pins `efdc229` (2026-07-01), but the clone these models were built against sits at `d5a3eee` (2026-05-24), and all three script headers say `@ d5a3eee`.
+There is a discrepancy worth stating plainly. [`.upstream-ref`](../.upstream-ref) pins `efdc229` (2026-07-01), but the clone these models were built against sits at `d5a3eee` (2026-05-24), and the scripts' `ported spec` headers say `@ d5a3eee` (`export_ocr_ncnn.py` reuses `export_ocr_onnx.py`'s loader, so it inherits that pin).
 
 This does not affect rebuilds, and that was checked rather than assumed. Diffing `d5a3eee..efdc229` across the watched model paths:
 
@@ -84,11 +84,11 @@ So the architectures we trace are identical at either commit. The scripts' `@ d5
 |---|---|---|---|
 | `detect-20241225.ckpt` | 308,380,176 B | `67ce1c4ed4793860f038c71189ba9630a7756f7683b1ee5afb69ca0687dc502e` | `export_dbnet_ncnn.py` |
 | `inpainting.ckpt` | 22,785,303 B | `878d541c68648969bc1b042a6e997f3a58e49b6c07c5636ad55130736977149f` | `export_aot_ncnn.py` |
-| `ocr-ctc.zip` | — | `fc61c52f7a811bc72c54f6be85df814c6b60f63585175db27cb94a08e0c30101` | `export_ocr_onnx.py` (also unzips) |
+| `ocr-ctc.zip` | — | `fc61c52f7a811bc72c54f6be85df814c6b60f63585175db27cb94a08e0c30101` | `export_ocr_onnx.py` / `export_ocr_ncnn.py` (also unzips) |
 
 Checkpoints are cached in `parity/out/ckpt/` (gitignored, so nothing large enters the repo). `fetch()` verifies sha256 on **every** run, not just after downloading; a file whose hash doesn't match is re-downloaded once and then refused rather than used. Downloads go through a `.part` file, so an interrupted run can't leave a truncated file masquerading as the real one. Point `YAKU_DET_CKPT` / `YAKU_INPAINT_CKPT` / `YAKU_OCR_CTC_DIR` at copies you already have to skip the downloads.
 
-**The OCR checkpoint takes one extra step: it ships as a zip.** `export_ocr_onnx.py` downloads `ocr-ctc.zip`, verifies it, and extracts `ocr-ctc.ckpt` + `alphabet-all-v5.txt` into `parity/out/ckpt/ocr-ctc/`. Note that **upstream declares a hash for the zip only** — the two extracted files have no upstream-declared hash, so the scripts don't invent one and pin it. Verifying the zip is what establishes provenance; a hash we computed ourselves could only prove the unzip didn't corrupt anything, which is a different claim. (For reference, what we observe locally: `ocr-ctc.ckpt` 169,075,247 B, `alphabet-all-v5.txt` 95,997 B / `c1295ae1…54da33`.)
+**The OCR checkpoint takes one extra step: it ships as a zip.** `export_ocr_onnx.py` (and `export_ocr_ncnn.py`, through the same loader) downloads `ocr-ctc.zip`, verifies it, and extracts `ocr-ctc.ckpt` + `alphabet-all-v5.txt` into `parity/out/ckpt/ocr-ctc/`. Note that **upstream declares a hash for the zip only** — the two extracted files have no upstream-declared hash, so the scripts don't invent one and pin it. Verifying the zip is what establishes provenance; a hash we computed ourselves could only prove the unzip didn't corrupt anything, which is a different claim. (For reference, what we observe locally: `ocr-ctc.ckpt` 169,075,247 B, `alphabet-all-v5.txt` 95,997 B / `c1295ae1…54da33`.)
 
 `parity/paths.py` holds every path and env override in one place.
 
@@ -123,42 +123,50 @@ That is ncnn's fp16 storage rounding where sigmoid is steep, it has no practical
 
 **The trace shape is not a runtime limit.** The network is fully convolutional — the output param contains only Convolution/Deconvolution/Pooling/Concat/Split/ReLU/BinaryOp, no Reshape or Interp — so it runs at any size. The 768×1024 rectangle matches what the engine actually feeds it, which also keeps clear of an ncnn heap-corruption bug on square inputs in the 832–992 band.
 
-## Rebuilding the OCR model (48px CTC, int8)
+## Rebuilding the OCR model (48px CTC, NCNN mixed precision)
 
-Two stages, no manual downloads.
+Two stages, no manual downloads. The first produces the fp32 ONNX the second is verified against; only the second produces what ships.
 
 ```bash
-python3 parity/export_ocr_onnx.py        # ckpt (auto-fetch + unzip) -> fp32 ONNX
-python3 parity/quantize_ocr_int8.py      # fp32 ONNX -> int8 (~3 s), + verify
+python3 parity/export_ocr_onnx.py                 # ckpt (auto-fetch + unzip) -> fp32 ONNX: the verification reference
+python3 parity/export_ocr_ncnn.py                 # ckpt -> NCNN (plain + _mixed param, one .bin), + verify
+python3 parity/export_ocr_ncnn.py --skip-export   # re-derive the _mixed param and re-verify from the existing outputs
+python3 parity/export_ocr_ncnn.py --fixture       # ...and also write the JVM test fixture
 ```
 
-**Stage 1** exports `OCR.forward` with opset 17 and dynamic axes N/W → `parity/out/ocr_48px_ctc.onnx`, 164,974,063 B, sha256 `3019b406…2c35d8`. Deterministic on a rerun; the torch version is what this stage's bytes hinge on.
+**Stage 1** exports `OCR.forward` with opset 17 and dynamic axes N/W → `parity/out/ocr_48px_ctc.onnx`, 164,974,063 B, sha256 `3019b406…2c35d8`. Deterministic on a rerun; the torch version is what this stage's bytes hinge on. Nothing from it ships any more: it is the fp32 reference that stage 2's verification (and `ocr_parity.py`) run through onnxruntime on the desktop.
 
-Only this stage needs the checkpoint zip. Stage 2 and the parity scripts need just the alphabet, and `paths.ALPHABET` falls back to the copy in the engine's assets (`engine/src/main/assets/models/alphabet-all-v5.txt`, bit-identical to upstream's) when the extracted one isn't there — so they run from a clean clone without fetching anything.
+Both stages read the checkpoint zip — stage 2 traces from the checkpoint, not from the ONNX. The decode-only parity scripts need just the alphabet, and `paths.ALPHABET` falls back to the copy in the engine's assets (`engine/src/main/assets/models/alphabet-all-v5.txt`, bit-identical to upstream's) when the extracted one isn't there — so they run from a clean clone without fetching anything.
 
-**Stage 2** produces `parity/out/ocr_int8.onnx`, 43,625,294 B, sha256 `353e68a5506a6b8967905cd9b3c59e67708df1bc6812e105aa54d4e829fa4c5c` — bit-identical to the released model, name already correct, ready to ship.
+**Stage 2** is `export_ocr_ncnn.py`, in order:
 
-Internally it is two calls, and **neither is optional**:
+1. Load `OCR` from the clone and the checkpoint, dropping the `pe.pe` buffers (the baked positional-encoding tables; loaded non-strict).
+2. Measure the backbone's width downsampling at ten widths (64 … 1024) and match it against a set of candidate formulas — `T = ⌊W/4⌋ − 1` is the one that fits, recorded in `t_of_w.txt`; the engine's `sinusoidalPe` uses the same formula, and the script refuses to continue if no candidate fits.
+3. Wrap the model (`build_wrapper`): the three encoder layers' `PositionalEncoding.forward` are patched to add an *input tensor* instead of a slice of their buffer, and the unused `color` head is dropped so the only output is `char_logits` (text colour comes from the cleaned background, not from the OCR). Fed the model's own PE table, the wrapper reproduces the original `char_logits` exactly (`max|Δ| = 0` is asserted), so it changes plumbing and nothing else.
+4. `torch.jit.trace` at W = 256 with a freshly computed sinusoidal PE (`make_pe`, T = 63), then pnnx with `inputshape=[1,3,48,256],[1,63,320]` **and** `inputshape2=[1,3,48,1024],[1,255,320]`. The second shape is what makes pnnx keep the attention Reshapes' dimensions dynamic instead of baking in the trace width — the further apart the two shapes, the more reliably it infers which dimension varies.
+5. `write_mixed_param()` derives `ocr_48px_ctc_mixed.ncnn.param` from the plain param, as text: every layer from the backbone's `Squeeze` onward, plus the `Split` on the PE input `in1`, gets `31=7` appended (ncnn's per-layer featmask: bit0 disables fp16 arithmetic, bit1 fp16 storage/packing, bit2 bf16 — bf16 is off globally anyway, masked so nobody can turn it on later), and one `Cast` layer (`0=2 1=1`, fp16 → fp32) is inserted between the last backbone convolution and the `Squeeze`. Only the header counts and those tails differ; the weight order does not, so both params read the same `.bin`.
 
-1. **`quant_pre_process(..., skip_symbolic_shape=True)`** — constant folding.
-2. **`quantize_dynamic(..., weight_type=QUInt8)`**.
+**Why the PE is an input.** Upstream's `PositionalEncoding.forward` is `x + self.pe[:, :x.size(1)]`; under tracing `size(1)` is a constant, so pnnx bakes the slice at the trace width and every other width returns garbage. That wall is what kept OCR on ONNX Runtime through v3. With the encoding fed as `in1` — pure sinusoid, `pe[t, 2i] = sin(t / 10000^(2i/320))`, `pe[t, 2i+1] = cos(…)`, a few lines to compute on the device and shared by all three encoder layers — the graph holds only `x + in1`. The blob contract the engine's `ncnn_jni.cpp:ocrCtcNative` reads: `in0` = image `[3,48,W]` in `(x − 127.5)/127.5`, `in1` = PE `[T,320]`, `out0` = `char_logits [T,19264]` raw; greedy CTC and the top-1 log-softmax confidence are computed in JNI, the collapse and alphabet lookup in Kotlin.
 
-Why each is mandatory is the [trap section](#trap-4-the-ocr-quantizer-needs-two-non-obvious-preconditions) — it is the reason this step was previously not reproducible.
+**Why mixed precision.** On device (SD 8 Gen 3, 9 pages / 242 lines against an fp32 ground truth): all-fp16 is 27–32% faster but reads 219 — the transformer misreads small kana (なぃ, か6, だろぅ, やは自); all-fp32 reads 242 but is 32–45% slower; fp16 storage-only is 10× slower (every layer casts in and out). Backbone fp16 + transformer fp32 reads 241 (the one differing line is the ground truth's own misread) at ~23% less OCR time than the int8 ONNX model, and loads in ~0.3–0.4 s.
 
-**Why dynamic quantization, not static/QDQ:** the input width W varies with the number of characters in a text strip. Static quantization needs a fixed-shape calibration set to compute activation scales offline, which doesn't hold for a W-dynamic model. Dynamic quantization only quantizes weights offline and derives activation scale/zero-point at runtime — no calibration set, no fixed shape, at the cost of some per-inference overhead.
+**Output** — `parity/out/ocr_ncnn/ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param` + `ocr_48px_ctc.ncnn.bin`. The names already match `models.json`; the shipped bytes are:
 
-**Why `weight_type=QUInt8`** (not ORT's default QInt8): proven by construction — QUInt8 reproduces the released file bit-for-bit, so that is what was originally used.
+```
+ocr_48px_ctc.ncnn.param          18,133 B  sha256 e701cfc5df9d3c55c9fd0a36725499d01d45c18e32946271fc26e580cd9901bd
+ocr_48px_ctc_mixed.ncnn.param    18,438 B  sha256 32e298deca3acb8ba95897ca8cccbd028582ae42a697c3c05b4eaefe198309e3
+ocr_48px_ctc.ncnn.bin        83,037,664 B  sha256 3e0a809441f5284871d18a3d757a7ec098c4b9ee64bdfd7ac776a84aa057c7a9
+```
 
-**Verification** has two levels, and the good one is the default:
+**Verification** runs automatically, from a clean clone, on the *plain* param with every fp16 option off — which is all an x86 CPU can do:
 
-- **Real strips** (default, works from a clean clone) — runs fp32 vs int8 over 30 real text quads and compares the decoded text. Both inputs are in the repo: the page is `app-sandbox/src/main/assets/test/demo03.png` (`paths.SANDBOX_PAGE`) and the quads are [`parity/fixtures/faithful_boxes.json`](../parity/fixtures/faithful_boxes.json) (`paths.FAITHFUL_BOXES`). Measured: max|Δchar_logits| 40.682, argmax agreement 99.94% (1684/1685 timesteps), CTC per-line exact match **29/30**.
-- **Synthetic** — a random tensor, if the page fixture is unavailable: load + numerical equivalence only, no text. It degrades honestly rather than pretending it verified something.
+- **Real strips** — the same 30 frozen quads as ever (`faithful_boxes.json` on `demo03.png`): NCNN against the ORT fp32 reference, decoded text per line and argmax per timestep, plus the int8 ONNX as a third column when it is present. Measured: **text identical on 30/30, argmax identical on 30/30** (and 29/30 against int8 — the known line where int8 differs from fp32).
+- **Width sweep** — the longest strip, right-padded with white to W+1, W+7, 300, 333, 512, 777, 1000, 1024 and 1500: every width must decode to the same text as ORT fp32 at that width. Measured: no width differs. This is the check that the trace width didn't leak into the graph; a failure here is trap 7.
+- **`--fixture`** writes `engine/src/test/resources/ocr/` — strip 0's `in0`, its PE, the expected argmax indices and log-probs, and copies of both params — for the JVM tests: `OcrCtcParityTest` (the engine's `sinusoidalPe` and CTC collapse against numpy) and `OcrMixedParamTest` (the structural rules the mixed param must satisfy — trap 6).
 
-The quad fixture is **frozen on purpose**. It was produced by `ctd_reference.py` using comic-text-detector, which is retired and no longer shipped in any models release, so it cannot be regenerated. That's fine: the claim being verified is "int8 vs fp32 over the same strips" — a property of the OCR model pair, not of whichever detector found the strips. Freezing them is what keeps the number reproducible from a clean clone. The file's own `_provenance` block records this.
+**What the desktop cannot verify: the mixed param.** x86 has no fp16 storage, so `_mixed` can only be parsed and structurally checked here; whether it *computes* correctly is a device question (the 241/242 above). Trap 6 is why that is the only way it can go wrong.
 
-**Read 29/30 correctly.** That is where `models.json`'s "96.7% CTC parity" comes from. The one line that differs is a low-confidence line (p=0.66) where fp32 reads `ふふ口` and int8 reads `ふふっ` — **int8 is the one that's right** (`ふふっ` is real Japanese; `ふふ口` is a misread). 3.3% divergence is not 3.3% quality loss.
-
-To re-check the parity number without redoing the quantization, use `parity/ocr_parity.py`, which takes the two existing ONNX files.
+**The retired int8 model.** Through v3 the shipped OCR was `ocr_int8.onnx`: the stage-1 ONNX dynamically quantized by `quantize_ocr_int8.py` (`quant_pre_process(skip_symbolic_shape=True)`, then `quantize_dynamic(weight_type=QUInt8)` — 43,625,294 B, sha256 `353e68a5…29fa4c5c`, bit-identical to the `models-v2` release; 29/30 on the strips, the "96.7% CTC parity" of old). The script and `ocr_parity.py` are kept so stage 2's int8 column can still be reproduced; nothing ships from them. Trap 4 records the quantizer's two non-obvious preconditions.
 
 ## Rebuilding the inpaint model (AOT-GAN)
 
@@ -210,6 +218,8 @@ The same applies to AOT-GAN for a different reason: `AOTGenerator.forward`'s tra
 
 ### Trap 4: the OCR quantizer needs two non-obvious preconditions
 
+*(Retired int8 path — only matters if you rebuild `ocr_int8.onnx` for the comparison column.)*
+
 1. **Constant-fold first.** In torch's exported graph, `layer4.5/conv1`'s weight arrives as `Conv <- Identity <- initializer`. ORT's Conv quantizer only recognises "input[1] is directly an initializer" and won't see through the Identity, so a bare `quantize_dynamic` dies with `ValueError: Expected onnx::Conv_1267 to be an initializer`. Exporting with `do_constant_folding=True` does *not* remove this one. `quant_pre_process` does (nodes 646 → 437, non-initializer Conv weights 1 → 0).
 2. **`skip_symbolic_shape=True` is required.** Symbolic shape inference can't cope with the dynamic W: `Cannot determine if floor(floor(W/2)/2) - 1 < 0` → `Incomplete symbolic shape inference`. Dynamic quantization doesn't need shape inference anyway — we only want the constant folding.
 
@@ -218,6 +228,20 @@ The same applies to AOT-GAN for a different reason: `AOTGenerator.forward`'s tra
 An ncnn `.bin` is just a linear stream of weights laid out in the `.param`'s layer order. A different pnnx version orders layers differently, so the `.bin` bytes change completely — even when every individual tensor is bit-identical. **Mixing a new `.param` with an old `.bin` does not error. It silently outputs all zeros** (text removal renders solid black).
 
 Measured: `ours.param` + `release.bin` → 0.0, and `release.param` + `ours.bin` → 0.0, while each matched pair gives the same 513071.40625. In `models.json` the `.param` and `.bin` are two independent assets — **always replace both from the same conversion**, and remember the app may have cached the old one. The AOT script's `compare_weights()` exists to catch this class of mistake.
+
+### Trap 6: a featmask changes how a layer computes, not what it receives
+
+The mixed-precision OCR param marks the transformer layers `31=7` so they run fp32. The first version did only that, and crashed on device with a SIGSEGV inside `conv3x3s1_winograd43_fp16sa` — a *backbone* convolution, on a *different* page's thread, nowhere near the transformer.
+
+The mechanism, verified against ncnn's `net.cpp`: `convert_layout` only casts an fp16 blob to fp32 when `opt.use_fp16_storage && !layer->support_fp16_storage`, and a masked layer's option already has `use_fp16_storage` turned off — so the condition is false, no cast happens, and the backbone's fp16 pack8 output flows into the fp32 layers as-is. `Squeeze` only reshapes, so nothing shows; `Permute` allocates its output with elemsize 2 but writes `w*h` floats through a `float*` — twice the buffer — and the heap overflow lands on whichever concurrent thread's Winograd workspace sits next door. Small (T=30 is about 19 KB), silent, and remote from its cause.
+
+The fix is the explicit `Cast` (`0=2 1=1`) between the last backbone conv and the `Squeeze`: `Cast_arm` supports fp16 storage itself on asimdhp CPUs, so the Net leaves it alone; it consumes the fp16 pack8 blob and emits fp32 pack8, and `Squeeze` (a base layer, no packing) gets unpacked by the Net to pack1. The `Cast` itself carries no mask. `OcrMixedParamTest` guards the rule: every input of every masked layer must come from a masked layer, from `in1` (the PE, which the extractor injects as fp32), or from a `Cast`.
+
+The corollary is the mixed param's precondition: its `Cast` declares its input to be fp16, which is true only when the CPU has fp16 storage (ARMv8.2 `asimdhp`) and the Net has `use_fp16_storage` on. On x86, on older ARM, or with fp16 storage disabled the incoming blob is fp32, the `Cast` reinterprets it, and OCR returns garbage without crashing. The engine (`Ocr.pickParam`) therefore loads `_mixed` only when `OcrConfig.ncnnMixed && ncnnFp16Storage && NcnnBackend.cpuSupportsFp16`, and the plain param otherwise; the desktop scripts never execute it at all.
+
+### Trap 7: the OCR trace width leaks into the graph unless the PE is an input
+
+`PositionalEncoding.forward` slices its buffer by `x.size(1)`, a constant under tracing. A straight trace → pnnx export therefore works at exactly the trace width and returns garbage at every other — no error, just wrong text. This is the wall the 2026-07 attempt hit, and why OCR stayed on ONNX Runtime until v4. The export lifts the encoding out as `in1` (see the OCR section), pairs `inputshape` with a distant `inputshape2` so the attention Reshapes stay dynamic, and the width sweep in `verify()` is the regression test: pad one strip to nine unrelated widths and demand the same text at each.
 
 ### Smaller ones, all of which have cost time
 
@@ -229,12 +253,12 @@ Measured: `ours.param` + `release.bin` → 0.0, and `release.param` + `ours.bin`
 
 ## Shipping a rebuild
 
-Outputs land in `parity/out/` (gitignored). Two of the five files ship under a different name than they're built with:
+Outputs land in `parity/out/` (gitignored). Two of the six files ship under a different name than they're built with:
 
 | Built | Ships as | `models.json` role |
 |---|---|---|
 | `dbnet.ncnn.param` / `.bin` | **`dbnet_detect.ncnn.param` / `.bin`** — rename required | detector |
-| `ocr_int8.onnx` | `ocr_int8.onnx` — as-is | ocr |
+| `ocr_48px_ctc.ncnn.param` / `ocr_48px_ctc_mixed.ncnn.param` / `ocr_48px_ctc.ncnn.bin` | same names — as-is | ocr |
 | `mit_aot_fixed512.ncnn.param` / `.bin` | `mit_aot_fixed512.ncnn.param` / `.bin` — as-is | inpainter |
 
 ```bash
@@ -242,7 +266,7 @@ cp parity/out/dbnet/dbnet.ncnn.param /tmp/ship/dbnet_detect.ncnn.param
 cp parity/out/dbnet/dbnet.ncnn.bin   /tmp/ship/dbnet_detect.ncnn.bin
 ```
 
-The detector rename is a manual step and therefore easy to forget. Bring-your-own-model will still resolve the unrenamed file — `ModelSet` matches by substring (`.param` containing `dbnet` → detector, `.param` containing `aot` → inpainter, `.onnx` containing `ocr` → OCR) and finds the `.bin` by swapping the suffix — but a release asset must carry the name `models.json` declares, or auto-download fails.
+The detector rename is a manual step and therefore easy to forget. Bring-your-own-model will still resolve the unrenamed file — `ModelSet` matches by substring (`.param` containing `dbnet` → detector, `.param` containing `aot` → inpainter, `.param` containing `ocr` → OCR, either param — the engine picks `_mixed` or plain itself) and finds the `.bin` by swapping the suffix — but a release asset must carry the name `models.json` declares, or auto-download fails.
 
 If you publish weights that differ from the current ones, update `models.json`'s `size` and `sha256` in the same change — the manifest is versioned with the files, which is what keeps that check meaningful.
 
@@ -250,6 +274,7 @@ If you publish weights that differ from the current ones, update `models.json`'s
 
 Being explicit, so nobody burns a day trying:
 
-- **Performance numbers are device-side.** "~3.6× faster on ARM", and the 10.3 s / 6 pages figures in [MODELS.md](MODELS.md), were measured on real hardware (SD 8 Gen 3). They cannot be reproduced by this build process.
-- **x86 timings from these scripts are noise.** Two runs of a *bit-identical* OCR model measured 1732 ms and 3336 ms — a ~2× spread on the same file. The fp32-vs-int8 "~29×" seen on x86 is likewise an artifact. Don't read any speed conclusion out of a desktop run.
+- **Performance and precision numbers are device-side.** "~23% faster than int8", the 241/242 mixed-precision read rate, and the 10.3 s / 6 pages figures in [MODELS.md](MODELS.md) were measured on real hardware (SD 8 Gen 3). They cannot be reproduced by this build process.
+- **The mixed-precision OCR param cannot be executed on x86.** No fp16 storage there, and its `Cast` assumes fp16 input (trap 6). The scripts parse and structure-check it; the plain param is what they run.
+- **x86 timings from these scripts are noise.** Two runs of a *bit-identical* OCR model (the retired int8 one) measured 1732 ms and 3336 ms — a ~2× spread on the same file. The fp32-vs-int8 "~29×" seen on x86 is likewise an artifact. Don't read any speed conclusion out of a desktop run.
 - **`out1` mask resolution differs by platform and must not be hard-coded.** On x86 it comes back half-resolution (H/2 × W/2); on arm64 it comes back full-resolution. The engine allocates for the full-resolution worst case and reads the actual dimensions back from JNI (commit `7c62f78` fixed exactly this overrun). Don't let a desktop measurement talk you into fixing a size at either end.

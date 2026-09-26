@@ -5,7 +5,7 @@
 不出貨。開發專用的 Python harness，跑跟 Kotlin `:engine` 同樣的 pipeline 階段，讓我們在信任它上機前，
 先檢查裝置端移植跟參考（[manga-image-translator](https://github.com/zyddnys/manga-image-translator)，m-i-t）一致。
 
-引擎把 m-i-t（Python/torch）重寫成 Kotlin/ONNX，這種移植沒辦法逐行 diff，所以正確性是「同輸入、近輸出」。
+引擎把 m-i-t（Python/torch）重寫成 Kotlin/NCNN，這種移植沒辦法逐行 diff，所以正確性是「同輸入、近輸出」。
 這些腳本產出那份參考輸出，grouping 還有自動化跨語言斷言。見 [`../docs/ARCHITECTURE_zh.md`](../docs/ARCHITECTURE_zh.md#兩半)。
 
 ---
@@ -42,8 +42,8 @@ YAKU_TEST_DIR=~/manga-test YAKU_MIT_CLONE=~/src/mit python3 pipeline_parity.py r
 
 **刻意放進 repo** 的驗證素材，讓我們公開宣稱的數字可以從空白 clone 重新量出來：
 
-- `faithful_boxes.json`——定義 `models.json` / `docs/MODELS.md` 那個 OCR **int8 vs fp32 CTC parity**
-  數字的 30 個文字行 quad。**凍結**：它由 `ctd_reference.py` 跑**已退役**的 comic-text-detector 產出，
+- `faithful_boxes.json`——每一次 OCR 轉檔都拿來驗的 30 個文字行 quad：`export_ocr_ncnn.py` 用它們把出貨的 NCNN OCR
+  對 ORT fp32 逐行比（30/30 相同），更早之前它們定義的是退役 int8 模型的 96.7% 那個數字。**凍結**：它由 `ctd_reference.py` 跑**已退役**的 comic-text-detector 產出，
   該模型已不在任何 models release 裡 ⇒ 重產不出來；而且凍結才對——這個數字要量的是「**OCR 模型對**
   在同一批 strip 上讀出的字是否一致」，不是偵測器的性質。來歷寫在檔案裡（`_provenance`）。
 - 測試頁——`app-sandbox/src/main/assets/test/demo03.png`（舊名 `page.png`；commit `ea3e166` 只是
@@ -51,15 +51,16 @@ YAKU_TEST_DIR=~/manga-test YAKU_MIT_CLONE=~/src/mit python3 pipeline_parity.py r
 - 字表——`engine/src/main/assets/models/alphabet-all-v5.txt`（與上游逐位元相同），`paths.ALPHABET`
   缺 ckpt 時自動退回這份 ⇒ 純解碼的腳本不必抓 ckpt zip。
 
-重現 parity 數字（需要兩顆 OCR 模型，見 `docs/BUILD_MODELS.md`）：
+重現這兩個檢查（都需要 fp32 ONNX 參考，見 `docs/BUILD_MODELS_zh.md`）：
 
 ```bash
-python3 parity/ocr_parity.py     # 印出「逐行 exact match = N/30 = xx.x%」
+python3 parity/export_ocr_ncnn.py --skip-export   # 出貨的 NCNN OCR vs ORT fp32：逐行文字 + 寬度掃描
+python3 parity/ocr_parity.py                      # 退役的 int8 vs fp32：印出「逐行 exact match = N/30 = xx.x%」
 ```
 
-2026-07-16 實測：**29/30 = 96.7%**，與公開宣稱一致。唯一不同的那行是低信心行（p=0.66）、
-且 int8 讀得**比較對** ⇒ 96.7% 不等於 3.3% 品質損失。效能宣稱（如「ARM 快 3.6×」）是
-**真機數字、桌面驗不出來**。
+實測：NCNN 文字 **30/30** 與 fp32 相同、寬度掃描全過。退役的 int8 模型是 **29/30 = 96.7%**（2026-07-16）；
+它唯一不同的那行是低信心行（p=0.66）、且 int8 當時讀得**比較對**。真機的效能與精度宣稱（如「比 int8 快 ~23%」、
+「241/242 行」）是**真機數字、桌面驗不出來**——`_mixed` param 在 x86 上更是根本跑不了。
 
 ---
 
@@ -67,14 +68,14 @@ python3 parity/ocr_parity.py     # 印出「逐行 exact match = N/30 = xx.x%」
 
 **端到端**
 - `pipeline_parity.py <img…>`——整條 detect→OCR→group→translate→inpaint→typeset。
-  主驅動；寫 `out/final_<name>.png` + 快取中間結果。（端到端仍跑退役的 ctd + LaMa；出貨的 DBNet/AOT
-  走 per-stage 驗證——int8 OCR parity、分組測試、`export_*_ncnn.py` 轉檔比對。）
+  主驅動；寫 `out/final_<name>.png` + 快取中間結果。（端到端仍跑退役的 ctd + LaMa、OCR 用 fp32 ONNX；出貨的
+  DBNet/OCR/AOT 三顆 NCNN 模型走 per-stage 驗證——`export_*_ncnn.py` 轉檔比對、分組測試。）
 
 **逐階段 parity**（跑/檢視單一階段）
 - `ctd_reference.py [page]`——偵測：faithful（m-i-t 後處理）vs simplified，並排。
   凍在歷史：需要已退役的 comic-text-detector ONNX（見上面 Fixture）。
-- `ocr_parity.py`——對凍結的 30 框做 48px CTC 辨識；有 int8 模型在時順便印出公開宣稱的 CTC parity。
-  空白 clone 可跑（fixture + repo 內字表）。
+- `ocr_parity.py`——對凍結的 30 框用 ORT 做 48px CTC 辨識（fp32；退役的 int8 在的話順便印它的歷史 parity 數字）。
+  出貨的 NCNN OCR 改由 `export_ocr_ncnn.py` 驗。空白 clone 可跑（fixture + repo 內字表）。
 - `group_exp.py <name…>`——分組：我們的區域 vs m-i-t 的，畫成框。
 - `translate_parity.py`——OCR 出的日文 → DeepSeek → 繁中。
 - `merge_translate_parity.py`——先併行再翻。
@@ -87,8 +88,13 @@ python3 parity/ocr_parity.py     # 印出「逐行 exact match = N/30 = xx.x%」
 - `ctd_reference.py`——也拉 m-i-t 的偵測後處理。
 
 **工具**
-- `export_ocr_onnx.py`——把 48px CTC checkpoint 匯出成 ONNX（build-time，需 torch）。
-- `quantize_ocr_int8.py`——把上面那顆 fp32 OCR ONNX 動態量化成 int8 → `ocr_int8.onnx`（出貨的 OCR 權重）。
+- `export_ocr_onnx.py`——把 48px CTC checkpoint 匯出成 fp32 ONNX：NCNN 轉檔拿來驗證的桌面參考、不出貨（build-time，需 torch）。
+- `quantize_ocr_int8.py`——把上面那顆 fp32 OCR ONNX 動態量化成 int8 → `ocr_int8.onnx`：models-v3 以前出貨的 OCR，
+  OCR 改跑 NCNN 後退役；留著給 `export_ocr_ncnn.py` 驗證裡的 int8 那欄用。
+- `export_ocr_ncnn.py`——從上游 ckpt 產出**出貨的** OCR：48px CTC 的 NCNN 檔（`ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param`
+  共用一份 `.bin`；`write_mixed_param()` 衍生混合精度 param——backbone fp16、transformer fp32）。正弦位置編碼當第二個輸入
+  （`in1`，T=floor(W/4)−1）而不是烤進圖裡，先前的嘗試在 trace 寬度以外全壞就是卡在這。對 ORT fp32 驗 30 條 fixture 字條
+  與一組寬度掃描（CTC 文字相同），並把 JVM fixture 寫到 `engine/src/test/resources/ocr/`。
 - `export_dbnet_ncnn.py`——從上游 ckpt 產出出貨的 DBNet 偵測器 NCNN 檔（`dbnet_detect.ncnn.param`/`.bin`）。
 - `export_aot_ncnn.py`——從上游 ckpt 產出出貨的 AOT-GAN 去字 NCNN 檔（`mit_aot_fixed512.ncnn.param`/`.bin`）。
 - `compare_inpaint.py`——去字模型×方法比較 + 計時；驗證出貨的 AOT-GAN 去字。

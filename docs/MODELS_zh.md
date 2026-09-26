@@ -2,41 +2,50 @@
 
 [English](MODELS.md) ｜ 中文
 
-引擎不內建任何模型權重。它需要三顆模型——偵測、OCR、去字（inpaint）——有兩種取得方式：手動（自備模型）或從本 repo 的 releases 自動下載。其中兩顆跑 NCNN、以 `.param` + `.bin` 成對交付，OCR 是單一顆 int8 ONNX——總共五個檔。兩者都落在同一個 models 資料夾，下游解析完全一樣。
+引擎不內建任何模型權重。它需要三顆模型——偵測、OCR、去字（inpaint）——有兩種取得方式：手動（自備模型）或從本 repo 的 releases 自動下載。三顆全跑 NCNN、以 `.param` + `.bin` 交付；OCR 是兩份 `.param`（原版與混合精度版）共用一份 `.bin`——總共六個檔。兩種方式都落在同一個 models 資料夾，下游解析完全一樣。引擎已經不依賴 ONNX Runtime。
 
 ## 三顆模型
 
 | 角色 | 後端 | 檔案 | 大小 | 授權 | 出處 |
 |---|---|---|---|---|---|
-| 偵測 | NCNN | `dbnet_detect.ncnn.param` + `.bin` | ~153 MB | GPL-3.0 | DBNet（ResNet34 + DB head），出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 的 default detector |
-| OCR | ONNX（int8） | `ocr_int8.onnx` | ~44 MB | GPL-3.0 | 由 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 權重在本專案匯出 |
-| 去字 | NCNN | `mit_aot_fixed512.ncnn.param` + `.bin` | ~11 MB | GPL-3.0 | AOT-GAN，出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| 偵測 | NCNN（fp16） | `dbnet_detect.ncnn.param` + `.bin` | ~153 MB | GPL-3.0 | DBNet（ResNet34 + DB head），出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 的 default detector |
+| OCR | NCNN（fp16/fp32 混合） | `ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param` + `ocr_48px_ctc.ncnn.bin` | ~83 MB | GPL-3.0 | 48px CTC，由 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 權重在本專案轉檔 |
+| 去字 | NCNN（fp16） | `mit_aot_fixed512.ncnn.param` + `.bin` | ~11 MB | GPL-3.0 | AOT-GAN，出自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 
-**後端。** 偵測與去字跑 NCNN（ARM-NEON）；OCR 走 ONNX Runtime，且是 int8 動態量化（QUInt8——ARM 快 ~3.6×、對 fp32 有 96.7% CTC parity、165 MB → 44 MB）。三顆都跑 CPU——GPU/NPU 試過、對這些模型不管用（NCNN Vulkan 把 AOT-GAN 算成垃圾、LiteRT 編不出來）。v1 的 LaMa 去字已退役移除，改由 AOT-GAN（manga-image-translator 的 inpaint）取代。
+**後端。** 三顆都跑 NCNN（ARM NEON / Winograd 核心）、都在 CPU 上——GPU/NPU 試過、對這些模型不管用（NCNN Vulkan 把 AOT-GAN 算成垃圾、LiteRT 編不出來）。v1 的 LaMa 去字已退役移除，改由 AOT-GAN（manga-image-translator 的 inpaint）取代。OCR 到 v3 為止走 ONNX Runtime（int8）；v4 把它搬到 NCNN，引擎從此整個拔掉 ONNX Runtime。
 
-**v3 偵測器。** comic-text-detector 已退役、整條移除；改用 manga-image-translator 的 default detector（DBNet：ResNet34 + DB head），真機讀對的文字多 **1.6–2.5×**。權重維持 fp16 storage——int8 量化實測**完全吐不出框**、在 ARM 上也沒有比較快，因此不採用；這也是為什麼光偵測器就佔了裝置端 ~208 MB 權重裡的 ~153 MB。前處理是 resize_aspect 到 1024、再 pad 到 256 的倍數；這樣得到的**矩形**輸入同時繞開 ncnn 對 832–992 正方形尺寸的 heap corruption。SD 8 Gen 3 上的實測：6 張代表頁、161 個偵測框，偵測 + OCR 共 10.3 秒、讀出其中 160——99.4%。
+**v4 OCR。** 48px CTC 模型跑在 NCNN 上、**混合精度**：卷積 backbone（約 96% 的 MACs）維持 fp16，transformer encoder 與字元頭用 ncnn 的逐層 featmask（`31=7`）強制 fp32，兩者之間插一個明確的 `Cast` 層。精度怎麼切就是重點。9 頁 242 行、以 fp32 為真值：全 fp16 的 NCNN 讀對 219 行、舊的 int8 ONNX 模型 223 行——兩者都把小假名讀錯（なぃ、か6、だろぅ）——全 fp32 的 NCNN 242 行、混合精度 241 行（唯一不同的那行其實是真值讀錯、混合精度是對的）。OCR 時間比 int8 那顆少 ~23%（例：每頁 1256 vs 1669 ms），模型載入 ~0.3–0.4 秒。正弦位置編碼不烤進圖裡、而是當第二個輸入餵進去，所以任何寬度的字條都能跑——先前把 OCR 卡在 ONNX Runtime 上的那道牆就是它。文字行 8 條並發、跑在單緒建的 Net 上，不進 NCNN 的全域推論鎖。兩份 `.param` 共用同一份 `.bin`：
+
+- `ocr_48px_ctc_mixed.ncnn.param`——混合精度版，預設用它。**只在**CPU 有 ARMv8.2 fp16（`asimdhp`）且 fp16 storage 開著時才正確：它的 `Cast` 層宣告「進來的是 fp16」，其他情況下會把 fp32 資料當 fp16 讀、靜默吐垃圾。
+- `ocr_48px_ctc.ncnn.param`——原版，每層都用 Net 的全域精度。混合版用不了時（CPU 沒 fp16、`OcrConfig.ncnnFp16Storage` / `ncnnMixed` 關、或 `_mixed` 檔不在）引擎（`Ocr.pickParam`）就載這份——沒 fp16 的手機一樣讀得對，只是跑 fp32、慢一點。
+
+fp16 的 `.bin` 約 83 MB，退役的 int8 是 44 MB；救回小假名的是精度、不是體積。
+
+**v3 偵測器。** comic-text-detector 已退役、整條移除；改用 manga-image-translator 的 default detector（DBNet：ResNet34 + DB head），真機讀對的文字多 **1.6–2.5×**。權重維持 fp16 storage——int8 量化實測**完全吐不出框**、在 ARM 上也沒有比較快，因此不採用；這也是為什麼光偵測器就佔了裝置端 ~247 MB 權重裡的 ~153 MB。前處理是 resize_aspect 到 1024、再 pad 到 256 的倍數；這樣得到的**矩形**輸入同時繞開 ncnn 對 832–992 正方形尺寸的 heap corruption。SD 8 Gen 3 上的實測：6 張代表頁、161 個偵測框，偵測 + OCR 共 10.3 秒、讀出其中 160——99.4%（以 v3 的 int8 OCR 量的；v4 讓 OCR 那份再快 ~23%）。
 
 精確 bytes 與雜湊釘在 [`models.json`](../models.json)：
 
 ```
-dbnet_detect.ncnn.param        13392  sha256 9e6db2f8…ee1ff7b5
-dbnet_detect.ncnn.bin      153010556  sha256 f57bdbed…fcc55c3d
-ocr_int8.onnx               43625294  sha256 353e68a5…29fa4c5c
-mit_aot_fixed512.ncnn.param    33810  sha256 f21ef860…ee7d32b5
-mit_aot_fixed512.ncnn.bin   11366088  sha256 a52db45e…5e3560b6
+dbnet_detect.ncnn.param            13392  sha256 9e6db2f8…ee1ff7b5
+dbnet_detect.ncnn.bin          153010556  sha256 f57bdbed…fcc55c3d
+ocr_48px_ctc.ncnn.param            18133  sha256 e701cfc5…cd9901bd
+ocr_48px_ctc_mixed.ncnn.param      18438  sha256 32e298de…198309e3
+ocr_48px_ctc.ncnn.bin           83037664  sha256 3e0a8094…a057c7a9
+mit_aot_fixed512.ncnn.param        33810  sha256 f21ef860…ee7d32b5
+mit_aot_fixed512.ncnn.bin       11366088  sha256 a52db45e…5e3560b6
 ```
 
 這些雜湊是**散布用的完整性檢查**——用來確認你手上的檔就是我們發行的那個。它們**不是**判斷「重建是否正確」的準則：一次重建可以數值上完全等價、雜湊卻不同（去字那顆就永遠如此）。要從上游 ckpt 重建這些模型，見 [BUILD_MODELS_zh.md](BUILD_MODELS_zh.md)。
 
 ## 散布與授權
 
-這些權重全是 GPL-3.0。本專案在該授權下、附出處歸屬地重新散布它們，純粹是為了「自動下載」的方便。OCR 模型是我們自己對 manga-image-translator 權重做 int8 量化 ONNX 匯出，NCNN 偵測與 AOT-GAN 去字則是我們自己對上游權重的轉檔——沒有上游現成的可散布檔可指，所以由本 repo host。你也可以自己從出處取得原始權重、走自備模型。從上游 ckpt 到這五個檔的完整轉檔路徑——腳本、釘住的版本、以及怎麼驗證產出——見 [BUILD_MODELS_zh.md](BUILD_MODELS_zh.md)。
+這些權重全是 GPL-3.0。本專案在該授權下、附出處歸屬地重新散布它們，純粹是為了「自動下載」的方便。三顆都是我們自己對 manga-image-translator 權重做的 NCNN 轉檔（OCR 那顆把位置編碼抽成輸入，再從原版 param 衍生出第二份混合精度 param）——沒有上游現成的可散布檔可指，所以由本 repo host。你也可以自己從出處取得原始權重、走自備模型。從上游 ckpt 到這六個檔的完整轉檔路徑——腳本、釘住的版本、以及怎麼驗證產出——見 [BUILD_MODELS_zh.md](BUILD_MODELS_zh.md)。
 
 ## 怎麼取得模型
 
-**自動下載（reader）。** reader 一鍵抓齊 manifest 列的每個檔，逐檔對 [`models.json`](../models.json) 的 sha256 驗證。每一筆都帶自己的 url：偵測器來自 `models-v3` release，OCR 與去字沒有變動、仍由 `models-v2` 供應。結果跟自備模型一樣，只是自動化。
+**自動下載（reader）。** reader 一鍵抓齊 manifest 列的每個檔，逐檔對 [`models.json`](../models.json) 的 sha256 驗證。每一筆都帶自己的 url：偵測器來自 `models-v3` release、OCR 三個檔來自 `models-v4`，去字沒有變動、仍由 `models-v2` 供應。結果跟自備模型一樣，只是自動化。
 
-**自備模型（手動）。** 把檔案放進你指給 app 的 models 資料夾（NCNN 角色要 `.param` 與對應的 `.bin` 兩個都放）。它們按檔名 + 副檔名解析——`.param` 含 `dbnet` → 偵測、`.param` 含 `aot` → 去字、`.onnx` 含 `ocr` → OCR。三個角色缺一即視為未備齊；沒有 ORT 備援、也沒有 LaMa 路徑（兩者皆已移除）。
+**自備模型（手動）。** 把檔案放進你指給 app 的 models 資料夾（每個角色都要 `.param` 與對應的 `.bin`；OCR 請把兩份 `.param` 和 `.bin` 都放進去）。它們按檔名 + 副檔名解析——`.param` 含 `dbnet` → 偵測、`.param` 含 `aot` → 去字、`.param` 含 `ocr` → OCR（兩份 OCR param 哪份當入口都行；引擎查過 CPU 後自己切到 `_mixed` 或退回原版）。三個角色缺一即視為未備齊。沒有備援 runtime：ONNX Runtime 的 OCR 路徑、ONNX 偵測/去字路徑與 LaMa 全都移除了，v3 留下的 `ocr_int8.onnx` 不再被使用。
 
 ## 驗證
 

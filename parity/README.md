@@ -7,7 +7,7 @@ Not shipped. A developer-only Python harness that runs the same pipeline stages 
 ([manga-image-translator](https://github.com/zyddnys/manga-image-translator), m-i-t) before trusting
 it on a device.
 
-The engine re-implements m-i-t (Python/torch) in Kotlin/ONNX, and that port can't be diffed line for
+The engine re-implements m-i-t (Python/torch) in Kotlin/NCNN, and that port can't be diffed line for
 line, so correctness means "same input, close output". These scripts produce the reference output,
 and for grouping an automated cross-language assertion. See
 [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md#the-two-halves).
@@ -47,8 +47,9 @@ Outputs land in `parity/out/` (cached JSON + comparison PNGs; gitignored).
 Verification material that is **in the repo on purpose**, so the numbers we publish can be
 re-measured from a clean clone:
 
-- `faithful_boxes.json` — the 30 text-line quads that define the OCR **int8-vs-fp32 CTC parity**
-  figure quoted in `models.json` / `docs/MODELS.md`. Frozen: they came from `ctd_reference.py`
+- `faithful_boxes.json` — the 30 text-line quads every OCR conversion is verified on: `export_ocr_ncnn.py`
+  checks the shipped NCNN OCR against ORT fp32 on them (30/30 identical), and before that they defined the
+  retired int8 model's 96.7% figure. Frozen: they came from `ctd_reference.py`
   running the **retired** comic-text-detector, which no longer ships in any models release, so
   they cannot be regenerated — and freezing them is what makes the number a stable measurement
   of the *OCR model pair* rather than of the detector. Provenance is inside the file (`_provenance`).
@@ -57,15 +58,17 @@ re-measured from a clean clone:
 - Alphabet — `engine/src/main/assets/models/alphabet-all-v5.txt` (byte-identical to upstream's),
   which `paths.ALPHABET` falls back to, so decode-only scripts need no checkpoint download.
 
-Reproduce the parity number (needs both OCR models — see `docs/BUILD_MODELS.md`):
+Reproduce the checks (both need the fp32 ONNX reference — see `docs/BUILD_MODELS.md`):
 
 ```bash
-python3 parity/ocr_parity.py     # prints "逐行 exact match = N/30 = xx.x%"
+python3 parity/export_ocr_ncnn.py --skip-export   # shipped NCNN OCR vs ORT fp32: per-line text + width sweep
+python3 parity/ocr_parity.py                      # retired int8 vs fp32: prints "逐行 exact match = N/30 = xx.x%"
 ```
 
-Measured 2026-07-16: **29/30 = 96.7%**, matching the published figure. The one differing line is
-low-confidence (p=0.66) and int8 is the *better* read there — so 96.7% is not a 3.3% quality loss.
-Speed claims (e.g. "~3.6× on ARM") are **device numbers and cannot be verified on desktop**.
+Measured: NCNN **30/30** text-identical to fp32, width sweep clean. The retired int8 model measured
+**29/30 = 96.7%** (2026-07-16); its one differing line is low-confidence (p=0.66) and int8 was the *better*
+read there. Device speed and precision claims (e.g. "~23% faster than int8", "241/242 lines") are
+**device numbers and cannot be verified on desktop** — and the `_mixed` param can't run on x86 at all.
 
 ---
 
@@ -74,14 +77,15 @@ Speed claims (e.g. "~3.6× on ARM") are **device numbers and cannot be verified 
 **End-to-end**
 - `pipeline_parity.py <img…>` — full chain detect→OCR→group→translate→inpaint→typeset for a page.
   The main driver; writes `out/final_<name>.png` + caches intermediates. (Still runs the retired ctd +
-  LaMa end-to-end; the shipped DBNet/AOT are validated per-stage — int8 OCR parity, the grouping test,
-  and the `export_*_ncnn.py` build/verify.)
+  LaMa end-to-end, with the fp32 ONNX OCR; the shipped DBNet/OCR/AOT NCNN models are validated per-stage —
+  the `export_*_ncnn.py` build/verify and the grouping test.)
 
 **Per-stage parity** (run/inspect one stage)
 - `ctd_reference.py [page]` — detection: faithful (m-i-t post-processing) vs simplified, side by side.
   Frozen in history: needs the retired comic-text-detector ONNX (see Fixtures above).
-- `ocr_parity.py` — 48px CTC recognition on the frozen quads; with an int8 model present it also
-  reports the published CTC parity figure. Runs from a clean clone (fixtures + repo alphabet).
+- `ocr_parity.py` — 48px CTC recognition on the frozen quads through ORT (fp32, plus the retired int8 if
+  present, for its historical parity figure). The shipped NCNN OCR is checked by `export_ocr_ncnn.py` instead.
+  Runs from a clean clone (fixtures + repo alphabet).
 - `group_exp.py <name…>` — grouping: our regions vs m-i-t's, drawn as boxes.
 - `translate_parity.py` — OCR'd JP → DeepSeek → CHT.
 - `merge_translate_parity.py` — line-merge then translate.
@@ -95,10 +99,17 @@ Speed claims (e.g. "~3.6× on ARM") are **device numbers and cannot be verified 
 - `ctd_reference.py` — also pulls m-i-t's detection post-processing.
 
 **Tools**
-- `export_ocr_onnx.py` — export the 48px CTC checkpoint to ONNX (build-time, needs torch).
-- `quantize_ocr_int8.py` — dynamic-quantize that fp32 OCR ONNX to int8 → `ocr_int8.onnx` (the shipped OCR weights).
+- `export_ocr_onnx.py` — export the 48px CTC checkpoint to fp32 ONNX: the desktop reference the NCNN export is verified
+  against; not shipped (build-time, needs torch).
+- `quantize_ocr_int8.py` — dynamic-quantize that fp32 OCR ONNX to int8 → `ocr_int8.onnx`: the OCR shipped up to models-v3,
+  retired now that OCR runs on NCNN; kept for the int8 column of `export_ocr_ncnn.py`'s verification.
 - `export_dbnet_ncnn.py` — build the shipped DBNet detector NCNN files (`dbnet_detect.ncnn.param`/`.bin`) from the upstream ckpt.
 - `export_aot_ncnn.py` — build the shipped AOT-GAN inpaint NCNN files (`mit_aot_fixed512.ncnn.param`/`.bin`) from the upstream ckpt.
+- `export_ocr_ncnn.py` — build the **shipped** OCR: the 48px CTC NCNN files (`ocr_48px_ctc.ncnn.param` + `ocr_48px_ctc_mixed.ncnn.param`
+  over one `.bin`; `write_mixed_param()` derives the mixed-precision param — fp16 backbone, fp32 transformer) from the upstream ckpt. The
+  sinusoidal positional encoding is fed as a second input (`in1`, T=floor(W/4)−1) instead of being traced into the graph,
+  which is what made earlier attempts fail at any width other than the trace width. Verifies the 30 fixture strips and a
+  width sweep against ORT fp32 (CTC text identical) and writes the JVM fixture under `engine/src/test/resources/ocr/`.
 - `compare_inpaint.py` — inpaint model × method comparison + timing; verifies the shipped AOT-GAN removal.
 - `seg_validate.py` — inspect the detector's `seg` stroke mask at thresholds.
 - `emit_grouping_fixture.py` — generate the Kotlin grouping test fixture (see below).

@@ -1,6 +1,6 @@
 {
-  "version": "models-v3",
-  "note": "Auto-download manifest. The engine fetches this (ModelDownloader.fetchManifest), downloads each url into the app's models dir, and verifies sha256. v3 switches the detector to DBNet (m-i-t default, ResNet34 + DB head) replacing comic-text-detector — 1.6-2.5x higher on-device recall on dense/handwritten text. OCR (ocr_int8) and inpaint (mit_aot) are unchanged from v2 (urls still point at the models-v2 release). NCNN roles ship as .param + .bin pairs (both required). Weights are GPL-3.0; see docs/MODELS.md. Urls point at this repo's GitHub release assets.",
+  "version": "models-v4",
+  "note": "Auto-download manifest. The engine fetches this (ModelDownloader.fetchManifest), downloads each url into the app's models dir, and verifies sha256. v4 moves OCR to NCNN — mixed precision: fp16 backbone + fp32 transformer via ncnn's per-layer featmask plus an explicit Cast layer; the sinusoidal positional encoding is fed as a second input, so any strip width works. On-device it is ~23% faster than the previous ORT int8 model and reads the small kana int8 got wrong (241/242 lines matching fp32 on 9 pages, vs 223/242 for int8). The engine no longer depends on ONNX Runtime. The _mixed param needs an arm82 (fp16) CPU — the engine falls back to the plain param otherwise; both params share one .bin. Detector (models-v3) and inpaint (models-v2) are unchanged and their urls still point at those releases. NCNN roles ship as .param + .bin (all files required). Weights are GPL-3.0; see docs/MODELS.md. Urls point at this repo's GitHub release assets.",
   "models": [
     {
       "role": "detector",
@@ -25,14 +25,36 @@
     },
     {
       "role": "ocr",
-      "backend": "onnxruntime",
-      "name": "ocr_int8.onnx",
-      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v2/ocr_int8.onnx",
-      "size": 43625294,
-      "sha256": "353e68a5506a6b8967905cd9b3c59e67708df1bc6812e105aa54d4e829fa4c5c",
+      "backend": "ncnn",
+      "name": "ocr_48px_ctc.ncnn.param",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v4/ocr_48px_ctc.ncnn.param",
+      "size": 18133,
+      "sha256": "e701cfc5df9d3c55c9fd0a36725499d01d45c18e32946271fc26e580cd9901bd",
       "license": "GPL-3.0",
       "source": "https://github.com/zyddnys/manga-image-translator",
-      "note": "48px CTC, int8 dynamic quantization (QUInt8) — ~3.6x faster on ARM, 96.7% CTC parity vs fp32, 165MB -> 44MB."
+      "note": "48px CTC OCR on NCNN (parity/export_ocr_ncnn.py). Plain param: every layer at the net's global precision — the engine loads this one whenever the _mixed param can't be used (CPU without arm82 fp16, or fp16 storage turned off). Positional encoding is the second input (in1, T = floor(W/4) - 1), so any strip width works. Shares ocr_48px_ctc.ncnn.bin with the _mixed param."
+    },
+    {
+      "role": "ocr",
+      "backend": "ncnn",
+      "name": "ocr_48px_ctc_mixed.ncnn.param",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v4/ocr_48px_ctc_mixed.ncnn.param",
+      "size": 18438,
+      "sha256": "32e298deca3acb8ba95897ca8cccbd028582ae42a697c3c05b4eaefe198309e3",
+      "license": "GPL-3.0",
+      "source": "https://github.com/zyddnys/manga-image-translator",
+      "note": "Mixed-precision param, the default on arm82 (asimdhp) CPUs: backbone convs fp16, transformer + char_pred forced to fp32 via per-layer featmask 31=7, with an explicit Cast (fp16 -> fp32) between them. Only valid with fp16 storage on the CPU — elsewhere the Cast would read fp32 as fp16, so the engine falls back to the plain param. Same .bin as the plain param (weight order unchanged)."
+    },
+    {
+      "role": "ocr",
+      "backend": "ncnn",
+      "name": "ocr_48px_ctc.ncnn.bin",
+      "url": "https://github.com/joyeli/yakuyomi-engine/releases/download/models-v4/ocr_48px_ctc.ncnn.bin",
+      "size": 83037664,
+      "sha256": "3e0a809441f5284871d18a3d757a7ec098c4b9ee64bdfd7ac776a84aa057c7a9",
+      "license": "GPL-3.0",
+      "source": "https://github.com/zyddnys/manga-image-translator",
+      "note": "Weights (fp16 storage, ~83 MB; the retired int8 ONNX was 44 MB). Shared by both OCR params — always ship it from the same conversion as the params."
     },
     {
       "role": "inpainter",

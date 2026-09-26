@@ -1,4 +1,4 @@
-# Desktop parity harness deps. Not shipped (the engine is pure Kotlin/NCNN/ONNX).
+# Desktop parity harness deps. Not shipped (the engine is pure Kotlin/NCNN).
 
 # ── Core — the per-stage and end-to-end parity scripts ──
 numpy
@@ -14,9 +14,11 @@ pytest          # run: pytest parity/
 # ── Model build (see docs/BUILD_MODELS.md) ──
 # ★ Pinned on purpose: reproducing the released weights **bit-for-bit** depends on this
 #   exact set (verified: torch 2.1.1 + pnnx 20260526 on x86 Linux reproduces the released
-#   DBNet and OCR int8 sha256 exactly). Other versions still yield numerically equivalent
-#   models — that is expected, not a failure. See docs/BUILD_MODELS.md for the criteria.
-torch==2.1.1            # export_dbnet_ncnn.py / export_aot_ncnn.py / export_ocr_onnx.py
+#   DBNet sha256 exactly, and likewise the OCR int8 ONNX that shipped before models-v4 — OCR
+#   now ships as NCNN (export_ocr_ncnn.py); the int8 ONNX path is retired but still rebuildable
+#   as a reference). Other versions still yield numerically equivalent models — that is
+#   expected, not a failure. See docs/BUILD_MODELS.md for the criteria.
+torch==2.1.1            # export_dbnet_ncnn.py / export_aot_ncnn.py / export_ocr_onnx.py / export_ocr_ncnn.py
 torchvision==0.16.1     # export_dbnet_ncnn.py — ResNet34 backbone
 onnx==1.17.0            # quantize_ocr_int8.py — quant_pre_process
 pnnx==1.0.20260526      # torch → ncnn. pip package: provides both the module and ~/.local/bin/pnnx

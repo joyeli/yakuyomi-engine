@@ -5,12 +5,6 @@ coreKtx = "1.13.1"
 appcompat = "1.7.0"
 lifecycle = "2.8.7"
 coroutines = "1.11.0"
-# ORT 刻意釘 1.20.0（2026-08-25 稽核 1.21–1.29 後拍板，見 memory ort-pin-1.20）：升級對我們零效能收益
-# （ARM int8 加速全在 SME/SME2 線，SD8G3 無 SME；我們的 U8U8/U8S8 QGEMM kernel 九版沒動）、
-# 代價 arm64 .so +11~14.5MB（1.24.1 起 WebGPU EP 焊死在 AAR）＋ 1.29.0 起 telemetry 預設開
-# （ContentProvider 自啟動+INTERNET 權限，與本專案無 telemetry 承諾衝突）。16KB page 對齊 1.20.0
-# 實測已達標、舊 opset 相容官方保證。再評估時機＝1.30（PR #31146 SVE i8mm int8 QGEMM 首次碰我們熱路徑）。
-onnxruntime = "1.20.0"
 okhttp = "5.3.2"
 
 [libraries]
@@ -18,9 +12,6 @@ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = 
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
-# 還原為精簡 AAR（QNN fp16 實測對本 float 模型不加速、op 回退 CPU＋多 7s 編譯＝更慢，已記 qnn-fp16-no-npu-accel）。
-# QNN 程式碼（OrtEp.applyEp / useQnn flag）保留為休眠（addQnn 在標準 API 即可編譯，runtime 無庫則退回 XNNPACK），未來若走 int8 再換回 -qnn。
-onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 [plugins]

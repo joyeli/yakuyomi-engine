@@ -1,6 +1,6 @@
 # Yakuyomi — 漫畫翻譯引擎
 
-偵測與去字在裝置上跑（NCNN）、OCR 也在裝置上（ONNX Runtime、int8），翻譯走雲端 LLM。預設日文翻繁體中文，來源與目標語言都可改。
+偵測、OCR、去字都在裝置上跑（全 NCNN），翻譯走雲端 LLM。預設日文翻繁體中文，來源與目標語言都可改。
 
 [English](README.md) ｜ 中文
 
@@ -18,12 +18,12 @@
 
 ## 這是什麼
 
-Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測與去字走 NCNN、OCR 走 ONNX Runtime、排版走 Canvas），只有翻譯連網：
+Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR、去字走 NCNN，排版走 Canvas），只有翻譯連網：
 
 ```
 頁 bitmap
   偵測  (NCNN)      文字行框 + 逐像素筆畫遮罩
-  OCR   (ONNX·int8) 每行一次前向  ->  原文
+  OCR   (NCNN)      每行一次前向  ->  原文
   分群              把對齊的行併成氣泡區塊
   翻譯  (LLM)       每頁一個請求
   去字  (NCNN)      抹掉原文（平塗，或 AOT-GAN 重建）
@@ -44,11 +44,11 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測與去�
 ## 目標
 
 - **速度優先於極致品質——這是為手機刻意做的權衡。** 一開始的直覺是追畫質：LaMa 去字、逐區原生解析度重建、最銳的去字。**在手機上那是死路**——那些每頁要好幾秒、吃掉好幾 GB 記憶體，reader 就卡住了。在終端裝置上，目標不是那最後幾個百分點的品質，而是**速度**：你在讀，頁就得出得來。所以每個階段都停在「品質/效率的拐點」、而非品質天花板：
-  - **OCR** int8 量化（ARM 上比 fp32 快 ~3.6×、96.7% parity、大小剩四分之一）。
-  - **偵測與去字** 走 NCNN 的手機核心（NEON/Winograd）。偵測器維持 fp16——int8 量化試過，完全吐不出框，在 ARM 上也沒有比較快。
+  - **OCR** 走 NCNN 混合精度——backbone fp16、transformer 頭 fp32。全 fp16 會把小假名讀錯（9 頁 242 行只讀對 219），它取代的那顆 int8 ONNX Runtime 模型也一樣（223/242）；混合精度讀對 241/242，還比那顆 int8 快 ~23%。
+  - **偵測與去字** 同樣走 NCNN 的手機核心（NEON/Winograd）。偵測器維持 fp16——int8 量化試過，完全吐不出框，在 ARM 上也沒有比較快。
   - **去字 tile 768** ——整頁 AOT-GAN，品質夠好、**又剛好藏在翻譯等待底下**（見「併發」）的那個點。更大的 tile 或逐區重建只是銳一咪咪、卻會戳出翻譯等待；LaMa 又慢又糊。**GPU/NPU 試過、對這些模型不管用**——NCNN 的 Vulkan 把 AOT-GAN 算成垃圾、LiteRT 根本編不出來——所以全部跑在 **CPU**，而 CPU 結果就夠了。
 
-  Snapdragon 8 Gen 3 上的實測：偵測 + OCR 在 **6 張代表頁上共 10.3 秒**——161 個偵測框、讀出 160（99.4%）。翻譯與去字在這之外，且兩者互相重疊（見「併發」）。記憶體峰值 ~1.9–2.1 GB——不用 GPU、遠不到 16 GB RAM。
+  Snapdragon 8 Gen 3 上的實測：偵測 + OCR 在 **6 張代表頁上共 10.3 秒**——161 個偵測框、讀出 160（99.4%）；那是用先前的 int8 OCR 量的，NCNN OCR 讓 OCR 那份再快 ~23%。翻譯與去字在這之外，且兩者互相重疊（見「併發」）。記憶體峰值 ~1.9–2.1 GB——不用 GPU、遠不到 16 GB RAM。
 - **併發，兩層。**
   - *頁內* ——去字只需要 OCR 過的區塊（LLM 回來前就知道），所以它在背景 coroutine 上跑、同時翻譯請求在飛；一頁只付兩者中較長的那個。（這也是為什麼失敗的區塊保留重貼的原文、而非原封的圖——把去字跟翻譯結果解耦，才能重疊。）
   - *跨頁* ——`translatePage` 可以對同一個 warm 引擎併發呼叫（共用偵測／OCR／翻譯／去字 session；真機 benchmark 過——不崩、不亂）。所以 reader 能做流水線：第 N 頁的網路翻譯，跟第 N+1 頁的裝置端 detect/OCR 重疊。搭配便宜的 box-fill 去字，流水線能撞到「網路上限」——淺深度（~4）下約 **2× 循序速度**。讀到的頁先是 box-fill 畫質、閒置時再升級成完整 AOT-GAN 去字（見下方重繪）。
@@ -62,7 +62,7 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測與去�
 ## 能做什麼
 
 - **偵測** — DBNet（ResNet34 + DB head，manga-image-translator 的 default detector）跑在 NCNN 上。它取代了 comic-text-detector，後者已整條移除：DBNet 在真機上**讀對的文字多 1.6–2.5×**。頁面以 resize_aspect 縮到 1024、再 pad 到 256 的倍數——**矩形**輸入，這也繞開了 ncnn 對 832–992 正方形尺寸的 heap corruption。回傳文字行四邊形，加一張逐像素筆畫遮罩，用來把去字限制在筆畫上。
-- **OCR** — 48px CTC 模型跑在 ONNX Runtime 上，**int8 動態量化**（ARM 快 ~3.6×、對 fp32 有 96.7% CTC parity、大小只剩四分之一）。每行一次前向、貪婪解碼、文字行並發辨識。跑純 CPU MLAS（XNNPACK 會算錯這個模型）。
+- **OCR** — 48px CTC 模型跑在 NCNN 上、**混合精度**：卷積 backbone 走 fp16、transformer 與字元頭走 fp32（ncnn 的逐層 featmask，中間插一個明確的 Cast 層）。正弦位置編碼每條字條現算、當第二個輸入餵進去而不是烤進圖裡，所以任何字條寬度都能跑。真機 242 行讀對 241 行、與 fp32 相同（int8 223、全 fp16 219——兩者都把小假名讀錯），比它取代的 int8 ONNX Runtime 模型快 ~23%。每行一次前向、貪婪解碼、文字行並發辨識。混合精度 param 需要 ARMv8.2 fp16 的 CPU；沒有的話引擎載原版 param、跑 fp32。
 - **翻譯** — 雲端 LLM，沿用 manga-image-translator 的行號協定。任何 OpenAI 相容服務商都行；預設選單涵蓋 manga-image-translator 那組（OpenAI、DeepSeek、Gemini、Groq、Qwen、Sakura、自訂）外加 OpenRouter，各家的模型清單即時撈取。預設 DeepSeek。引擎每頁送一個請求；把多頁並發跑（以及限流）是呼叫端的事——reader 用 semaphore 做，見上面的「併發」。某行翻譯失敗時退回原文，不會弄壞整頁。詳見 [docs/PROVIDERS_zh.md](docs/PROVIDERS_zh.md)。
 - **去字** — NCNN 上兩個模式。對話框一律平塗（乾淨、無黃暈），模式之間只差在壓在畫面上的字怎麼處理：
 
@@ -93,17 +93,17 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測與去�
 | 階段 | 模型 | 後端 | 來源 |
 |---|---|---|---|
 | 偵測 | DBNet，ResNet34 + DB head（`.ncnn.param`/`.bin`） | NCNN | 來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator)（它的 default detector） |
-| OCR | 48px CTC，int8 量化（`.onnx`） | ONNX Runtime | 權重來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
+| OCR | 48px CTC，fp16/fp32 混合精度（`.ncnn.param` ×2 + `.bin`） | NCNN | 權重來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | 去字 | AOT-GAN 漫畫 inpaint（`.ncnn.param`/`.bin`） | NCNN | 來自 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) |
 | 字型 | Noto Sans/Serif CJK、思源 | — | CJK 算繪（OFL / Apache） |
 
-NCNN 角色是 `.param` + `.bin` 成對（兩個都要）。整套約 208 MB，其中大半是 fp16 偵測器（153 MB）。
+全部都是 NCNN，`.param` + `.bin` 成對（都要）；OCR 是兩份 `.param`（原版與 `_mixed`）共用一份 `.bin`，引擎載入時自己挑。整套約 247 MB，大半是 fp16 偵測器（153 MB）與 fp16 的 OCR 權重（83 MB）。
 
 ## 試跑
 
-引擎是 Android library（arm64 NCNN + ONNX Runtime），所以要試跑就是把 sandbox app（`:app-sandbox`）編出來裝上去。**需要真的 arm64 Android 裝置**——sandbox 只打 `arm64-v8a`，x86 模擬器跑不起來。
+引擎是 Android library（arm64、NCNN），所以要試跑就是把 sandbox app（`:app-sandbox`）編出來裝上去。**需要真的 arm64 Android 裝置**——sandbox 只打 `arm64-v8a`，x86 模擬器跑不起來。
 
-**1. 拿模型。** 模型不在 repo 裡。把 [`models.json`](models.json) 列的五個檔抓下來——偵測器的 `.param`+`.bin` 在 `models-v3` release，OCR 的 `.onnx` 與去字的 `.param`+`.bin` 在 `models-v2`——全放進同一個手機讀得到的資料夾。來源、雜湊與授權見 [docs/MODELS_zh.md](docs/MODELS_zh.md)。
+**1. 拿模型。** 模型不在 repo 裡。把 [`models.json`](models.json) 列的六個檔抓下來——偵測器的 `.param`+`.bin` 在 `models-v3` release、OCR 的兩份 `.param`（原版與 `_mixed`）+ `.bin` 在 `models-v4`、去字的 `.param`+`.bin` 在 `models-v2`——全放進同一個手機讀得到的資料夾。來源、雜湊與授權見 [docs/MODELS_zh.md](docs/MODELS_zh.md)。
 
 **2.（選配）給 LLM key。** 把 `api-keys.properties.example` 複製成 `api-keys.properties`、填入 `DEEPSEEK_API_KEY`。**不給也沒關係，翻譯那步會自動跳過**——偵測、OCR、去字照跑，一樣看得到 pipeline 在做什麼。
 
@@ -140,7 +140,7 @@ reader app（Yakuyomi）在另一個 fork repo。
 
 - [mihon](https://github.com/mihonapp/mihon) — app fork 的來源（Apache-2.0）
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — prompt 與行為參考；DBNet 偵測、OCR 與 AOT-GAN 去字模型權重
-- [ncnn](https://github.com/Tencent/ncnn) — 偵測與去字的裝置端推論 runtime
+- [ncnn](https://github.com/Tencent/ncnn) — 三顆模型的裝置端推論 runtime
 - Noto Sans/Serif CJK、思源 — 字型
 
 ## 授權
@@ -150,7 +150,6 @@ reader app（Yakuyomi）在另一個 fork repo。
 各組件授權：
 - [manga-image-translator](https://github.com/zyddnys/manga-image-translator) — GPL-3.0（prompt/協定、偵測/OCR/去字行為、文字行分組；DBNet 偵測模型、48px CTC OCR 模型與 AOT-GAN 去字模型）
 - [ncnn](https://github.com/Tencent/ncnn) — BSD-3-Clause（推論 runtime，靜態連結）
-- [ONNX Runtime](https://github.com/microsoft/onnxruntime) — MIT（OCR 推論 runtime）
 - [mihon](https://github.com/mihonapp/mihon) — Apache-2.0（reader fork 在另一個產品 repo；Apache-2.0 與 GPL-3.0 相容，故組合後的 app 為 GPL-3.0）
 
-模型權重皆 GPL-3.0，透過本 repo 的 release **散布**供一鍵自動下載——manifest 是 [`models.json`](models.json)，指向 [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3) 的偵測器，以及 [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) 裡未變動的 OCR 與去字檔（見 [docs/MODELS_zh.md](docs/MODELS_zh.md)）；也可從上述來源自備。字型未 bundle（系統 CJK fallback）。
+模型權重皆 GPL-3.0，透過本 repo 的 release **散布**供一鍵自動下載——manifest 是 [`models.json`](models.json)，指向 [`models-v3`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v3) 的偵測器、[`models-v4`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v4) 的 OCR，以及 [`models-v2`](https://github.com/joyeli/yakuyomi-engine/releases/tag/models-v2) 裡未變動的去字檔（見 [docs/MODELS_zh.md](docs/MODELS_zh.md)）；也可從上述來源自備。字型未 bundle（系統 CJK fallback）。
