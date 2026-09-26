@@ -4,17 +4,18 @@
 
 repo   = https://github.com/zyddnys/manga-image-translator
 branch = main
-commit = 95227a2  # 2026-07-28 查核：自 efdc229 起 4 個 commit 全為本機 offline MT
-                  # （M2M100 走 HuggingFace + CUDA/ROCm、NLLB 修正），watched paths 僅
-                  # config.py 加兩個 m2m100_hf enum 值；chatgpt.py / 偵測 / OCR / 去字
-                  # 零變更 ⇒ 判定無需 port（我們走雲端 LLM，CUDA/ROCm 對 Android 無意義）。
-                  # 2026-08-25 再查：main 仍 = 95227a2（靜止逾月）、其餘分支皆 2021–23 廢棄
-                  # WIP、無新 tag/模型。開放 PR 掃過：#1166（Groq 退役預設 mixtral →
-                  # gpt-oss-20b，未合）→ 我方 preset 早已是 gpt-oss-120b、另借此把 Groq
-                  # 四顆到期停役 id + mixtral 收進 RETIRED_MODELS 自動遷移；#1043 panel
-                  # detection 仍未合（panel-order 維持「決定不做」）；其餘（越南語 UI/
-                  # server 安全修/offline MT）皆非 watched 範圍 ⇒ 無需 port、pin 不動。
-date   = 2026-08-25
+commit = 441d07c  # 2026-09-26 查核：自 95227a2 起 4 個 commit（#1170 web UI 深色模式、#1171 web 批次佇列
+                  # 429 指數退避重試）全在 server/index.html，watched paths 零變更（diff --stat 空；
+                  # index.html diff 亦無夾帶 detector/ocr/inpaint/translator 預設值）⇒ 無需 port。
+                  # 模型：beta-0.3 資產無更新（detect-20241225.ckpt 仍 2024-12-26）、無新 tag。
+                  # 開放 PR：#1148「New wrap」（MERGEABLE 未合）碰 config.py/detection/generic.py/
+                  # rendering/custom_openai.py＝新 yolomanga 偵測器（非預設）、SD-ControlNet 去字（GPU）、
+                  # font_path、貼邊空 crop 守衛（我方 Ocr.kt 已 clamp）⇒ 合入 main 後再看；#1168 為外部
+                  # repo 誤基的巨型 PR（CONFLICTING）不理；#1166／#1043 狀態未變。issue #1163 有人問
+                  # detect-20241225.ckpt 授權來源（維護者 0 回覆）⇒ 若另給 grant 需更新我方授權段。
+                  # （前次：2026-07-28 efdc229→95227a2 全為 offline MT；2026-08-25 main 靜止、Groq
+                  #  退役 id 收進 RETIRED_MODELS；皆無需 port。）
+date   = 2026-09-26
 
 # watched paths（最新 layout）：
 #   偵測 = manga_translator/detection/default.py (+ default_utils/)  ← DBNet（m-i-t 的 default 偵測器）
