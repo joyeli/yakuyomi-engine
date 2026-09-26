@@ -105,7 +105,7 @@ The engine is an Android library (arm64, NCNN), so trying it means building the 
 
 **1. Get the models.** They aren't in the repo. Fetch the six files listed in [`models.json`](models.json) — the detector `.param`+`.bin` from the `models-v3` release, the OCR `.param` (plain and `_mixed`) + `.bin` from `models-v4`, and the inpaint `.param`+`.bin` from `models-v2` — and put them all in one folder the phone can read. Details, checksums and licensing: [docs/MODELS.md](docs/MODELS.md).
 
-**2. (Optional) Add an LLM key.** Copy `api-keys.properties.example` to `api-keys.properties` and fill in `DEEPSEEK_API_KEY`. **Skip this and translation is simply skipped** — you still get detection, OCR and text removal, which is enough to watch the pipeline work.
+**2. (Optional) Add an LLM key.** Enter your DeepSeek key in the sandbox app itself (the field under the model-folder button; it is stored in the app's preferences — the APK never embeds a key). **Skip this and translation is simply off**: detection, OCR and text removal still run. `api-keys.properties` (copied from `api-keys.properties.example`) is only read by the desktop parity scripts.
 
 **3. Build and install.**
 

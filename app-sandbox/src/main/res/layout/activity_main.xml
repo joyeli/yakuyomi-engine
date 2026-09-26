@@ -18,7 +18,7 @@
             android:layout_height="wrap_content"
             android:text="選擇模型資料夾（dbnet／ocr_48px_ctc／aot 的 .ncnn.param+.bin）" />
 
-        <!-- LLM key：app 內輸入、存 prefs；留空＝用 build 時注入的 api-keys.properties（會過期，2026-09-26 就撞過 401） -->
+        <!-- LLM key：只在 app 內輸入、存 prefs。APK 不再於 build 時注入（防外流）；沒填就不翻譯 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -30,7 +30,7 @@
                 android:layout_width="0dp"
                 android:layout_weight="1"
                 android:layout_height="wrap_content"
-                android:hint="DeepSeek API key（留空＝用 build 內建）"
+                android:hint="DeepSeek API key（APK 不內建，翻譯前先填）"
                 android:inputType="textPassword"
                 android:importantForAutofill="no"
                 android:singleLine="true" />

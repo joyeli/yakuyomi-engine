@@ -83,7 +83,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         binding.pickFolderButton.setOnClickListener { folderPicker.launch(null) }
-        // LLM key：app 內可輸入/覆蓋（存 prefs）；留空存檔＝清掉、退回 build 內建的 key
+        // LLM key：只能在 app 內輸入（存 prefs）；APK 不內建、留空存檔＝清掉（之後只跑偵測/OCR/去字、不翻譯）
         binding.apiKeyInput.setText(prefs.getString(PREF_API_KEY, "") ?: "")
         binding.apiKeySaveButton.setOnClickListener {
             val k = binding.apiKeyInput.text.toString().trim()
@@ -117,15 +117,13 @@ class MainActivity : AppCompatActivity() {
      * backtrace）落成模型夾裡的 `<stamp>_exit.txt`——無 adb 時唯一能拿到 SIGSEGV/abort 堆疊的路（照 fork 的
      * NativeCrashReporter）。同一次死亡只寫一次（prefs 記時間戳）。
      */
-    /** 翻譯用的 LLM key：prefs 有存就用它，否則 build 時注入的 api-keys.properties（可能過期）。 */
-    private fun apiKey(): String = prefs.getString(PREF_API_KEY, null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEEPSEEK_API_KEY
+    /** 翻譯用的 LLM key：只認 app 內輸入的（prefs）。APK 不再內建任何 key（防外流）；空＝引擎不翻譯（只跑偵測/OCR/去字）。 */
+    private fun apiKey(): String = prefs.getString(PREF_API_KEY, null)?.trim().orEmpty()
 
-    /** key 來源＋尾四碼（log/Toast 對帳用，不印全文）。 */
+    /** key 狀態＋尾四碼（log/Toast 對帳用，不印全文）。 */
     private fun keyLabel(): String {
-        val saved = prefs.getString(PREF_API_KEY, null)?.takeIf { it.isNotBlank() }
-        val k = saved ?: BuildConfig.DEEPSEEK_API_KEY
-        if (k.isBlank()) return "無（不翻譯）"
-        return "${if (saved != null) "app 內存的" else "build 內建"} ****${k.takeLast(4)}"
+        val k = apiKey()
+        return if (k.isBlank()) "無（未輸入，不翻譯）" else "app 內存的 ****${k.takeLast(4)}"
     }
 
     private fun dumpLastExit(tree: DocumentFile?) {

@@ -42,7 +42,7 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      # api-keys.properties / local.properties 都 gitignored；缺檔時 build 已有後備
+      # local.properties gitignored、缺檔時 build 已有後備；api-keys.properties 已不再被 build 讀（key 只在 app 內輸入）
       # （api key → 空字串、SDK 路徑 → ANDROID_HOME），故 CI 不需提供即可編譯。
       - name: Assemble (compile check)
         run: ./gradlew :engine:assembleDebug :app-sandbox:assembleDebug --no-daemon --stacktrace

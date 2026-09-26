@@ -105,7 +105,7 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 
 **1. 拿模型。** 模型不在 repo 裡。把 [`models.json`](models.json) 列的六個檔抓下來——偵測器的 `.param`+`.bin` 在 `models-v3` release、OCR 的兩份 `.param`（原版與 `_mixed`）+ `.bin` 在 `models-v4`、去字的 `.param`+`.bin` 在 `models-v2`——全放進同一個手機讀得到的資料夾。來源、雜湊與授權見 [docs/MODELS_zh.md](docs/MODELS_zh.md)。
 
-**2.（選配）給 LLM key。** 把 `api-keys.properties.example` 複製成 `api-keys.properties`、填入 `DEEPSEEK_API_KEY`。**不給也沒關係，翻譯那步會自動跳過**——偵測、OCR、去字照跑，一樣看得到 pipeline 在做什麼。
+**2.（選配）給 LLM key。** 在 sandbox app 裡填 DeepSeek key（模型資料夾按鈕下方那格，存在 app 的偏好設定——APK 不內建任何 key）。**不給也沒關係**：翻譯就是關著，偵測／OCR／去字照跑。`api-keys.properties`（由 `api-keys.properties.example` 複製）只有桌面 parity 腳本會讀。
 
 **3. 編譯安裝。**
 
