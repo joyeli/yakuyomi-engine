@@ -444,7 +444,10 @@ class MainActivity : AppCompatActivity() {
                 val ocrCfg = OcrConfig()
                 log("▶ 偵測+OCR 檢驗（${pages.size} 內建圖）｜產品設定：DBNet @${detCfg.dbnetInputSize}、" +
                     "OCR stripPad=${ocrCfg.stripPad} bicubic=${ocrCfg.useBicubic} minProb=${ocrCfg.minProb}"); writeLog()
+                val tOL0 = System.currentTimeMillis()
                 val ocr = Ocr(ocrLocal, alphabet, ocrCfg)
+                ocr.warmUp() // 暖機不計時（產品引擎常駐；第一頁才不會把冷啟算進 OCR）
+                log("OCR 載入+暖機 ${"%.1f".format((System.currentTimeMillis() - tOL0) / 1000.0)}s［${ocr.backend}］（不計入下列每頁）"); writeLog()
                 try {
                     Detector(dbnetPath, detCfg).use { det ->
                         det.detect(pages[0].second).textMask.recycle() // warm（丟，不計時）
@@ -519,17 +522,26 @@ class MainActivity : AppCompatActivity() {
                 val tf = runCatching { Typeface.createFromAsset(assets, FONT) }.getOrNull()
 
                 // 共用前段（3 模式共用、只跑一次）：偵測→OCR→分群→翻譯→過濾；逐階段計時供總表。
+                // ★ 暖機後才計時：產品是常駐引擎，每頁成本＝暖機後的 forward；模型載入＋冷啟另外印（之前把 83MB OCR 載入
+                //   和第一次 forward 都算進「辨識」，圖上 1.4 s 對不上 A/B 暖機後的 1.26 s）。
+                val tDL0 = System.currentTimeMillis()
                 val detector = Detector(detPath) // NCNN 偵測（.param→NCNN 後端）
+                detector.warmUp()
+                val tDetLoad = System.currentTimeMillis() - tDL0
                 val tD0 = System.currentTimeMillis()
                 val detection = detector.detect(page)
                 val tDetect = System.currentTimeMillis() - tD0
                 detector.close()
-                val tO0 = System.currentTimeMillis()
+                val tOL0 = System.currentTimeMillis()
                 val ocr = Ocr(ocrPath, alphabet, OcrConfig()) // 並發鎖最優預設(concurrent/8)
+                ocr.warmUp()
+                val tOcrLoad = System.currentTimeMillis() - tOL0
+                val tO0 = System.currentTimeMillis()
                 ocr.recognize(page, detection.lines)
                 ocr.close()
                 val regions = Grouping.group(detection.lines)
                 val tOcr = System.currentTimeMillis() - tO0
+                log("模型載入+暖機（不計入表）：偵測 ${"%.1f".format(tDetLoad / 1000.0)}s、OCR ${"%.1f".format(tOcrLoad / 1000.0)}s［${ocr.backend}］")
                 val tT0 = System.currentTimeMillis()
                 val translator = LlmTranslator(apiKey(), TranslatorConfig())
                 val cht = translator.translate(regions.map { it.sourceText })
@@ -1236,7 +1248,7 @@ class MainActivity : AppCompatActivity() {
             "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · $soc · %d核 · %.1fGB".format(cores, ramGB),
             "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) · $abi",
             "效能：OCR並發 x%d · 偵測/去字/OCR 全 NCNN CPU（OCR mixed：backbone fp16＋transformer fp32）".format(OcrConfig().concurrency),
-            "去字與翻譯並發重疊 → 整張＝牆鐘(非各段相加)",
+            "去字與翻譯並發重疊 → 整張＝牆鐘(非各段相加) · 各段皆暖機後計時（引擎常駐時的每頁成本）",
             "LLM：${tc.provider} · ${tc.model}",
         )
     }
@@ -1518,7 +1530,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val BUILD_TAG = "v2.5-nokey" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
+        private const val BUILD_TAG = "v2.6-warm" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
         private const val PREF_LAST_EXIT = "last_exit_ts_v2" // v2＝raw .pb 版；換 key 讓上一版毀掉的那次 crash 重吐一次
         // NCNN 推論由引擎 NcnnBackend（libyakuyomi_ncnn）負責；sandbox 不再自帶 benchmark 用的 libncnn_jni。
 
