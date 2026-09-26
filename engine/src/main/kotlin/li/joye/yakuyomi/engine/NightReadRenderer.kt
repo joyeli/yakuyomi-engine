@@ -102,6 +102,11 @@ object NightReadRenderer {
      * 一條龍：（必要時縮圖）→ [Detector.detect] → [CharSegmenter.segment] → [NightRead.render] → 新 ARGB_8888 Bitmap。
      * [page] 所有權不變（不 recycle）；內部產生的 [Detection.textMask] 與縮圖用完自己 recycle。
      * 回傳的 Bitmap 尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]）。
+     *
+     * [extraLines]：呼叫端另外知道的文字行（**[page] 座標**；縮圖時一併等比縮），與偵測結果聯集後才分群成文字區。
+     * 用途＝譯後頁：翻譯素材裡的原文行框比譯文大、也涵蓋 DBNet 對短譯文抓不到的泡（「咦」「是的」），併進來
+     * 既補偵測漏、又把「泡面積：字框長邊²」的分母拉大（見 nightread docs/DECISIONS「譯後頁的泡」）。
+     * 只影響文字區（bbox）；筆畫遮罩仍是偵測器對這頁的輸出。
      */
     fun render(
         page: Bitmap,
@@ -109,19 +114,31 @@ object NightReadRenderer {
         charSeg: CharSegmenter,
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
+        extraLines: List<TextLine> = emptyList(),
     ): Bitmap {
         val work = scaleToBudget(page, stats)
         try {
             var t = System.nanoTime()
-            val detection = detector.detect(work)
+            val detected = detector.detect(work)
             stats?.detectMs = (System.nanoTime() - t) / 1_000_000
+            val detection = if (extraLines.isEmpty()) {
+                detected
+            } else {
+                val s = work.width.toFloat() / page.width
+                val extra = if (s == 1f) {
+                    extraLines
+                } else {
+                    extraLines.map { l -> TextLine(l.quad.map { Pt(it.x * s, it.y * s) }, l.score) }
+                }
+                Detection(detected.lines + extra, detected.textMask)
+            }
             try {
                 t = System.nanoTime()
                 val chars = charSeg.segment(work)
                 stats?.maskMs = (System.nanoTime() - t) / 1_000_000
                 return render(work, detection, chars, params, stats)
             } finally {
-                detection.textMask.recycle()
+                detected.textMask.recycle()
             }
         } finally {
             if (work !== page) work.recycle()
