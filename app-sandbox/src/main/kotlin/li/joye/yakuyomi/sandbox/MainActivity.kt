@@ -83,6 +83,13 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         binding.pickFolderButton.setOnClickListener { folderPicker.launch(null) }
+        // LLM key：app 內可輸入/覆蓋（存 prefs）；留空存檔＝清掉、退回 build 內建的 key
+        binding.apiKeyInput.setText(prefs.getString(PREF_API_KEY, "") ?: "")
+        binding.apiKeySaveButton.setOnClickListener {
+            val k = binding.apiKeyInput.text.toString().trim()
+            prefs.edit().apply { if (k.isEmpty()) remove(PREF_API_KEY) else putString(PREF_API_KEY, k) }.apply()
+            Toast.makeText(this, "LLM key → ${keyLabel()}", Toast.LENGTH_SHORT).show()
+        }
         binding.detectButton.setOnClickListener { runPipeline() }
         binding.inpaintCompareButton.setOnClickListener { runInpaintCompare() }
         binding.repoDemoButton.setOnClickListener { runRepoDemo() }
@@ -110,6 +117,17 @@ class MainActivity : AppCompatActivity() {
      * backtrace）落成模型夾裡的 `<stamp>_exit.txt`——無 adb 時唯一能拿到 SIGSEGV/abort 堆疊的路（照 fork 的
      * NativeCrashReporter）。同一次死亡只寫一次（prefs 記時間戳）。
      */
+    /** 翻譯用的 LLM key：prefs 有存就用它，否則 build 時注入的 api-keys.properties（可能過期）。 */
+    private fun apiKey(): String = prefs.getString(PREF_API_KEY, null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEEPSEEK_API_KEY
+
+    /** key 來源＋尾四碼（log/Toast 對帳用，不印全文）。 */
+    private fun keyLabel(): String {
+        val saved = prefs.getString(PREF_API_KEY, null)?.takeIf { it.isNotBlank() }
+        val k = saved ?: BuildConfig.DEEPSEEK_API_KEY
+        if (k.isBlank()) return "無（不翻譯）"
+        return "${if (saved != null) "app 內存的" else "build 內建"} ****${k.takeLast(4)}"
+    }
+
     private fun dumpLastExit(tree: DocumentFile?) {
         if (tree == null || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return
         runCatching {
@@ -251,7 +269,7 @@ class MainActivity : AppCompatActivity() {
                 log("後端：偵測=NCNN｜去字=NCNN AOT｜OCR=NCNN（CPU 有 asimdhp 就載 mixed 精度）")
                 val models = ModelSet(ocr = ocrNcnn, detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
                 log("✓ 模型就緒，開跑")
-                Yakuyomi.create(models, alphabet, BuildConfig.DEEPSEEK_API_KEY, cfg, tf).use { engine ->
+                Yakuyomi.create(models, alphabet, apiKey(), cfg, tf).use { engine ->
                     var total = 0L
                     imgs.forEachIndexed { i, asset ->
                         val tag = "圖${sel[i] + 1}"
@@ -496,6 +514,7 @@ class MainActivity : AppCompatActivity() {
                     log("✗ 模型不齊（需 dbnet + ocr_48px_ctc 的 .ncnn.param/.bin）"); return@launch
                 }
                 val orient = TextOrientation.AUTO // 鎖定
+                log("LLM key：${keyLabel()}")
                 log("▶ 去字全比較（原圖/偵測/遮罩/最佳成果 + 全去字法 boxfill·auto·AOT + 時間表）— $imgPath（需連網翻譯）")
                 val page = loadAssetBitmap(imgPath)
                 val alphabet = assets.open(ALPHABET).bufferedReader().use { it.readLines() }
@@ -514,7 +533,7 @@ class MainActivity : AppCompatActivity() {
                 val regions = Grouping.group(detection.lines)
                 val tOcr = System.currentTimeMillis() - tO0
                 val tT0 = System.currentTimeMillis()
-                val translator = LlmTranslator(BuildConfig.DEEPSEEK_API_KEY, TranslatorConfig())
+                val translator = LlmTranslator(apiKey(), TranslatorConfig())
                 val cht = translator.translate(regions.map { it.sourceText })
                 regions.forEachIndexed { j, r -> r.translatedText = cht.getOrElse(j) { r.sourceText } }
                 // 等效 engine TextFilter（internal 跨不過 module）：空白/純數字/譯==原 就丟（filterText 此處 null、略過 regex）
@@ -679,7 +698,7 @@ class MainActivity : AppCompatActivity() {
                 val ocr = Ocr(ocrPath, alphabet, OcrConfig())
                 ocr.recognize(page, detection.lines); ocr.close()
                 val regions = Grouping.group(detection.lines)
-                val translator = LlmTranslator(BuildConfig.DEEPSEEK_API_KEY, TranslatorConfig())
+                val translator = LlmTranslator(apiKey(), TranslatorConfig())
                 val cht = translator.translate(regions.map { it.sourceText })
                 regions.forEachIndexed { j, r -> r.translatedText = cht.getOrElse(j) { r.sourceText } }
                 val kept = regions.filter { r ->
@@ -1436,8 +1455,9 @@ class MainActivity : AppCompatActivity() {
                 val cfg = EngineConfig(inpainter = InpainterConfig(method = method, tileSize = 768))
                 val models = ModelSet(ocr = ocrNcnn, detectorNcnn = detNcnn, aotInpainterNcnn = aotNcnn)
                 val page = loadAssetBitmap(imgPath)
+                log("LLM key：${keyLabel()}")
                 log("▶ 跨頁吞吐測試（同一圖·併發 D=1→5·需連網翻譯·去字=$methodLabel）— $imgPath")
-                Yakuyomi.create(models, alphabet, BuildConfig.DEEPSEEK_API_KEY, cfg, tf).use { engine ->
+                Yakuyomi.create(models, alphabet, apiKey(), cfg, tf).use { engine ->
                     engine.translatePage(page) // 熱身（載模型/暖快取），不計時
                     log("  熱身完成，開始 D 掃描（每頁＝總時間/D；D 併發同時翻同一圖）")
                     for (d in 1..5) {
@@ -1500,11 +1520,12 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val BUILD_TAG = "v2.3-ncnn-only" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
+        private const val BUILD_TAG = "v2.4-key" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
         private const val PREF_LAST_EXIT = "last_exit_ts_v2" // v2＝raw .pb 版；換 key 讓上一版毀掉的那次 crash 重吐一次
         // NCNN 推論由引擎 NcnnBackend（libyakuyomi_ncnn）負責；sandbox 不再自帶 benchmark 用的 libncnn_jni。
 
         private const val PREF_TREE = "modelTree"
+        private const val PREF_API_KEY = "llmApiKey" // app 內輸入的 LLM key（覆蓋 build 內建）
         // 去字兩門別：0 快速去字（BoxFill·就近取色平塗）/ 1 AI 去字（AOT-GAN 重建背景·整頁 768·預設）
         private val INPAINT_MODES = listOf(
             "快速去字（極速·低質）",
