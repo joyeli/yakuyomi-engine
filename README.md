@@ -14,6 +14,7 @@ This repo is the **engine** (`yakuyomi-engine`) — the translation library, not
 |---|---|
 | **See it run** | [**Try it**](#try-it) below — build the sandbox app, put it on an arm64 phone, watch a page go through the pipeline. An LLM key is optional: without one, translation is skipped and you still get detection, OCR and text removal. |
 | **Integrate the engine into your app** | [**`engine/README.md`**](engine/README.md) — the API surface: `translatePage`, getting the models in, configuration, result handling, threading. |
+| **Use night reading only, without translation** | [**`nightread-android/README.md`**](nightread-android/README.md) — the night-read module depends on the shared inference core, not on the translation engine: adding it to an app, the two model roles it needs, threading and memory. |
 | **Rebuild the models yourself** | [**`docs/BUILD_MODELS.md`**](docs/BUILD_MODELS.md) — from the upstream checkpoints, with the traps and the verification criteria. Advanced: ours are downloadable, so you never need this to *use* the engine. |
 
 ## What it is
@@ -74,7 +75,7 @@ Two layers of concurrency. *Within a page*, text removal (CPU) overlaps the tran
 - **Typesetting** — text-box layout, vertical or horizontal, with adaptive font size, vertical centering, outline scaled to the font, line-head kinsoku, and tilt-aware placement (text follows a slanted bubble's angle). Text colour is chosen from the cleaned background (black on light, white on dark).
 - **Re-rendering (analyze | render split)** — a translated page comes back with its analysis: the text mask, plus the regions carrying their source and target text. The text-removal method can then be changed and the page re-typeset without re-running detection, OCR, or the LLM — switching removal mode or upgrading quality costs only the removal and typeset stages, no tokens.
 - **Languages** — Japanese to Traditional Chinese out of the box. Set a different target, source, and few-shot example for any pair. Traditional-Chinese output relies on the prompt; there is no OpenCC post-processing.
-- **Night reading (in progress)** — darkens the page itself while protecting the characters, using the same detector plus two on-device character segmenters (YOLO11-seg ∪ CartoonSegmentation, on NCNN); off by default, reader integration still in progress — see [docs/MODELS.md](docs/MODELS.md#night-reading-models).
+- **Night reading (in progress)** — darkens the page itself while protecting the characters, using the same detector plus two on-device character segmenters (YOLO11-seg ∪ CartoonSegmentation, on NCNN); off by default, reader integration still in progress — see [docs/MODELS.md](docs/MODELS.md#night-reading-models). It is a separate module, [`:nightread-android`](nightread-android/README.md), usable without the translation engine.
 
 ## Repository layout
 
@@ -82,8 +83,10 @@ Two repos:
 
 | Repo | Role |
 |---|---|
-| `yakuyomi-engine` (this one) | the engine: `:engine` (the pipeline, exposing only `translatePage`), a `:app-sandbox` for exercising it on a device, and the `parity/` desktop validation harness. No reader code. |
+| `yakuyomi-engine` (this one) | the engine, as five parts: `:inference-core` (the NCNN native layer, DBNet detection, grouping, model download), `:engine` (the translation pipeline, exposing only `translatePage`), `:nightread-android` (night reading; does not depend on `:engine`), a `:app-sandbox` for exercising them on a device, and the `parity/` desktop validation harness. No reader code. |
 | `Yakuyomi` (a mihon fork) | the reader app: mihon with the download hook, translation settings, and model management. Consumes the engine as a git submodule via Gradle `includeBuild`. |
+
+`:engine` and `:nightread-android` both depend on `:inference-core` through `api` and not on each other, so either can be taken without the other. `libyakuyomi_ncnn.so` is built only by `:inference-core`: NCNN is linked statically, and a second copy would mean a second thread pool and a second inference lock. The night-read algorithm itself is the pure-Kotlin [yakuyomi-nightread](https://github.com/joyeli/yakuyomi-nightread) library, included here as a submodule.
 
 The engine stays reader-agnostic so it can be tested on its own; the app is a real mihon fork. Engine work is committed here, and the app bumps the submodule pointer.
 
@@ -109,7 +112,7 @@ The engine is an Android library (arm64, NCNN), so trying it means building the 
 
 **2. (Optional) Add an LLM key.** Enter your DeepSeek key in the sandbox app itself (the field under the model-folder button; it is stored in the app's preferences — the APK never embeds a key). **Skip this and translation is simply off**: detection, OCR and text removal still run. `api-keys.properties` (copied from `api-keys.properties.example`) is only read by the desktop parity scripts.
 
-**3. Build and install.**
+**3. Build and install.** The night-read library is a git submodule and the build needs it, so clone with `--recursive` (or run `git submodule update --init --recursive` in an existing clone).
 
 ```
 ./gradlew :app-sandbox:assembleDebug

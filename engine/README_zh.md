@@ -8,7 +8,9 @@
 
 > **這頁是整合指南。** 如果你只想**先看它跑**，[repo README](../README_zh.md#試跑) 有一條路：把 sandbox app 編出來裝到手機上，不必整合任何東西。如果你想自己從上游 checkpoint 把模型轉出來，那是 [docs/BUILD_MODELS_zh.md](../docs/BUILD_MODELS_zh.md)。
 
-Group：`li.joye.yakuyomi:engine`。Min SDK 26。
+Group：`li.joye.yakuyomi:engine`。Min SDK 26。只出 arm64-v8a。
+
+引擎 repo 有三個函式庫模組。`:engine`（這個）是翻譯，用 `api` 依賴 [`:inference-core`](../inference-core/README_zh.md)：NCNN 原生層（`libyakuyomi_ncnn.so`）、DBNet 偵測（`Detector`、`DetectorConfig`）、分群（`TextLine`、`TextRegion`）和 `ModelDownloader` 都在那裡，這些型別也出現在本模組的 API 上。夜讀是第三個模組 [`:nightread-android`](../nightread-android/README_zh.md)；`:engine` 不依賴它，它也不依賴 `:engine`。兩個都要的 app 就兩個都宣告。
 
 ## 快速開始
 
@@ -45,7 +47,7 @@ Yakuyomi.create(models, alphabet, apiKey).use { engine ->
 
 引擎不帶模型權重——把模型弄到裝置上有兩條路。
 
-**自動下載。** 引擎自己會抓：`ModelDownloader` 讀本 repo 的 [`models.json`](../models.json) manifest、把每個檔下載到你指定的資料夾、並逐檔驗 sha256（已存在且驗過的會跳過）。reader app 走的就是這條。
+**自動下載。** 引擎自己會抓：`ModelDownloader`（在 `:inference-core`，經 `api` 在這裡可用）讀本 repo 的 [`models.json`](../models.json) manifest、把每個檔下載到你指定的資料夾、並逐檔驗 sha256（已存在且驗過的會跳過）。reader app 走的就是這條。
 
 ```kotlin
 val remote = ModelDownloader.fetchManifest()        // 預設抓本 repo main 上的 models.json
@@ -58,7 +60,7 @@ val models = ModelSet.resolve(dir.listFiles()!!.map { it.name to it.absolutePath
 
 **自備模型（BYOM）。** 或自己放檔——放在任何本機路徑，讓 `ModelSet.resolve` 按檔名比對，或明確指定各角色（見[快速開始](#快速開始)）。
 
-兩條路要的是同樣那六個檔（翻譯），全走 NCNN（`.param` + `.bin`，兩個都要；OCR 有兩份 `.param`——一般版與 `_mixed`——共用一份 `.bin`），外加選配的四個檔（夜讀）：
+兩條路要的是同樣那六個檔（翻譯），全走 NCNN（`.param` + `.bin`，兩個都要；OCR 有兩份 `.param`——一般版與 `_mixed`——共用一份 `.bin`），外加選配的四個檔（夜讀；給 `:nightread-android` 用，本模組不用）：
 
 | 角色 | 檔名（常見） | 後端 | 做什麼 | 來源 |
 |---|---|---|---|---|
@@ -68,7 +70,7 @@ val models = ModelSet.resolve(dir.listFiles()!!.map { it.name to it.absolutePath
 | charseg（yolo）→ `charSegYoloNcnn` | `manga_seg_s.ncnn.param`（+ `.bin`） | NCNN | 夜讀用的人物遮罩（YOLO11-seg，只取人物類）——選配 | 權重來自 Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)；非 GPL，見 [docs/MODELS_zh.md](../docs/MODELS_zh.md#夜讀模型) |
 | charseg（cseg）→ `charSegCsegNcnn` | `cartoonseg.ncnn.param`（+ `.bin`） | NCNN | 夜讀用的人物遮罩（CartoonSegmentation RTMDet-Ins）——選配 | 權重來自 Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)；非 GPL，見 [docs/MODELS_zh.md](../docs/MODELS_zh.md#夜讀模型) |
 
-`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.param` 含 `ocr` 是 OCR（兩份 OCR param 給哪份都行——`Ocr` 查過 CPU 後自己切到 `_mixed` 或切回來）。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。另外兩個關鍵字是選配：`.param` 含 `manga_seg` → `charSegYoloNcnn`、含 `cartoonseg` → `charSegCsegNcnn`。缺了不會讓 `resolve` 回 `null`——翻譯就緒不看夜讀模型——欄位就只是 `null`，`NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)` 拿手上有的建分割器（兩顆 → 聯集、一顆 → 那顆、零顆 → `null`、夜讀不可用）。注意每個角色都要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin`（OCR 還有另一份 `.param`）請自行確保放在旁邊。
+`ModelSet.resolve(files)` 把一份扁平的 `(檔名, 本機路徑)` 清單按檔名加副檔名對到各角色：`.param` 含 `dbnet` 是偵測器、`.param` 含 `aot` 是去字、`.param` 含 `ocr` 是 OCR（兩份 OCR param 給哪份都行——`Ocr` 查過 CPU 後自己切到 `_mixed` 或切回來）。三顆少任一就回 `null`——拿這個當「能翻了嗎？」的檢查。另外兩個關鍵字是選配：`.param` 含 `manga_seg` → `charSegYoloNcnn`、含 `cartoonseg` → `charSegCsegNcnn`。缺了不會讓 `resolve` 回 `null`——翻譯就緒不看夜讀模型——欄位就只是 `null`。這兩欄只是讓同一份資料夾清單兩個模組都能用：夜讀在 `:nightread-android`，由它拿這兩個路徑建分割器（見[它的 README](../nightread-android/README_zh.md)）。注意每個角色都要兩個檔：`resolve` 只看得到 `.param`，對應的 `.bin`（OCR 還有另一份 `.param`）請自行確保放在旁邊。
 
 路徑必須是本機檔，不能是 SAF/content URI：後端直接從路徑載進 native 記憶體。別用 `readBytes()` 把權重讀進 JVM heap；heap 上限約 512MB（跟裝置 RAM 無關）會 OOM。來源是 SAF 的話，先複製到 `filesDir` 再傳路徑。
 
@@ -95,7 +97,7 @@ Yakuyomi.create(models, alphabet, apiKey, config)
 - `RenderConfig.orientation = AUTO`。跟著每區塊偵測到的方向，再沿區塊傾斜角旋轉。
 - `TranslatorConfig.provider = "deepseek"`，配 `apiBase` 跟 `model`。任何 OpenAI 相容端點。`LlmProviders.ALL` 內建 manga-image-translator 的 LLM 那組外加 OpenRouter 的預設（全 OpenAI 相容；Gemini 走它的 compat 端點），`LlmModels.list()` 撈服務商的即時模型清單。詳見 [`docs/PROVIDERS_zh.md`](../docs/PROVIDERS_zh.md)。
 
-**夜讀**是獨立入口、不在 `translatePage` 裡：`NightReadRenderer.render(page, detector, charSeg, NightReadParams())` 一次跑完偵測、人物分割與夜讀重繪、回一張新 bitmap（超過 `NightReadRenderer.MAX_PIXELS` = 3.5 MPx 的頁會先縮、輸出＝縮後尺寸），`charSeg` 由 `NightReadRenderer.charSegmenter(models.charSegYoloNcnn, models.charSegCsegNcnn)` 建。`NightReadParams()` 的預設就是定案值；一次只跑一頁。夜讀函式庫（`li.joye.yakuyomi:nightread`）是 `:engine` 的 `api` 依賴，型別對使用端可見。
+**夜讀**不在這個模組。它在 [`:nightread-android`](../nightread-android/README_zh.md)，不帶翻譯引擎也能用；這裡建的 `Detector` 可以跟它共用，因為兩邊都來自 `:inference-core`。
 
 ### 語言對（不寫死日翻繁中）
 
@@ -219,4 +221,4 @@ val detection = detector.detect(page)   // 行 + textMask，畫你的 overlay
 detector.close()                         // 自己建的自己關
 ```
 
-純 helper（`Geometry`、`ImageOps`、`TextFilter`）是 `internal`，不是公開 API。
+`ImageOps`、`TextFilter` 是 `internal`。`NcnnBackend`、`Geometry` 在 `:inference-core`，標了 `@InternalEngineApi`（opt-in 註解）：公開只是為了讓兄弟模組用得到，不是公開 API。

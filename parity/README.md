@@ -2,8 +2,8 @@
 
 **English** · [中文](README_zh.md)
 
-Not shipped. A developer-only Python harness that runs the same pipeline stages as the Kotlin
-`:engine`, so we can check the on-device port matches the reference
+Not shipped. A developer-only Python harness that runs the same pipeline stages as the Kotlin side
+(`:inference-core`, `:engine`, `:nightread-android`), so we can check the on-device port matches the reference
 ([manga-image-translator](https://github.com/zyddnys/manga-image-translator), m-i-t) before trusting
 it on a device.
 
@@ -125,11 +125,11 @@ text detection; point its `YAKU_ENGINE_CLONE` at this checkout.
 The one automated parity check spans both languages:
 
 ```
-emit_grouping_fixture.py                          # desktop: detect real pages, group with mit_grouping,
-   → engine/src/test/kotlin/.../GroupingFixture.kt #   emit detected lines + expected regions as Kotlin
-                                                   #
-gradlew :engine:testDebugUnitTest                 # device-side: feed the same lines to Kotlin Grouping,
-   → GroupingParityTest                            #   assert regions (bbox ±2px) + angle (±1°) match
+emit_grouping_fixture.py                                  # desktop: detect real pages, group with mit_grouping,
+   → inference-core/src/test/kotlin/.../GroupingFixture.kt #   emit detected lines + expected regions as Kotlin
+                                                           #
+gradlew :inference-core:testDebugUnitTest                 # device-side: feed the same lines to Kotlin Grouping,
+   → GroupingParityTest                                    #   assert regions (bbox ±2px) + angle (±1°) match
 ```
 
 So a change to the Kotlin grouping (or a re-sync of `mit_grouping.py`) is caught automatically: edit,
@@ -142,5 +142,5 @@ re-run `emit_grouping_fixture.py`, run the test. Other stages are still validate
 
 1. `pipeline_parity.py raw/002.jpg raw/012.jpg` — end-to-end, eyeball `out/final_*.png` vs `mit/`.
 2. Tuning layout only? edit `typeset_parity.py`, `retypeset.py 002 012` (no LLM call).
-3. Touched grouping? `emit_grouping_fixture.py` then `:engine:testDebugUnitTest`.
+3. Touched grouping? `emit_grouping_fixture.py` then `:inference-core:testDebugUnitTest`.
 4. Synced m-i-t? bump `mit_grouping.py` / `.upstream-ref`, re-run the relevant parity, fix to green.

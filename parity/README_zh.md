@@ -2,7 +2,7 @@
 
 [English](README.md) ｜ 中文
 
-不出貨。開發專用的 Python harness，跑跟 Kotlin `:engine` 同樣的 pipeline 階段，讓我們在信任它上機前，
+不出貨。開發專用的 Python harness，跑跟 Kotlin 端（`:inference-core`、`:engine`、`:nightread-android`）同樣的 pipeline 階段，讓我們在信任它上機前，
 先檢查裝置端移植跟參考（[manga-image-translator](https://github.com/zyddnys/manga-image-translator)，m-i-t）一致。
 
 引擎把 m-i-t（Python/torch）重寫成 Kotlin/NCNN，這種移植沒辦法逐行 diff，所以正確性是「同輸入、近輸出」。
@@ -116,11 +116,11 @@ python3 parity/ocr_parity.py                      # 退役的 int8 vs fp32：印
 唯一一個橫跨兩語言的自動化 parity 檢查：
 
 ```
-emit_grouping_fixture.py                          # 桌面：偵測真實頁面、用 mit_grouping 分組、
-   → engine/src/test/kotlin/.../GroupingFixture.kt #   把偵測到的行 + 期望區域 emit 成 Kotlin
-                                                   #
-gradlew :engine:testDebugUnitTest                 # 裝置端：把同樣的行餵給 Kotlin Grouping，
-   → GroupingParityTest                            #   斷言區域（bbox ±2px）+ 角度（±1°）吻合
+emit_grouping_fixture.py                                  # 桌面：偵測真實頁面、用 mit_grouping 分組、
+   → inference-core/src/test/kotlin/.../GroupingFixture.kt #   把偵測到的行 + 期望區域 emit 成 Kotlin
+                                                           #
+gradlew :inference-core:testDebugUnitTest                 # 裝置端：把同樣的行餵給 Kotlin Grouping，
+   → GroupingParityTest                                    #   斷言區域（bbox ±2px）+ 角度（±1°）吻合
 ```
 
 所以動了 Kotlin 分組（或重新同步 `mit_grouping.py`）會被自動抓到：改、重跑 `emit_grouping_fixture.py`、跑測試。
@@ -132,5 +132,5 @@ gradlew :engine:testDebugUnitTest                 # 裝置端：把同樣的行�
 
 1. `pipeline_parity.py raw/002.jpg raw/012.jpg`——端到端，目視 `out/final_*.png` vs `mit/`。
 2. 只調版？改 `typeset_parity.py`、`retypeset.py 002 012`（不打 LLM）。
-3. 動了分組？`emit_grouping_fixture.py` 然後 `:engine:testDebugUnitTest`。
+3. 動了分組？`emit_grouping_fixture.py` 然後 `:inference-core:testDebugUnitTest`。
 4. 同步了 m-i-t？bump `mit_grouping.py` / `.upstream-ref`，重跑相關 parity、修到綠。

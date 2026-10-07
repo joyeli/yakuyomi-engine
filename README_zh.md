@@ -14,6 +14,7 @@
 |---|---|
 | **看它跑起來** | 下面的[**試跑**](#試跑)——把 sandbox app 編出來裝到 arm64 手機上，看一頁走完整條 pipeline。LLM key 是選配：不給就跳過翻譯，偵測、OCR、去字照樣看得到。 |
 | **把引擎整合進自己的 app** | [**`engine/README_zh.md`**](engine/README_zh.md)——API 面：`translatePage`、模型怎麼進去、設定、結果處理、執行緒。 |
+| **只要夜讀、不要翻譯** | [**`nightread-android/README_zh.md`**](nightread-android/README_zh.md)——夜讀模組依賴的是共用推論核心、不是翻譯引擎：怎麼接進 app、要哪兩組模型、執行緒與記憶體。 |
 | **自己重建模型** | [**`docs/BUILD_MODELS_zh.md`**](docs/BUILD_MODELS_zh.md)——從上游 checkpoint 轉，含各種坑與驗證判準。屬進階：我們轉好的可以直接下載，**用**引擎完全不需要走這條。 |
 
 ## 這是什麼
@@ -74,7 +75,7 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 - **排版** — 文字框排版，直排或橫排，字級自適應、垂直置中、描邊隨字級、行頭禁則、沿傾斜氣泡角度擺放。文字顏色依去字後的背景決定（亮底黑字、暗底白字）。
 - **重繪（analyze | render 切分）** — 翻好的頁會連同它的分析素材一起回傳：文字遮罩，加上帶著原文與譯文的區塊。之後換去字法、重新排版時不必重跑偵測／OCR／LLM——換去字模式、升級品質只花去字 + 排版兩個階段，不耗 token。
 - **語言** — 開箱即用日翻繁中。換目標語言、來源語言、few-shot 範例就能翻任何語言對。繁中輸出靠 prompt，沒有 OpenCC 後處理。
-- **夜讀（進行中）** — 把頁面本身變暗、同時保護人物：用同一顆偵測器加兩顆裝置端人物分割（YOLO11-seg ∪ CartoonSegmentation，NCNN）；預設關、reader 端整合進行中——見 [docs/MODELS_zh.md](docs/MODELS_zh.md#夜讀模型)。
+- **夜讀（進行中）** — 把頁面本身變暗、同時保護人物：用同一顆偵測器加兩顆裝置端人物分割（YOLO11-seg ∪ CartoonSegmentation，NCNN）；預設關、reader 端整合進行中——見 [docs/MODELS_zh.md](docs/MODELS_zh.md#夜讀模型)。它是獨立的模組 [`:nightread-android`](nightread-android/README_zh.md)，不帶翻譯引擎也能用。
 
 ## 儲存庫結構
 
@@ -82,8 +83,10 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 
 | Repo | 角色 |
 |---|---|
-| `yakuyomi-engine`（這個） | 引擎：`:engine`（整條 pipeline，只開 `translatePage`）、`:app-sandbox`（真機跑 pipeline 用）、`parity/` 桌面驗證工具。沒有 reader 程式碼。 |
+| `yakuyomi-engine`（這個） | 引擎，分五塊：`:inference-core`（NCNN 原生層、DBNet 偵測、分群、模型下載）、`:engine`（翻譯 pipeline，只開 `translatePage`）、`:nightread-android`（夜讀，不依賴 `:engine`）、`:app-sandbox`（真機跑用）、`parity/` 桌面驗證工具。沒有 reader 程式碼。 |
 | `Yakuyomi`（mihon fork） | reader app：mihon 加上下載 hook、翻譯設定、模型管理。用 git submodule + Gradle `includeBuild` 引入引擎。 |
+
+`:engine` 和 `:nightread-android` 都用 `api` 依賴 `:inference-core`，彼此不互相依賴，所以可以只拿其中一個。`libyakuyomi_ncnn.so` 只由 `:inference-core` 編：NCNN 是靜態連結，多一份就多一個執行緒池、多一把推論鎖。夜讀演算法本身是純 Kotlin 的 [yakuyomi-nightread](https://github.com/joyeli/yakuyomi-nightread) 函式庫，以 submodule 放在這裡。
 
 引擎跟 reader 解耦，才能自己單獨測；app 是真正的 mihon fork。引擎的改動 commit 在這裡，app 端 bump submodule 指標。
 
@@ -109,7 +112,7 @@ Yakuyomi 翻譯漫畫頁。五個階段裡四個在裝置上跑（偵測、OCR�
 
 **2.（選配）給 LLM key。** 在 sandbox app 裡填 DeepSeek key（模型資料夾按鈕下方那格，存在 app 的偏好設定——APK 不內建任何 key）。**不給也沒關係**：翻譯就是關著，偵測／OCR／去字照跑。`api-keys.properties`（由 `api-keys.properties.example` 複製）只有桌面 parity 腳本會讀。
 
-**3. 編譯安裝。**
+**3. 編譯安裝。** 夜讀函式庫是 git submodule、建置會用到，所以 clone 時加 `--recursive`（已經 clone 的話跑 `git submodule update --init --recursive`）。
 
 ```
 ./gradlew :app-sandbox:assembleDebug

@@ -87,7 +87,7 @@ cartoonseg.ncnn.bin            126418212  sha256 f3bf313f…1cc2d83f
 ## API
 
 ```kotlin
-// 引擎 — ModelDownloader
+// :inference-core — ModelDownloader（翻譯與夜讀兩個模組都經 api 拿到）
 val models = ModelDownloader.fetchManifest()              // models.json -> List<RemoteModel>
 ModelDownloader.ensure(models, destDir) { progress -> }   // 下載缺的/不符的，驗 sha256
 ModelDownloader.verify(models, destDir)                   // role -> 是否相符（只驗、不下載）

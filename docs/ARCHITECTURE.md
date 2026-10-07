@@ -2,15 +2,15 @@
 
 English ｜ [中文](ARCHITECTURE_zh.md)
 
-How Yakuyomi translates a page, why the project is split the way it is, and how the on-device engine relates to the desktop validation harness. For the engine's API, see [`engine/README.md`](../engine/README.md).
+How Yakuyomi translates a page, why the project is split the way it is, and how the on-device engine relates to the desktop validation harness. For the translation API, see [`engine/README.md`](../engine/README.md); for the shared inference core and night reading, [`inference-core/README.md`](../inference-core/README.md) and [`nightread-android/README.md`](../nightread-android/README.md).
 
 ## The two halves
 
-| | On-device (`engine/`, Kotlin) | Desktop (`parity/`, Python) |
+| | On-device (`inference-core/`, `engine/`, `nightread-android/`; Kotlin) | Desktop (`parity/`, Python) |
 |---|---|---|
 | Role | the product; runs on the phone | a validation harness; runs on a laptop |
 | Stack | Kotlin, NCNN, Android Canvas | Python, numpy/cv2, torch, onnxruntime, ncnn, PIL |
-| Ships | yes (the library) | no (dev only) |
+| Ships | yes (the libraries) | no (dev only) |
 | Purpose | translate pages | check the Kotlin port against the reference |
 
 The engine is the deliverable. The parity harness exists because the engine re-implements [manga-image-translator](https://github.com/zyddnys/manga-image-translator) (m-i-t, Python/torch) in Kotlin (NCNN), and that port can't be diffed line for line. The harness runs the same stages in Python so we can confirm "same input, close output" before trusting the Kotlin version. See [`parity/README.md`](../parity/README.md).
@@ -71,19 +71,48 @@ Learned by running on real hardware:
 
 ## Repo layout
 
+Three Android library modules. All their Kotlin code keeps the package `li.joye.yakuyomi.engine` (the JNI symbol names are derived from it), so the module split renamed nothing.
+
 ```
-engine/        Android library, the on-device pipeline (the product)
+inference-core/  shared on-device inference (li.joye.yakuyomi:inference-core)
+  src/main/kotlin/li/joye/yakuyomi/engine/
+    NcnnBackend.kt (+ src/main/cpp/ncnn_jni.cpp)     NCNN JNI: nets, global lock, every model's forward
+    Detector.kt, DetectorConfig.kt                   DBNet detection
+    TextLine.kt, Grouping.kt                         lines and m-i-t grouping into regions
+    Geometry.kt, ImageOps.kt                         geometry + preprocessing helpers
+    ModelDownloader.kt, EngineTrace.kt               manifest download, native-call trace hook
+  src/main/cpp/ncnn/                                 prebuilt NCNN (arm64, SimpleOMP, no Vulkan)
+  src/test/kotlin/…                                  JVM unit tests (geometry, grouping parity, lock)
+engine/          translation (li.joye.yakuyomi:engine; the product's translation library)
   src/main/kotlin/li/joye/yakuyomi/engine/
     Yakuyomi.kt, TranslationEngine.kt, ModelSet.kt   public entry (facade + types)
-    Pipeline.kt, Detector.kt, Ocr.kt, Grouping.kt,
-    LlmTranslator.kt, Inpainter.kt, Renderer.kt      stages
+    Pipeline.kt, Ocr.kt, LlmTranslator.kt,
+    Inpainter.kt, Renderer.kt, TextFilter.kt         stages
     LlmProviders.kt, LlmModels.kt                    provider presets + live model-list fetch
-    NcnnBackend.kt (+ src/main/cpp/ncnn_jni.cpp)     NCNN JNI: nets, global lock, OCR CTC forward
-    Geometry.kt, ImageOps.kt, TextFilter.kt          internal helpers
+    Config.kt                                        OCR / translator / inpaint / render config
+  src/main/assets/models/alphabet-all-v5.txt         OCR alphabet
   src/test/kotlin/…                                  JVM unit tests
+nightread-android/  night reading on Android (li.joye.yakuyomi:nightread-android)
+  src/main/kotlin/li/joye/yakuyomi/engine/
+    NightReadRenderer.kt                             Bitmap <-> night-read library glue
+    CharSeg.kt                                       character segmentation (YOLO11-seg, CartoonSegmentation)
+  src/test/kotlin/…                                  JVM unit tests (segmenter post-processing, whole pages)
+yakuyomi-nightread/  submodule: the pure-Kotlin night-read library (li.joye.yakuyomi:nightread)
 app-sandbox/   sandbox test app (device timing, comparison images)
 parity/        desktop Python validation harness (not shipped)
 docs/          this file, plus the parameter reference
 ```
 
-The reader app (the [Yakuyomi](https://github.com/joyeli/Yakuyomi) mihon fork) pulls `engine` in as a git submodule and Gradle composite build, and adds only the integration layer: the download hook, settings, and model management.
+How they depend on each other:
+
+```
+li.joye.yakuyomi:nightread (submodule, pure Kotlin)
+        ▲ api
+:nightread-android ──api──▶ :inference-core ◀──api── :engine
+        ▲                    (libyakuyomi_ncnn.so)       ▲
+        └──────────────── :app-sandbox ──────────────────┘
+```
+
+`:engine` and `:nightread-android` do not depend on each other; Gradle enforces it, since neither declares the other. `libyakuyomi_ncnn.so` is built only by `:inference-core`. NCNN is a static library, so a second `.so` would carry a second NCNN, with its own SimpleOMP pool and its own `pthread_once`, outside the lock and the pool rules in `NcnnBackend`. That is also why the OCR and inpaint JNI entries stay in the core even though only translation calls them.
+
+The reader app (the [Yakuyomi](https://github.com/joyeli/Yakuyomi) mihon fork) pulls this repo in as a git submodule and Gradle composite build, depends on `:engine`, `:nightread-android` and `:inference-core`, and adds only the integration layer: the download hook, settings, and model management.

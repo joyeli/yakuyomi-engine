@@ -2,11 +2,11 @@
 
 [English](ARCHITECTURE.md) ｜ 中文
 
-Yakuyomi 怎麼翻一頁、專案為什麼這樣切、裝置端引擎跟桌面驗證工具怎麼搭。引擎的 API 看 [`engine/README_zh.md`](../engine/README_zh.md)。
+Yakuyomi 怎麼翻一頁、專案為什麼這樣切、裝置端引擎跟桌面驗證工具怎麼搭。翻譯的 API 看 [`engine/README_zh.md`](../engine/README_zh.md)；共用推論核心與夜讀看 [`inference-core/README_zh.md`](../inference-core/README_zh.md)、[`nightread-android/README_zh.md`](../nightread-android/README_zh.md)。
 
 ## 兩半
 
-| | 裝置端（`engine/`，Kotlin） | 桌面（`parity/`，Python） |
+| | 裝置端（`inference-core/`、`engine/`、`nightread-android/`；Kotlin） | 桌面（`parity/`，Python） |
 |---|---|---|
 | 角色 | 產品，跑在手機上 | 驗證工具，跑在筆電上 |
 | 技術 | Kotlin、NCNN、Android Canvas | Python、numpy/cv2、torch、onnxruntime、ncnn、PIL |
@@ -71,19 +71,48 @@ Yakuyomi 怎麼翻一頁、專案為什麼這樣切、裝置端引擎跟桌面�
 
 ## Repo 結構
 
+三個 Android library 模組。它們的 Kotlin 程式碼套件都維持 `li.joye.yakuyomi.engine`（JNI 符號名由它決定），所以拆模組沒有改任何名字。
+
 ```
-engine/        Android library，裝置端 pipeline（產品）
+inference-core/  共用的裝置端推論（li.joye.yakuyomi:inference-core）
+  src/main/kotlin/li/joye/yakuyomi/engine/
+    NcnnBackend.kt (+ src/main/cpp/ncnn_jni.cpp)     NCNN JNI：Net、全域鎖、每顆模型的 forward
+    Detector.kt, DetectorConfig.kt                   DBNet 偵測
+    TextLine.kt, Grouping.kt                         文字行與 m-i-t 分群
+    Geometry.kt, ImageOps.kt                         幾何 + 前處理 helper
+    ModelDownloader.kt, EngineTrace.kt               manifest 下載、原生呼叫 trace 掛鉤
+  src/main/cpp/ncnn/                                 預編 NCNN（arm64、SimpleOMP、不含 Vulkan）
+  src/test/kotlin/…                                  JVM 單元測試（幾何、分群 parity、鎖）
+engine/          翻譯（li.joye.yakuyomi:engine；產品的翻譯函式庫）
   src/main/kotlin/li/joye/yakuyomi/engine/
     Yakuyomi.kt, TranslationEngine.kt, ModelSet.kt   對外入口（facade + 型別）
-    Pipeline.kt, Detector.kt, Ocr.kt, Grouping.kt,
-    LlmTranslator.kt, Inpainter.kt, Renderer.kt      各階段
+    Pipeline.kt, Ocr.kt, LlmTranslator.kt,
+    Inpainter.kt, Renderer.kt, TextFilter.kt         各階段
     LlmProviders.kt, LlmModels.kt                    供應商預設 + 即時撈模型清單
-    NcnnBackend.kt (+ src/main/cpp/ncnn_jni.cpp)     NCNN JNI：Net、全域鎖、OCR CTC forward
-    Geometry.kt, ImageOps.kt, TextFilter.kt          內部 helper
+    Config.kt                                        OCR／翻譯／去字／排版設定
+  src/main/assets/models/alphabet-all-v5.txt         OCR 字表
   src/test/kotlin/…                                  JVM 單元測試
+nightread-android/  在 Android 上跑夜讀（li.joye.yakuyomi:nightread-android）
+  src/main/kotlin/li/joye/yakuyomi/engine/
+    NightReadRenderer.kt                             Bitmap ↔ 夜讀函式庫的膠水
+    CharSeg.kt                                       人物分割（YOLO11-seg、CartoonSegmentation）
+  src/test/kotlin/…                                  JVM 單元測試（分割後處理、整頁）
+yakuyomi-nightread/  submodule：純 Kotlin 的夜讀函式庫（li.joye.yakuyomi:nightread）
 app-sandbox/   sandbox 測試 app（裝置計時、比較圖）
 parity/        桌面 Python 驗證工具（不出貨）
 docs/          這份，加參數參考
 ```
 
-reader app（[Yakuyomi](https://github.com/joyeli/Yakuyomi) mihon fork）用 git submodule + Gradle composite build 引入 `engine`，只加整合層：下載 hook、設定、模型管理。
+依賴方向：
+
+```
+li.joye.yakuyomi:nightread（submodule，純 Kotlin）
+        ▲ api
+:nightread-android ──api──▶ :inference-core ◀──api── :engine
+        ▲                    （libyakuyomi_ncnn.so）     ▲
+        └──────────────── :app-sandbox ──────────────────┘
+```
+
+`:engine` 和 `:nightread-android` 互不依賴，由 Gradle 保證：兩邊都沒宣告對方。`libyakuyomi_ncnn.so` 只由 `:inference-core` 編。NCNN 是靜態庫，多一個 `.so` 就多一份 NCNN、多一個 SimpleOMP 池、多一套 `pthread_once`，不在 `NcnnBackend` 的鎖與建池規則管轄內。OCR 與去字的 JNI 入口只有翻譯在用，卻留在核心，也是這個原因。
+
+reader app（[Yakuyomi](https://github.com/joyeli/Yakuyomi) mihon fork）用 git submodule + Gradle composite build 引入本 repo，依賴 `:engine`、`:nightread-android`、`:inference-core`，只加整合層：下載 hook、設定、模型管理。

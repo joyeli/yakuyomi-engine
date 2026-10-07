@@ -87,7 +87,7 @@ The full conversion path from upstream checkpoint to each of these files — the
 ## API
 
 ```kotlin
-// engine — ModelDownloader
+// :inference-core — ModelDownloader (translation and night reading both get it through api)
 val models = ModelDownloader.fetchManifest()              // models.json -> List<RemoteModel>
 ModelDownloader.ensure(models, destDir) { progress -> }   // download missing/mismatched, verify sha256
 ModelDownloader.verify(models, destDir)                   // role -> ok (verify only, no download)
