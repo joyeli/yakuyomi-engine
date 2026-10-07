@@ -4,7 +4,7 @@ comic-text-detector parity harness (CLAUDE.md §7).
 
 對一張頁跑 comictextdetector.pt.onnx，畫出並比較：
   綠 = 上游「完整」後處理（直接 import m-i-t 的 SegDetectorRepresenter：輪廓→minAreaRect→unclip）
-  紅 = 本專案 M0c「簡化」後處理（二值化→連通元件→軸對齊 bbox），與 engine/Detector.kt 同演算法
+  紅 = 本專案 M0c「簡化」後處理（二值化→連通元件→軸對齊 bbox），與當時 engine/Detector.kt 的 ctd 版同演算法（163ee2b 移除；現在的 Detector.kt 在 :inference-core、是 DBNet）
 
 用法：python3 parity/ctd_reference.py [頁圖]（預設 paths.SANDBOX_PAGE = 測試頁 demo03.png）
 

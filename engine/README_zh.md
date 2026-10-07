@@ -215,7 +215,7 @@ Pipeline 對齊 manga-image-translator，但每個參數都在真機（Snapdrago
 工廠是建議路徑。要逐階段除錯（例如偵測 overlay）可以自己建各階段、自己組 `Pipeline`，但生命週期得自己管：
 
 ```kotlin
-val detector = Detector(models.detectorNcnn, config.detector)
+val detector = Detector(models.detectorNcnn!!, config.detector)   // ModelSet 的欄位是 String?
 val detection = detector.detect(page)   // 行 + textMask，畫你的 overlay
 // …
 detector.close()                         // 自己建的自己關

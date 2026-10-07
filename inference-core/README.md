@@ -55,6 +55,7 @@ Night reading on its own therefore carries the two small OCR and inpaint functio
 
 - NDK `28.2.13676358` and CMake `3.22.1` (`externalNativeBuild`). The reader app pins the same NDK so it can strip the library.
 - Only `arm64-v8a` is built; the prebuilt NCNN is arm64 only.
+- When an app pulls this repo in with `includeBuild`, the engine build and the night-read library build nested in it each look for the Android SDK on their own; the app's `local.properties` is not read there. Set `ANDROID_HOME`, or put a `local.properties` with `sdk.dir=...` in both `yakuyomi-engine/` and `yakuyomi-engine/yakuyomi-nightread/`.
 - If you replace the prebuilt NCNN, build it with SimpleOMP (`NCNN_SIMPLEOMP=ON`) and without Vulkan, and make sure `ncnn.cmake` does not link a bare `pthread` (the NDK has no `libpthread`; `Threads::Threads` is fine).
 
 ## `@InternalEngineApi`
@@ -71,10 +72,12 @@ val dir = File(context.filesDir, "models")
 ModelDownloader.ensure(remote.filter { it.role == "detector" }, dir) { progress -> /* ModelProgress */ }
 ```
 
+`fetchManifest` and `ensure` are `suspend` functions (they switch to `Dispatchers.IO` themselves), so call them from a coroutine. This module uses kotlinx-coroutines and OkHttp as `implementation` dependencies: they end up in your APK at runtime whether or not you download anything, but they are not on your compile classpath, so an app that calls these functions declares kotlinx-coroutines itself.
+
 The role is a plain string from the manifest (today `detector`, `ocr`, `inpainter`, `charseg`); filter by it to fetch only what you need. `ensure` returns a role → file map, but a role with several files (a `.param` and a `.bin`) keeps only the last one in that map, so look the files up by name in the folder instead. The app needs the `INTERNET` permission; this module declares none.
 
 Load models from a local path. Do not read weights into the JVM heap with `readBytes()`: the heap is capped around 512 MB regardless of device RAM.
 
 ## `EngineTrace`
 
-`EngineTrace.sink` is `null` by default, which costs nothing. Set it to receive one line before and after each native call (`xxx.enter` / `xxx.call` / `xxx.exit`). If the process dies inside native code, the last line names the call. The reader app writes these lines to its diagnostic log.
+`EngineTrace.sink` is `null` by default, which costs nothing. Set it to receive trace lines. In this module they surround the detection and text-removal forwards (`ncnn.detectDbnet.*`, `ncnn.inpaint.*`: enter / call / exit), the generic forward used by character segmentation (`ncnn.extract.*`: enter / exit) and the thread-pool creation; net creation, OCR forwards and net release are not traced. `:engine` adds engine creation, warm-up, OCR model loading and each pipeline stage (`create.*`, `warmup.*`, `ocr.load`, `pipe.*`). If the process dies inside native code, the last line points at the call. The reader app writes these lines to its diagnostic log.

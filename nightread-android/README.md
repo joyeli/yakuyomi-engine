@@ -48,7 +48,7 @@ The engine repo is consumed as source through a Gradle composite build.
 
    The app should build `arm64-v8a` only (`ndk { abiFilters += "arm64-v8a" }`); there is no inference backend for other ABIs.
 
-Requirements: NDK `28.2.13676358` and CMake `3.22.1` are installed (`:inference-core` builds `libyakuyomi_ncnn.so` from source), and the app's `minSdk` is 26 or higher.
+Requirements: NDK `28.2.13676358` and CMake `3.22.1` are installed (`:inference-core` builds `libyakuyomi_ncnn.so` from source), and the app's `minSdk` is 26 or higher. The engine build and the night-read library build nested in it each look for the Android SDK on their own and do not read the app's `local.properties`: set `ANDROID_HOME`, or put a `local.properties` with `sdk.dir=...` in both `yakuyomi-engine/` and `yakuyomi-engine/yakuyomi-nightread/`.
 
 ## Models
 
@@ -66,6 +66,8 @@ val dir = File(context.filesDir, "models")
 val wanted = ModelDownloader.fetchManifest().filter { it.role == "detector" || it.role == "charseg" }
 ModelDownloader.ensure(wanted, dir) { progress -> /* ModelProgress */ }
 ```
+
+Both calls are `suspend`; run them in a coroutine. The app declares kotlinx-coroutines itself to do that (`:inference-core` uses it as an `implementation` dependency, so it is not on your compile classpath). `:inference-core` puts OkHttp and kotlinx-coroutines into the APK at runtime either way.
 
 Or put the files in a local folder yourself. Pass paths; the nets load from the file into native memory. Do not read weights into the JVM heap with `readBytes()`.
 

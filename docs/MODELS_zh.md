@@ -62,7 +62,7 @@ cartoonseg.ncnn.bin            126418212  sha256 f3bf313f…1cc2d83f
 **授權與散布。** 這兩顆都不是 manga-image-translator 的、也都不是 GPL-3.0。以下只寫查證過的：
 
 - **yolo**——[YOLO11-seg](https://github.com/ultralytics/ultralytics) 權重來自 Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation)。模型卡宣告 `license: other`；Ultralytics YOLO11 本身是 AGPL-3.0。以 MangaSeg／Manga109-s 標註訓練。模型卡要求：再散布或商用前自行確認 MangaSeg、Manga109-s 與 Ultralytics 的授權、標註「Copyrighted by Minshan Xie」、並引用 MangaSeg 論文（CVPR 2025）。
-- **cseg**——[CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation)（RTMDet-Ins）權重來自 Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)。上游 repo 沒有 LICENSE 檔、README 也未寫授權；訓練資料含 Manga109。
+- **cseg**——[CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation)（RTMDet-Ins）權重來自 Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx)。上游 repo 沒有 LICENSE 檔、README 也未寫授權。原始 PyTorch 權重的 Hugging Face 模型卡 [dreMaz/AnimeInstanceSegmentation](https://huggingface.co/dreMaz/AnimeInstanceSegmentation) 寫 `license: mit`；我們轉檔所用的 ONNX 版沒有模型卡。訓練資料含 Manga109。
 
 我們把這兩顆的 NCNN 轉檔透過 `models-v5` release 散布，**僅供研究／非商業用途**、附上述出處歸屬；權利人提出要求即下架。你不必用我們的副本：自行從出處取得權重、用 [BUILD_MODELS_zh.md](BUILD_MODELS_zh.md#人物分割--ncnn夜讀) 的腳本轉檔、走自備模型。
 
@@ -82,7 +82,7 @@ cartoonseg.ncnn.bin            126418212  sha256 f3bf313f…1cc2d83f
 
 ## 驗證
 
-`ModelDownloader.verify(models, dir)` 逐角色回報「本機檔的 size 與 sha256 是否符合我們發行的版本」。因為 manifest 跟檔案一起版本化，雜湊永遠正確——更新權重 = 出新版 manifest，不會有過時雜湊。這能確認你手上的檔案跟我們散布的逐位元相同。
+`ModelDownloader.ensure(models, dir)` 會跳過 size 與 sha256 已經和 manifest 相符的檔，下載的每個檔也都會驗 sha256（不符就刪檔並拋例外）。想自己檢查、不下載任何東西，就拿 `ModelDownloader.sha256(file)` 跟 manifest 裡那一筆的 `sha256` 比。因為 manifest 跟檔案一起版本化，雜湊永遠正確——更新權重 = 出新版 manifest，不會有過時雜湊。相符就代表你手上的檔案跟我們散布的逐位元相同。
 
 ## API
 
@@ -90,7 +90,7 @@ cartoonseg.ncnn.bin            126418212  sha256 f3bf313f…1cc2d83f
 // :inference-core — ModelDownloader（翻譯與夜讀兩個模組都經 api 拿到）
 val models = ModelDownloader.fetchManifest()              // models.json -> List<RemoteModel>
 ModelDownloader.ensure(models, destDir) { progress -> }   // 下載缺的/不符的，驗 sha256
-ModelDownloader.verify(models, destDir)                   // role -> 是否相符（只驗、不下載）
+ModelDownloader.sha256(file)                              // 串流算 sha256，跟 RemoteModel.sha256 比（只驗、不下載）
 ```
 
 引擎只負責「抓、驗、落檔」；下載到哪、何時觸發、進度 UI 都是 reader 的事——跟 LLM 模型清單同一套引擎/reader 分法（見 [PROVIDERS.md](PROVIDERS_zh.md)）。

@@ -62,7 +62,7 @@ A whole night-read page (detect + segment + render) takes **6–25 s** on that d
 **License and redistribution.** Neither model is manga-image-translator's and neither is GPL-3.0. What was verified, and nothing more:
 
 - **yolo** — [YOLO11-seg](https://github.com/ultralytics/ultralytics) weights from Hugging Face [anonimkaq4/manga-page-element-segmentation](https://huggingface.co/anonimkaq4/manga-page-element-segmentation). The model card declares `license: other`; Ultralytics YOLO11 itself is AGPL-3.0. Trained on MangaSeg / Manga109-s annotations. The model card asks anyone redistributing or using it commercially to check the MangaSeg, Manga109-s and Ultralytics licenses themselves, to credit it as "Copyrighted by Minshan Xie", and to cite the MangaSeg paper (CVPR 2025).
-- **cseg** — [CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation) (RTMDet-Ins) weights from Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx). The upstream repository has no LICENSE file and its README states no license; the training data includes Manga109.
+- **cseg** — [CartoonSegmentation](https://github.com/CartoonSegmentation/CartoonSegmentation) (RTMDet-Ins) weights from Hugging Face [Jakaline/CartoonSegmentationOnnx](https://huggingface.co/Jakaline/CartoonSegmentationOnnx). The upstream repository has no LICENSE file and its README states no license. The Hugging Face card of the original PyTorch checkpoint, [dreMaz/AnimeInstanceSegmentation](https://huggingface.co/dreMaz/AnimeInstanceSegmentation), declares `license: mit`; the ONNX conversion we convert from has no model card. The training data includes Manga109.
 
 We redistribute our NCNN conversions of both through the `models-v5` release **for research / non-commercial use only**, with the attribution above, and will take them down if a rights holder asks. You do not have to use our copies: fetch the weights from the sources yourself, convert them with the scripts in [BUILD_MODELS.md](BUILD_MODELS.md#character-segmentation--ncnn-night-reading), and bring your own model.
 
@@ -82,7 +82,7 @@ The full conversion path from upstream checkpoint to each of these files — the
 
 ## Verification
 
-`ModelDownloader.verify(models, dir)` returns, per role, whether the local file's size and sha256 match what we published. Because the manifest is versioned together with the files, the checksum is always correct — updating the weights means a new manifest version, not a stale hash. This confirms the file you hold is byte-for-byte the one we distribute.
+`ModelDownloader.ensure(models, dir)` skips every file whose size and sha256 already match the manifest, and checks the sha256 of every file it downloads (a mismatch deletes the file and throws). To check a file yourself without downloading anything, compare `ModelDownloader.sha256(file)` with that entry's `sha256` in the manifest. Because the manifest is versioned together with the files, the checksum is always correct — updating the weights means a new manifest version, not a stale hash. A match confirms the file you hold is byte-for-byte the one we distribute.
 
 ## API
 
@@ -90,7 +90,7 @@ The full conversion path from upstream checkpoint to each of these files — the
 // :inference-core — ModelDownloader (translation and night reading both get it through api)
 val models = ModelDownloader.fetchManifest()              // models.json -> List<RemoteModel>
 ModelDownloader.ensure(models, destDir) { progress -> }   // download missing/mismatched, verify sha256
-ModelDownloader.verify(models, destDir)                   // role -> ok (verify only, no download)
+ModelDownloader.sha256(file)                              // streaming sha256; compare with RemoteModel.sha256 (check only, no download)
 ```
 
 The engine only fetches, verifies, and writes files; where to download, when to trigger, and the progress UI belong to the reader — the same engine/reader split as the LLM model list (see [PROVIDERS.md](PROVIDERS.md)).

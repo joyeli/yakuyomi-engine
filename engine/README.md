@@ -217,7 +217,7 @@ Two things measurement said *not* to do, kept here so they aren't re-attempted:
 The factory is the recommended path. For per-stage debugging (a detection overlay, say) you can construct the stages yourself and assemble a `Pipeline`, but then you own their lifecycle:
 
 ```kotlin
-val detector = Detector(models.detectorNcnn, config.detector)
+val detector = Detector(models.detectorNcnn!!, config.detector)   // ModelSet fields are String?
 val detection = detector.detect(page)   // lines + textMask, draw your overlay
 // …
 detector.close()                         // close what you create

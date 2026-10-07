@@ -55,6 +55,7 @@ Group：`li.joye.yakuyomi:inference-core`。Min SDK 26。只出 arm64-v8a。
 
 - NDK `28.2.13676358`、CMake `3.22.1`（`externalNativeBuild`）。reader app 釘同一版 NDK，才能 strip 這個庫。
 - 只編 `arm64-v8a`；預編的 NCNN 只有 arm64。
+- app 用 `includeBuild` 接本 repo 時，引擎這個 build 和它裡面巢狀的夜讀函式庫 build 各自找 Android SDK，讀不到 app 的 `local.properties`。請設 `ANDROID_HOME`，或在 `yakuyomi-engine/` 和 `yakuyomi-engine/yakuyomi-nightread/` 各放一份寫了 `sdk.dir=...` 的 `local.properties`。
 - 要換預編的 NCNN，請用 SimpleOMP（`NCNN_SIMPLEOMP=ON`）、不含 Vulkan 重編，並確認 `ncnn.cmake` 沒有連結裸的 `pthread`（NDK 沒有 `libpthread`；`Threads::Threads` 沒問題）。
 
 ## `@InternalEngineApi`
@@ -71,10 +72,12 @@ val dir = File(context.filesDir, "models")
 ModelDownloader.ensure(remote.filter { it.role == "detector" }, dir) { progress -> /* ModelProgress */ }
 ```
 
+`fetchManifest` 和 `ensure` 都是 `suspend` 函式（自己會切到 `Dispatchers.IO`），要在協程裡呼叫。這個模組以 `implementation` 依賴 kotlinx-coroutines 與 OkHttp：不管有沒有下載，它們都會在 runtime 進你的 APK，但不在你的編譯 classpath 上，所以呼叫這兩個函式的 app 要自己宣告 kotlinx-coroutines。
+
 role 是 manifest 裡的字串（目前有 `detector`、`ocr`、`inpainter`、`charseg`），用它篩出要的檔。`ensure` 回傳 role → 檔案的 map，但同一個 role 有多個檔（`.param` 和 `.bin`）時 map 只留最後一個，所以請用檔名到資料夾裡找。app 要自己宣告 `INTERNET` 權限，這個模組不宣告任何權限。
 
 模型要用本機路徑載入。別用 `readBytes()` 把權重讀進 JVM heap：heap 上限約 512 MB，跟裝置 RAM 無關。
 
 ## `EngineTrace`
 
-`EngineTrace.sink` 預設是 `null`，零開銷。設了之後，每個原生呼叫前後會收到一行（`xxx.enter`／`xxx.call`／`xxx.exit`）。行程如果死在原生碼裡，最後一行就是那個呼叫。reader app 把這些行寫進它的診斷紀錄。
+`EngineTrace.sink` 預設是 `null`，零開銷。設了之後會收到 trace 行。這個模組記的是偵測與去字的前向（`ncnn.detectDbnet.*`、`ncnn.inpaint.*`：enter／call／exit）、人物分割用的通用前向（`ncnn.extract.*`：enter／exit）和建執行緒池；建 Net、OCR 前向、釋放 Net 不記。`:engine` 另外記建引擎、暖機、載 OCR 模型和 pipeline 各階段（`create.*`、`warmup.*`、`ocr.load`、`pipe.*`）。行程如果死在原生碼裡，最後一行就指出是哪個呼叫。reader app 把這些行寫進它的診斷紀錄。

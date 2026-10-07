@@ -48,7 +48,7 @@ Kotlin 套件是 `li.joye.yakuyomi.engine`，不是 `li.joye.yakuyomi.nightread`
 
    app 只打 `arm64-v8a`（`ndk { abiFilters += "arm64-v8a" }`）；其他 ABI 沒有推論後端。
 
-條件：裝好 NDK `28.2.13676358` 與 CMake `3.22.1`（`:inference-core` 從原始碼編 `libyakuyomi_ncnn.so`），app 的 `minSdk` 至少 26。
+條件：裝好 NDK `28.2.13676358` 與 CMake `3.22.1`（`:inference-core` 從原始碼編 `libyakuyomi_ncnn.so`），app 的 `minSdk` 至少 26。引擎這個 build 和它裡面巢狀的夜讀函式庫 build 各自找 Android SDK，讀不到 app 的 `local.properties`：請設 `ANDROID_HOME`，或在 `yakuyomi-engine/` 和 `yakuyomi-engine/yakuyomi-nightread/` 各放一份寫了 `sdk.dir=...` 的 `local.properties`。
 
 ## 模型
 
@@ -66,6 +66,8 @@ val dir = File(context.filesDir, "models")
 val wanted = ModelDownloader.fetchManifest().filter { it.role == "detector" || it.role == "charseg" }
 ModelDownloader.ensure(wanted, dir) { progress -> /* ModelProgress */ }
 ```
+
+兩個呼叫都是 `suspend`，要在協程裡跑。所以 app 要自己宣告 kotlinx-coroutines（`:inference-core` 以 `implementation` 依賴它，不在你的編譯 classpath 上）。不管用不用，`:inference-core` 在 runtime 都會把 OkHttp 和 kotlinx-coroutines 帶進 APK。
 
 也可以自己把檔案放進本機資料夾。傳路徑就好，Net 直接從檔案載進 native 記憶體。別用 `readBytes()` 把權重讀進 JVM heap。
 
