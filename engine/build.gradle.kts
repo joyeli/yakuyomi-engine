@@ -3,36 +3,18 @@ plugins {
     // AGP 9+ 內建 Kotlin 支援，不再套 kotlin.android（見 kotl.in/gradle/agp-built-in-kotlin）
 }
 
-// Yakuyomi fork 以 Gradle composite build（includeBuild）接此引擎，靠 group:name 替換依賴
+// Yakuyomi 翻譯引擎（OCR／去字／排版／LLM／Pipeline）。Yakuyomi fork 以 Gradle composite build（includeBuild）接此引擎，
+// 靠 group:name 替換依賴。原生層（NCNN JNI、libyakuyomi_ncnn.so）與 DBNet 偵測、分群、模型下載在 :inference-core——用 api：
+// EngineConfig.detector、PageAnalysis.regions、OcrAbResult.quads 都露出核心型別。不依賴夜讀（:nightread-android）。
 group = "li.joye.yakuyomi"
-version = "0.4.0"
+version = "0.5.0"
 
 android {
     namespace = "li.joye.yakuyomi.engine"
     compileSdk = 37
-    ndkVersion = "28.2.13676358" // NCNN 原生層（Detector/Ocr/Inpainter）；釘住版本讓 CI/fork submodule 建置一致
 
     defaultConfig {
         minSdk = 26
-        consumerProguardFiles("consumer-rules.pro")
-
-        // NCNN 原生後端（去字／偵測／OCR／人物分割，引擎唯一的推論 runtime；ORT 2026-09-26 拔除）：只出 arm64（ncnn 預編庫＝arm64-v8a、SimpleOMP、不含 Vulkan）
-        ndk {
-            abiFilters += "arm64-v8a"
-        }
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                arguments += listOf("-DANDROID_STL=c++_static")
-            }
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
     }
 
     buildTypes {
@@ -51,19 +33,19 @@ android {
     }
 }
 
-// AGP 9 內建 Kotlin：jvmTarget 改在 kotlin{} 設（取代已移除的 android.kotlinOptions）
+// AGP 9 內建 Kotlin：jvmTarget 改在 kotlin{} 設（取代已移除的 android.kotlinOptions）。
+// Ocr／Inpainter／Yakuyomi 用到核心的 NcnnBackend、Geometry（@InternalEngineApi），整模組 opt-in。
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        optIn.add("li.joye.yakuyomi.engine.InternalEngineApi")
     }
 }
 
 dependencies {
+    api(project(":inference-core"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
-    // 夜讀膠水（NightReadRenderer）在引擎：用 api 而非 implementation——fork 要拿到 NightReadParams 等 nightread 型別。
-    // 座標由根 settings 的 includeBuild("yakuyomi-nightread") 以 group:name 替換成 submodule 原始碼（fork 經 includeBuild 本 repo 一併拿到）。
-    api("li.joye.yakuyomi:nightread:0.1.0")
 
     testImplementation("junit:junit:4.13.2")
 }

@@ -6,7 +6,7 @@
 ported spec: manga_translator/inpainting/inpainting_aot.py:AOTGenerator @ d5a3eee
   上游 forward(img, mask) → torch.cat([mask, img], dim=1) → head → 10×AOTBlock → tail → clip(-1,1)
 
-blob 契約（引擎 `engine/src/main/cpp/ncnn_jni.cpp:inpaintAotNative` 照這個吃，名字不可改）：
+blob 契約（引擎 `inference-core/src/main/cpp/ncnn_jni.cpp:inpaintAotNative` 照這個吃，名字不可改）：
   in0  = img [3,s,s]  值域 [-1,1]、holes（mask=1 處）已歸零
   in1  = mask[1,s,s]  {0,1}，1 = 要擦掉重建
   out0 = img [3,s,s]  值域 [-1,1]（模型 eval 分支已 clip）

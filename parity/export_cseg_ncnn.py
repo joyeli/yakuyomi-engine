@@ -8,7 +8,7 @@ ONNX 切圖（去掉圖內的 NMS／動態遮罩頭）→ pnnx → ncnn，後處
 NCNN 沒有這些層。切在**原始頭輸出**之後，剩下的 backbone（CSPNeXt）＋ neck（PAFPN）＋ head 全是
 Convolution／Swish／Pooling／Interp 這類標準層，pnnx 一次轉過。
 
-blob 契約（引擎 `engine/src/main/cpp/ncnn_jni.cpp:extractNative` 照這個吃，名字與順序不可改）：
+blob 契約（引擎 `inference-core/src/main/cpp/ncnn_jni.cpp:extractNative` 照這個吃，名字與順序不可改）：
   in0  = [3,640,640] float，**BGR**，(x − mean) / std，mean=(103.53,116.28,123.675) std=(57.375,57.12,58.395)
          等比縮到長邊 640、**右下角** pad（mmdet 慣例、非置中），pad 值 114（在正規化之前填）。
   out0..out2 = rtm_cls   [1,H,W]   三層 stride 8/16/32（H=80/40/20），單類別 logit → sigmoid 是分數
@@ -32,7 +32,7 @@ blob 契約（引擎 `engine/src/main/cpp/ncnn_jni.cpp:extractNative` 照這個�
   (3) 對 11 張測試頁：三條路（完整 ONNX／ORT 切圖＋後處理／NCNN＋後處理）的**聯集遮罩** IoU
 
 輸出落在 parity/out/cseg/（gitignore）；`--fixture` 另外把 ch34_011 的十個原始輸出（fp16）與期望遮罩
-寫進 engine/src/test/resources/charseg/，給 Kotlin 後處理的 JVM parity 測試。
+寫進 nightread-android/src/test/resources/charseg/，給 Kotlin 後處理的 JVM parity 測試。
 
 用法：
     python3 parity/export_cseg_ncnn.py              # 轉檔 + 三層驗證
@@ -62,7 +62,7 @@ CUT = os.path.join(OUTDIR, "cartoonseg.onnx")            # 切圖後的 ONNX（p
 PARAM = os.environ.get("YAKU_CSEG_NCNN_PARAM", os.path.join(OUTDIR, "cartoonseg.ncnn.param"))
 BIN = os.environ.get("YAKU_CSEG_NCNN_BIN", os.path.join(OUTDIR, "cartoonseg.ncnn.bin"))
 PAGES = sorted(glob.glob(os.path.join(ROOT, "app-sandbox", "src", "main", "assets", "test", "*.*")))
-FIXTURE_DIR = os.path.join(ROOT, "engine", "src", "test", "resources", "charseg")
+FIXTURE_DIR = os.path.join(ROOT, "nightread-android", "src", "test", "resources", "charseg")
 
 SIZE = 640
 STRIDES = (8, 16, 32)

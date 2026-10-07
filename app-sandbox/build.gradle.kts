@@ -15,7 +15,7 @@ android {
         targetSdk = 36
         versionCode = 2
         versionName = "0.3-ncnn"
-        // 只打 arm64-v8a（實機）：NCNN 原生層由 :engine 提供（libyakuyomi_ncnn，ncnn 預編庫本來就只出 arm64），
+        // 只打 arm64-v8a（實機）：NCNN 原生層由 :inference-core 提供（libyakuyomi_ncnn，ncnn 預編庫本來就只出 arm64），
         // 其他 ABI 沒有可用的推論後端，打進去只是白佔空間；sandbox 不再自帶 native build。
         ndk { abiFilters += "arm64-v8a" }
     }
@@ -57,14 +57,14 @@ kotlin {
 
 dependencies {
     implementation(project(":engine"))
-    // 夜讀：上機驗證用。只接 :nightread 核心（純 Kotlin 管線，includeBuild 靠 group:name 替換）；人物遮罩推論走 :engine 的
-    // NCNN 分割器（CharSegmenter：YoloSegSegmenter／CsegSegmenter），:nightread-ort（ORT 版 CharMaskOrt）已退役不再依賴。
-    implementation("li.joye.yakuyomi:nightread:0.1.0")
+    // 夜讀上機驗證：:nightread-android（NightReadRenderer＋NCNN 人物分割 CharSegmenter：YoloSegSegmenter／CsegSegmenter；
+    // api 帶 nightread 函式庫與 :inference-core）。:nightread-ort（ORT 版 CharMaskOrt）已退役不再依賴。
+    implementation(project(":nightread-android"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
     implementation("androidx.documentfile:documentfile:1.0.1") // SAF 資料夾讀檔
     implementation("androidx.activity:activity-ktx:1.8.2")      // registerForActivityResult / OpenDocumentTree
-    // NCNN 推論全在 :engine 內（libyakuyomi_ncnn）；sandbox 只透過引擎介面（Detector/Ocr/Inpainter/Yakuyomi/CharSegmenter），不直接依賴 runtime。
+    // NCNN 推論全在 :inference-core 內（libyakuyomi_ncnn）；sandbox 只透過引擎介面（Detector/Ocr/Inpainter/Yakuyomi/CharSegmenter），不直接依賴 runtime。
 }

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- inference-core 是純運算 library（NCNN 原生層 + 偵測 + 分群 + 模型下載），無需任何權限/元件；
+         下載用的網路權限由 app 自己宣告 -->
+</manifest>

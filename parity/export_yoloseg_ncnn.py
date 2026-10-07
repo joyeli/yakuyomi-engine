@@ -18,7 +18,7 @@ numpy 版，Kotlin `YoloSegPost` 照它移植、JVM 測試逐像素比）：
   ⚠️ 兩段雙線性都是 cv2.resize INTER_LINEAR（半像素中心、邊界夾住）；Kotlin 只在框的支撐區內算，結果相同。
 
 驗證：NCNN vs ONNX（ORT）的 out0 分數通道／out1；兩條路 + numpy 後處理的**聯集遮罩** IoU（12 頁）。
-`--fixture` 把 ch34_011 的 out0/out1（fp16）與期望遮罩寫進 engine/src/test/resources/charseg/。
+`--fixture` 把 ch34_011 的 out0/out1（fp16）與期望遮罩寫進 nightread-android/src/test/resources/charseg/。
 
 用法：
     python3 parity/export_yoloseg_ncnn.py              # 轉檔 + 驗證
@@ -46,7 +46,7 @@ OUTDIR = os.path.join(_OUT, "yoloseg")
 PARAM = os.environ.get("YAKU_YOLOSEG_NCNN_PARAM", os.path.join(OUTDIR, "manga_seg_s.ncnn.param"))
 BIN = os.environ.get("YAKU_YOLOSEG_NCNN_BIN", os.path.join(OUTDIR, "manga_seg_s.ncnn.bin"))
 PAGES = sorted(glob.glob(os.path.join(ROOT, "app-sandbox", "src", "main", "assets", "test", "*.*")))
-FIXTURE_DIR = os.path.join(ROOT, "engine", "src", "test", "resources", "charseg")
+FIXTURE_DIR = os.path.join(ROOT, "nightread-android", "src", "test", "resources", "charseg")
 
 SIZE = 1024
 CONF = 0.25

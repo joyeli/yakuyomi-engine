@@ -23,7 +23,7 @@ data class ModelSet(
     val aotInpainterNcnn: String? = null,
     /**
      * 夜讀人物分割 YOLO11-seg 的 NCNN 版（`manga_seg_s.ncnn.param`，同名 `.bin` 需在旁）。**選配**：缺了翻譯照常，
-     * 只是夜讀少一顆（兩顆都缺＝夜讀不可用）；給 [NightReadRenderer.charSegmenter]。
+     * 只是夜讀少一顆（兩顆都缺＝夜讀不可用）；給 :nightread-android 的 `NightReadRenderer.charSegmenter`。
      */
     val charSegYoloNcnn: String? = null,
     /** 夜讀人物分割 CartoonSegmentation（RTMDet-Ins）的 NCNN 版（`cartoonseg.ncnn.param`，同名 `.bin` 需在旁）。**選配**，同上。 */

@@ -38,10 +38,10 @@ class TextRegion(
 ) {
     var translatedText: String = ""
 
-    /** 此區是否「壓在畫面上」(去字走 lama 重建，非乾淨白泡)。由 [Inpainter] 設、[Renderer] 據此給黑字粗白邊（busy 背景好讀）。 */
+    /** 此區是否「壓在畫面上」(去字走 lama 重建，非乾淨白泡)。由 :engine 的 `Inpainter` 設、`Renderer` 據此給黑字粗白邊（busy 背景好讀）。 */
     var onArt: Boolean = false
 
-    /** auto 路由除錯：此區背景量到的 std / 亮度均值（由 [Inpainter] auto 分支設；-1＝未量）。sandbox 去背比較標在框上、調門檻用，產品不讀。 */
+    /** auto 路由除錯：此區背景量到的 std / 亮度均值（由 :engine 的 `Inpainter` auto 分支設；-1＝未量）。sandbox 去背比較標在框上、調門檻用，產品不讀。 */
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 

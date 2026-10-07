@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 
 /** manifest（models.json）裡的一顆遠端模型。 */
 data class RemoteModel(
-    val role: String,   // "detector" | "ocr" | "inpainter"（對齊 ModelSet 欄位）
+    val role: String,   // manifest 的 role 字串（現有 detector／ocr／inpainter／charseg；引擎不寫死清單）
     val name: String,   // 落地檔名
     val url: String,
     val size: Long,
@@ -30,8 +30,8 @@ sealed interface ModelProgress {
 
 /**
  * 模型 hosted 下載 + sha256 驗證——BYOM 的「自動版」，與手動放檔**並存**（下載進同一個 models 資料夾，
- * 下游 ModelSet 解析不變）。引擎只管「抓 + 驗 + 落檔」；觸發時機、進度 UI、目標資料夾由 reader 決定
- * （對照 [LlmModels] 的引擎/fork 分法）。
+ * 下游 :engine 的 `ModelSet` 解析不變）。引擎只管「抓 + 驗 + 落檔」；觸發時機、進度 UI、目標資料夾由 reader 決定
+ * （對照 :engine 的 `LlmModels` 的引擎/fork 分法）。
  *
  * manifest（models.json）＝單一真理來源：列每顆模型的 url / size / sha256 / role，**版本化** ⇒ 雜湊永遠對得上
  * （解掉「權重更新 → checksum 誤判」的舊顧慮）。下載後逐顆 sha256 驗證＝確定抓到的跟發行版是同一份。

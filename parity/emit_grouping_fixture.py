@@ -12,7 +12,7 @@ from collections import Counter
 
 from paths import RAW_DIR as RAW  # 集中路徑，見 paths.py
 DST = os.path.join(os.path.dirname(HERE),
-                   "engine/src/test/kotlin/li/joye/yakuyomi/engine/GroupingFixture.kt")
+                   "inference-core/src/test/kotlin/li/joye/yakuyomi/engine/GroupingFixture.kt")
 PAGES = ["002", "012"]
 
 

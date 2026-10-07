@@ -86,8 +86,12 @@ class NcnnForwardAbortedException(message: String = "低優先權推論被呼叫
  * 執行緒名都從建立者繼承、之後永不調整。若第一個呼叫者是低優先權的執行緒，整個行程之後的推論（含翻譯）都跑在低優先權的
  * worker 上。所以 [createNet]／[createNetEx] 第一次被呼叫前，先在一條明確設成 nice 0 的專用執行緒（[NCNN_POOL_THREAD_NAME]）
  * 上跑一次 2 緒 ReLU 把池建起來、join 等它做完（[ensureThreadPool]）。
+ *
+ * 不屬公開 API：在 :inference-core，給 :engine（偵測以外的 OCR／去字）與 :nightread-android（人物分割）用，所以標
+ * [InternalEngineApi]（原本是 internal，拆模組後跨不了模組）。
  */
-internal object NcnnBackend {
+@InternalEngineApi
+object NcnnBackend {
     private const val TAG = "NcnnBackend"
 
     /** 原生庫是否載得起來（缺 .so / 非 arm64 → false；三顆模型全 NCNN、沒有備援，呼叫端只能報錯）。 */
@@ -183,7 +187,7 @@ internal object NcnnBackend {
 
     private external fun cpuSupportsFp16Native(): Boolean
 
-    /** 這顆 CPU 有 fp16 storage/arithmetic（arm82 asimdhp）；OCR 混合精度 param 只在此為 true 時才能用（見 [Ocr]）。 */
+    /** 這顆 CPU 有 fp16 storage/arithmetic（arm82 asimdhp）；OCR 混合精度 param 只在此為 true 時才能用（見 :engine 的 `Ocr`）。 */
     val cpuSupportsFp16: Boolean by lazy { available && runCatching { cpuSupportsFp16Native() }.getOrDefault(false) }
 
     /**
@@ -356,7 +360,7 @@ internal object NcnnBackend {
      * 48px CTC OCR 單條：chw=[3,h,w]（h=48）+ pe=正弦位置表（至少 t×320，只讀前 t 列）→ JNI 內算完 argmax 與
      * top-1 log_softmax，填 idx[t]、logp[t]。回 t（>0=OK）；負值見 ncnn_jni.cpp。
      *
-     * [serialize]=false 時**不進 [ncnnLock]**：OCR 的 Net 以 num_threads=1 建（[Ocr] 並發模式），SimpleOMP 對
+     * [serialize]=false 時**不進 [ncnnLock]**：OCR 的 Net 以 num_threads=1 建（:engine 的 `Ocr` 並發模式），SimpleOMP 對
      * num_threads==1 的 parallel region 走 inline（simpleomp.cpp `__kmpc_fork_call`：不碰共用 task queue、全域初始化
      * 用 pthread_once）→ 多條 strip 可同時 forward，也不會與持鎖中的偵測/去字（走 task queue）互撞。這是 OCR 保住
      * 「8 行並發快 46%」的前提。非並發模式（num_threads>1）照舊序列化。

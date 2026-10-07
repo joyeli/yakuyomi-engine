@@ -1,7 +1,8 @@
 name: CI
 
-# 每次 push / PR 驗證整個 repo 能否正常編譯（:engine 函式庫 + :app-sandbox 測試 app）。
-# 只做「編譯/組裝」檢查——桌面 parity（Python，需模型權重與 fixtures）仍是手動跑，不在 CI。
+# 每次 push / PR 驗證整個 repo 能否正常編譯並跑 JVM 單元測試：三個函式庫模組（:inference-core 推論核心、
+# :engine 翻譯、:nightread-android 夜讀）+ :app-sandbox 測試 app。:nightread-android 單獨組得起來＝夜讀不帶翻譯也編得過
+# （它的依賴裡沒有 :engine）。桌面 parity（Python，需模型權重與 fixtures）仍是手動跑，不在 CI。
 on:
   push:
     branches: [main]
@@ -14,10 +15,14 @@ concurrency:
 
 jobs:
   build:
-    name: Compile engine + sandbox
+    name: Compile + unit-test engine modules + sandbox
     runs-on: ubuntu-latest
     steps:
+      # 夜讀函式庫是 submodule（根 settings 的 includeBuild）；沒有它設定階段就失敗（9 月加 submodule 後 CI 一直紅的原因：
+      # Could not find li.joye.yakuyomi:nightread:0.1.0）。夜讀模組的測試也讀 submodule 裡的測試頁。
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # 與本機一致：build 目標 JVM 17，但用 JDK 21 跑 Gradle/AGP 9（開發機是 Studio jbr 21）。
       - name: Set up JDK 21
@@ -34,7 +39,7 @@ jobs:
         with:
           packages: platform-tools
 
-      # 引擎的 NCNN 原生層需要 NDK + CMake（externalNativeBuild）；釘住與 engine/build.gradle.kts 一致的版本。
+      # NCNN 原生層在 :inference-core（externalNativeBuild）需要 NDK + CMake；釘住與 inference-core/build.gradle.kts 一致的版本。
       - name: Install NDK + CMake
         run: yes | sdkmanager "ndk;28.2.13676358" "cmake;3.22.1"
 
@@ -49,4 +54,8 @@ jobs:
       # local.properties gitignored、缺檔時 build 已有後備；api-keys.properties 已不再被 build 讀（key 只在 app 內輸入）
       # （api key → 空字串、SDK 路徑 → ANDROID_HOME），故 CI 不需提供即可編譯。
       - name: Assemble (compile check)
-        run: ./gradlew :engine:assembleDebug :app-sandbox:assembleDebug --no-daemon --stacktrace
+        run: ./gradlew :inference-core:assembleDebug :engine:assembleDebug :nightread-android:assembleDebug :app-sandbox:assembleDebug --no-daemon --stacktrace
+
+      # JVM 單元測試（核心 13、翻譯 39、夜讀 10；夜讀兩支整頁測試讀 nightread submodule 的測試頁，要上面的 recursive）。
+      - name: Unit tests
+        run: ./gradlew :inference-core:testDebugUnitTest :engine:testDebugUnitTest :nightread-android:testDebugUnitTest --no-daemon --stacktrace

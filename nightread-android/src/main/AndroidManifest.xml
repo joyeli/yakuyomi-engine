@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- nightread-android 是純運算 library（夜讀重繪膠水 + 人物分割），無需任何權限/元件 -->
+</manifest>
