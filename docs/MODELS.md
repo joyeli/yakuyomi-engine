@@ -47,7 +47,7 @@ These checksums are a distribution integrity check — they confirm the file you
 
 ## Night-reading models
 
-Night reading darkens the page itself — panels and backgrounds, region by region — and leaves the characters alone, so a page read at night is dim without the people in it going grey. It is **off by default**, the reader-side integration is still in progress, and the two models here are used only while it is on: translation never touches them, and `ModelSet.resolve` does not require them.
+Night reading darkens the page itself — panels and backgrounds, region by region — and leaves the characters alone, so a page read at night is dim without the people in it going grey. It is **off by default** (it shipped in the reader with Yakuyomi 0.23.0), and the two models here are used only while it is on: translation never touches them, and `ModelSet.resolve` does not require them.
 
 The recipe is **yolo ∪ cseg**, both on NCNN (fp16, CPU): the union of two character segmenters, because each misses characters the other finds. With both files present the engine unions their masks; with one it uses that one; with neither, night reading is unavailable. Text regions come from the same DBNet detector translation uses. Pages over 3.5 MPx are scaled down to that budget before detection, segmentation and re-rendering, and the output is the scaled size — the working set is about 40 bytes per pixel, and a 7 MPx page would take 20+ s.
 
