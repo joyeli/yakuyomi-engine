@@ -45,13 +45,60 @@ class TextRegion(
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 
-    /** 合併原文（lines 已依閱讀序排好）。日文無空白，直接相接。 */
-    val sourceText: String get() = lines.joinToString("") { it.text }
+    /**
+     * 排版可用框候選（各為 x0, y0, x1, y1）：由 :engine 的 `Inpainter` 對單色底區量到的「氣泡內部」裡的幾個內接矩形
+     * （由扁到高）；空＝`Renderer` 用 bbox 外擴。譯文（例：阿拉伯文、英文）常比原文長，照原文框排會縮到看不清；
+     * `Renderer` 從候選中挑能放下最大字級的那個，換行填滿氣泡、字級維持原文大小。
+     */
+    var layoutBoxes: List<FloatArray> = emptyList()
+
+    /** 原文字高（各行四邊形短邊的中位數，px）：排版時譯文字級的上限參考，維持與畫面相稱。 */
+    val lineHeight: Float
+        get() {
+            val hs = lines.map { ln ->
+                val q = ln.quad
+                if (q.size < 4) 0f else min(hypot(q[1].x - q[0].x, q[1].y - q[0].y), hypot(q[2].x - q[1].x, q[2].y - q[1].y))
+            }.sorted()
+            return if (hs.isEmpty()) 0f else hs[hs.size / 2]
+        }
+
+    /** 合併原文（lines 已依閱讀序排好）。日文無空白直接相接；英文等以空白分詞的行間補空白（行尾連字號接回單字）。 */
+    val sourceText: String get() = joinLines(lines.map { it.text })
 
     val x0: Float = lines.minOf { ln -> ln.quad.minOf { it.x } }
     val y0: Float = lines.minOf { ln -> ln.quad.minOf { it.y } }
     val x1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.x } }
     val y1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.y } }
+}
+
+/**
+ * 依閱讀序合併各行文字。任一邊是中日文字（或全形標點）→ 直接相接；否則（英文等）補一個空白，
+ * 但上一行以連字號結尾、下一行以字母開頭時視為斷字，去掉連字號直接相接（"DIF-" + "FERENT" → "DIFFERENT"）。
+ */
+fun joinLines(texts: List<String>): String {
+    val sb = StringBuilder()
+    for (raw in texts) {
+        val t = raw.trim()
+        if (t.isEmpty()) continue
+        if (sb.isEmpty()) { sb.append(t); continue }
+        val prev = sb[sb.length - 1]
+        val next = t[0]
+        when {
+            isCjkChar(prev) || isCjkChar(next) -> sb.append(t)
+            prev == '-' && next.isLetter() && sb.length >= 2 && sb[sb.length - 2].isLetter() -> {
+                sb.setLength(sb.length - 1); sb.append(t)
+            }
+            else -> sb.append(' ').append(t)
+        }
+    }
+    return sb.toString()
+}
+
+/** 中日文字與全形標點（行間不需空白；韓文有分詞空白，不算）。 */
+private fun isCjkChar(c: Char): Boolean {
+    val o = c.code
+    return o in 0x3000..0x30FF || o in 0x3400..0x4DBF || o in 0x4E00..0x9FFF ||
+        o in 0xF900..0xFAFF || o in 0xFF00..0xFFEF
 }
 
 object Grouping {
@@ -97,6 +144,48 @@ object Grouping {
             val (bw, bh) = orientedBox(pts, cx, cy, angle)
             TextRegion(ordered.map { lines[it] }, dir, angle, cx, cy, bw, bh)
         }
+    }
+
+    /**
+     * 分群後補一步（m-i-t 沒有、不影響 [group] 的 parity）：同一顆氣泡裡上下相疊、卻因字寬差太多被切成兩區的橫書行
+     * （例：「세상에!」＋「뺨자국 난거 봐!!」）合回一區——否則兩段譯文各自排版會互相重疊，翻譯也拿不到完整句子。
+     * 條件：兩區都是無傾斜橫書、字高比 ≤ 1.6、垂直間距 ≤ 0.9 行高（字高相近且水平重疊過半時 ≤ 1.25；可小幅重疊）、水平中心差 ≤ 較寬者一半。
+     */
+    fun mergeStacked(regions: List<TextRegion>): List<TextRegion> {
+        val rs = regions.toMutableList()
+        var merged = true
+        while (merged) {
+            merged = false
+            loop@ for (i in rs.indices) for (j in rs.indices) {
+                if (i == j) continue
+                val a = rs[i]; val b = rs[j]
+                if (a.direction != "h" || b.direction != "h" || a.angle != 0f || b.angle != 0f) continue
+                if ((a.y0 + a.y1) > (b.y0 + b.y1)) continue // a 在上
+                val lhA = a.lineHeight; val lhB = b.lineHeight
+                if (lhA <= 0f || lhB <= 0f) continue
+                val ratio = max(lhA, lhB) / min(lhA, lhB)
+                if (ratio > 1.6f) continue
+                val lh = min(lhA, lhB)
+                val gap = b.y0 - a.y1
+                // 行距：一般 ≤ 0.9 行高；字高相近（≤ 1.3 倍）且水平重疊夠多時放寬到 1.25 行高（旁白框常見的寬行距）
+                val overlap = min(a.x1, b.x1) - max(a.x0, b.x0)
+                val wide = ratio <= 1.3f && overlap >= 0.5f * min(a.x1 - a.x0, b.x1 - b.x0)
+                if (gap > (if (wide) 1.25f else 0.9f) * lh || gap < -0.5f * lh) continue
+                val acx = (a.x0 + a.x1) / 2f; val bcx = (b.x0 + b.x1) / 2f
+                if (abs(acx - bcx) > max(a.x1 - a.x0, b.x1 - b.x0) / 2f) continue
+                val lines = (a.lines + b.lines).sortedBy { ln -> ln.quad.sumOf { it.y.toDouble() } / ln.quad.size }
+                val pts = lines.flatMap { it.quad }
+                val m = TextRegion(
+                    lines, "h", 0f,
+                    pts.map { it.x }.average().toFloat(), pts.map { it.y }.average().toFloat(),
+                    max(a.x1, b.x1) - min(a.x0, b.x0), max(a.y1, b.y1) - min(a.y0, b.y0),
+                )
+                rs[i] = m; rs.removeAt(j)
+                merged = true
+                break@loop
+            }
+        }
+        return rs
     }
 
     /** 區域角度＝各行角度均值-90（度，對齊 textline_merge dispatch）；<3° 視為 0。 */

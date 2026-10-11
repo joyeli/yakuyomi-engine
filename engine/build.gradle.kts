@@ -27,6 +27,20 @@ android {
         }
     }
 
+    // 桌面整頁測試（PageHarnessTest，預設略過）：Robolectric 原生圖形＝真的 Bitmap／Canvas／字形排版。
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all {
+            it.systemProperty("robolectric.graphicsMode", "NATIVE")
+            System.getenv("ROBOLECTRIC_REPO_URL")?.let { url -> it.systemProperty("robolectric.dependency.repo.url", url) }
+            System.getenv("YAKU_NATIVE_DIR")?.let { dir -> it.systemProperty("java.library.path", dir) }
+            listOf("YAKU_HARNESS_PAGES", "YAKU_HARNESS_MODELS", "YAKU_HARNESS_OUT", "YAKU_HARNESS_TRANSLATIONS",
+                "YAKU_HARNESS_FONT", "YAKU_HARNESS_ONLY", "YAKU_HARNESS_CLEAN", "YAKU_HARNESS_INPAINT", "YAKU_HARNESS_PLACEHOLDER", "YAKU_HARNESS_ORIENT")
+                .forEach { k -> System.getenv(k)?.let { v -> it.environment(k, v) } }
+            it.maxHeapSize = "4g"
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -48,4 +62,5 @@ dependencies {
     implementation(libs.okhttp)
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.16")
 }

@@ -39,6 +39,44 @@ class Detector(
      * 後處理＝[linesFromProbMap]（連通元件+minAreaRect+unclip；score=component-mean prob＝DB box_score_fast）。
      */
     fun detect(page: Bitmap): Detection {
+        val w = page.width
+        val h = page.height
+        if (h <= w * TALL_RATIO) return detectSingle(page)
+        // 長條頁（條漫／webtoon）：整頁長邊縮到 dbnetInputSize 會把字縮小好幾倍（690×2500 → 寬只剩 ~280px），小字整個偵測不到。
+        // 改成沿長邊切「寬×TILE_ASPECT」的重疊塊各自偵測：每塊只收中心落在自己核心區的行、遮罩只取核心區的列。
+        val tileH = (w * TILE_ASPECT).roundToInt().coerceAtMost(h)
+        val overlap = (tileH * TILE_OVERLAP).roundToInt()
+        val lines = ArrayList<TextLine>()
+        val maskPx = IntArray(w * h) { MASK_OFF }
+        var y0 = 0
+        var coreTop = 0
+        while (true) {
+            val last = y0 + tileH >= h
+            if (last) y0 = h - tileH
+            val tile = Bitmap.createBitmap(page, 0, y0, w, tileH)
+            val d = detectSingle(tile)
+            val coreBot = if (last) h else y0 + tileH - overlap / 2
+            for (ln in d.lines) {
+                val q = ln.quad.map { Pt(it.x, it.y + y0) }
+                val cy = q.sumOf { it.y.toDouble() } / q.size
+                if (cy >= coreTop && cy < coreBot) lines += TextLine(q, ln.score)
+            }
+            val tp = IntArray(w * tileH)
+            d.textMask.getPixels(tp, 0, w, 0, 0, w, tileH)
+            for (yy in coreTop until coreBot) System.arraycopy(tp, (yy - y0) * w, maskPx, yy * w, w)
+            d.textMask.recycle()
+            if (tile !== page) tile.recycle()
+            if (last) break
+            coreTop = coreBot
+            y0 += tileH - overlap
+        }
+        val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        mask.setPixels(maskPx, 0, w, 0, 0, w, h)
+        Log.i(TAG, "DBNet 長條分塊偵測到 ${lines.size} 行（${w}x$h，塊高 $tileH）")
+        return Detection(lines, mask)
+    }
+
+    private fun detectSingle(page: Bitmap): Detection {
         val pre = ImageOps.detectorChwDbnet(page, cfg.dbnetInputSize, cfg.detectUnsharp)
         val inW = pre.w
         val inH = pre.h
@@ -101,6 +139,12 @@ class Detector(
         private const val TAG = "Detector"
         private const val MASK_ON = 0xFFFFFFFF.toInt()
         private const val MASK_OFF = 0xFF000000.toInt()
+        /** 長邊 > 短邊×此值 → 分塊偵測（一般單頁 ~1.4）。 */
+        private const val TALL_RATIO = 1.8f
+        /** 分塊高＝頁寬×此值（縮到 dbnetInputSize 時字幾乎不縮）。 */
+        private const val TILE_ASPECT = 1.4f
+        /** 相鄰塊重疊比例（> 單行字高×2，行不會被切在兩塊的核心交界）。 */
+        private const val TILE_OVERLAP = 0.25f
 
         /**
          * DBNet 的前處理：resize_aspect 到長邊 [size]、pad 到 256 倍數、/127.5−1。

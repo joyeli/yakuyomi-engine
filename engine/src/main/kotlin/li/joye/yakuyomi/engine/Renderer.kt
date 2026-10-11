@@ -62,7 +62,9 @@ object Renderer {
             } else {
                 x0 = region.x0; y0 = region.y0; x1 = region.x1; y1 = region.y1
             }
+            val boxes = region.layoutBoxes
             if (vertical) drawVertical(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt)
+            else if (boxes.isNotEmpty() && !rotate) drawHorizontalFit(canvas, boxes, region.lineHeight, text, fill, stroke, cfg, region.onArt)
             else drawHorizontal(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt)
             if (rotate) canvas.restore()
         }
@@ -222,12 +224,79 @@ object Renderer {
         val lh = size * 1.18f
         val tcx = (x0 + x1) / 2f
         var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT  // 垂直置中於框
+        val pageW = canvas.width.toFloat()
         for (ln in lines) {
-            val tx = tcx - fill.measureText(ln) / 2f
+            val lw = fill.measureText(ln)
+            // 置中後若超出頁緣（框貼頁邊、放大後的框比頁寬多）→ 推回頁內，避免句首／句尾被裁掉。
+            val tx = if (lw + 2 * EDGE_MARGIN <= pageW) {
+                (tcx - lw / 2f).coerceIn(EDGE_MARGIN, pageW - lw - EDGE_MARGIN)
+            } else {
+                tcx - lw / 2f
+            }
             if (cfg.fontBorder) canvas.drawText(ln, tx, baseline, stroke)
             canvas.drawText(ln, tx, baseline, fill)
             baseline += lh
         }
+    }
+
+    /**
+     * 橫排、排進已知可用框（氣泡內部，見 TextRegion.layoutBox）：字級上限＝原文字高×[FIT_SIZE_RATIO]（與畫面相稱），
+     * 由大往小找第一個「換行後塞得進框」的字級；行距用字型實際高度（阿拉伯文等上下伸部較長的字也不互撞）。
+     */
+    private fun drawHorizontalFit(canvas: Canvas, boxes: List<FloatArray>, srcLineH: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean) {
+        // 阿拉伯字母（阿拉伯文、波斯文、烏爾都文…）同 px 字面明顯比韓／日／拉丁大寫小，上限放寬才看起來與原文同大
+        val ratio = if (text.any { it.code in 0x0600..0x06FF || it.code in 0x0750..0x077F || it.code in 0xFB50..0xFEFF }) FIT_SIZE_RATIO_ARABIC else FIT_SIZE_RATIO
+        val cap = if (srcLineH > 0f) (srcLineH * ratio).roundToInt() else cfg.fontSizeMax
+        val maxS = min(cfg.fontSizeMax, cap).coerceAtLeast(cfg.fontSizeMin)
+        var size = cfg.fontSizeMin
+        var lines: List<String>? = null
+        var box = boxes.last()
+        search@ for (s in maxS downTo cfg.fontSizeMin) {
+            fill.textSize = s.toFloat()
+            for (b in boxes) {
+                val bw = (b[2] - b[0]) * (1f - 2 * FIT_INSET)
+                val bh = (b[3] - b[1]) * (1f - 2 * FIT_INSET)
+                if (bw < s) continue
+                val ls = wrapCjk(text, fill, bw)
+                val maxW = ls.maxOfOrNull { fill.measureText(it) } ?: 0f
+                if (blockInkHeight(ls, fill) <= bh && maxW <= bw) { size = s; lines = ls; box = b; break@search }
+            }
+        }
+        val bw = (box[2] - box[0]) * (1f - 2 * FIT_INSET)
+        fill.textSize = size.toFloat(); stroke.textSize = size.toFloat()
+        val ls = lines ?: wrapCjk(text, fill.apply { textSize = size.toFloat() }, bw.coerceAtLeast(size.toFloat()))
+        stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))
+        val lh = size * LINE_SPACING
+        val (top, bottom) = inkExtent(ls, fill)
+        val tcx = (box[0] + box[2]) / 2f
+        // 以實際墨跡置中：整塊高＝(行數−1)×行距＋單行墨跡高
+        var baseline = (box[1] + box[3]) / 2f - ((ls.size - 1) * lh + (bottom - top)) / 2f - top
+        val pageW = canvas.width.toFloat()
+        for (ln in ls) {
+            val lw = fill.measureText(ln)
+            val tx = if (lw + 2 * EDGE_MARGIN <= pageW) (tcx - lw / 2f).coerceIn(EDGE_MARGIN, pageW - lw - EDGE_MARGIN) else tcx - lw / 2f
+            if (cfg.fontBorder) canvas.drawText(ln, tx, baseline, stroke)
+            canvas.drawText(ln, tx, baseline, fill)
+            baseline += lh
+        }
+    }
+
+    /** 各行墨跡相對基線的最高（負）與最低點。 */
+    private fun inkExtent(lines: List<String>, p: Paint): Pair<Float, Float> {
+        val r = android.graphics.Rect()
+        var top = 0f; var bottom = 0f
+        for (ln in lines) {
+            if (ln.isEmpty()) continue
+            p.getTextBounds(ln, 0, ln.length, r)
+            top = min(top, r.top.toFloat()); bottom = maxOf(bottom, r.bottom.toFloat())
+        }
+        if (bottom - top <= 0f) { top = -p.textSize * ASCENT; bottom = p.textSize * (1f - ASCENT) }
+        return top to bottom
+    }
+
+    private fun blockInkHeight(lines: List<String>, p: Paint): Float {
+        val (top, bottom) = inkExtent(lines, p)
+        return (lines.size - 1) * p.textSize * LINE_SPACING + (bottom - top)
     }
 
     private fun drawCharVertical(canvas: Canvas, ch: Char, cx: Float, cyc: Float, fill: Paint, stroke: Paint, border: Boolean) {
@@ -243,6 +312,8 @@ object Renderer {
     }
 
     private fun wrapCjk(text: String, paint: Paint, maxW: Float): List<String> {
+        // 非中日文（阿拉伯文、拉丁字母、韓文…）按詞換行：逐字切會把詞拆兩半（阿拉伯文連寫字形也會斷開）。
+        if (!isCjk(text)) return wrapWords(text, paint, maxW)
         val lines = ArrayList<String>()
         val cur = StringBuilder()
         for (ch in text) {
@@ -256,7 +327,28 @@ object Renderer {
         return lines
     }
 
+    /** 按空白分詞換行；詞本身比行寬長也不拆（交給呼叫端縮字級——拆詞會讓阿拉伯文等連寫字形斷開）。 */
+    private fun wrapWords(text: String, paint: Paint, maxW: Float): List<String> {
+        val lines = ArrayList<String>()
+        for (para in text.split('\n')) {
+            var cur = ""
+            for (word in para.split(' ').filter { it.isNotEmpty() }) {
+                val cand = if (cur.isEmpty()) word else "$cur $word"
+                if (cur.isEmpty() || paint.measureText(cand) <= maxW) { cur = cand; continue }
+                lines.add(cur)
+                cur = word
+            }
+            lines.add(cur)
+        }
+        return lines.filter { it.isNotEmpty() }.ifEmpty { listOf("") }
+    }
+
     private const val ASCENT = 0.82f
+    private const val EDGE_MARGIN = 4f  // 橫排行與頁緣的最小距離（px）
+    private const val FIT_INSET = 0.04f       // 可用框四邊各內縮此比例（離氣泡外框留白；框本身已在外框內）
+    private const val FIT_SIZE_RATIO = 1.2f   // 譯文字級上限＝原文字高×此值（阿拉伯文等字面比韓／日文小，同 px 看起來較小）
+    private const val FIT_SIZE_RATIO_ARABIC = 1.8f   // 阿拉伯字母主體高約 0.45em（韓／日／拉丁大寫約 0.75em）
+    private const val LINE_SPACING = 1.3f     // 排進框時的行距＝字級×此值
     private const val STROKE_RATIO = 0.10f  // 描邊寬＝字級×此比例（隨字級縮放）
     private const val MAX_TCY = 4  // 縱中橫一格最多併幾個 ASCII（涵蓋 2 位數年齡、4 位數年份；更長退回逐字避免壓太扁）
     private const val ROTATE_CHARS = "ー－—―‐~〜～…‥（）()「」『』【】〔〕［］｛｝〈〉《》＜＞<>｜|：;"
