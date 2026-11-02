@@ -226,7 +226,7 @@ class NightProbeActivity : AppCompatActivity() {
 
     companion object {
         private const val PREF_TREE = "modelTree" // 跟 MainActivity 同一個資料夾
-        const val BUILD_TAG = "v3.0-nightprobe"
-        private val UI_HIDDEN = listOf("ENV\t", "PRIM\t", "BIN\t", "PAIR\t", "NUM\t", "LOAD\t", "EXPECT\t", "STEP_OK\t", "STEP\t")
+        const val BUILD_TAG = "v3.1-nightprobe"
+        private val UI_HIDDEN = listOf("ENV\t", "PRIM\t", "BIN\t", "GRAY\t", "PAIR\t", "NUM\t", "LOAD\t", "EXPECT\t", "STEP_OK\t", "STEP\t")
     }
 }

@@ -49,8 +49,8 @@ android {
         applicationId = "li.joye.yakuyomi.sandbox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.5-nightprobe-3a"
+        versionCode = 5
+        versionName = "0.6-nightprobe-3b"
         // 只打 arm64-v8a（實機）：NCNN 原生層由 :inference-core 提供（libyakuyomi_ncnn，ncnn 預編庫本來就只出 arm64），
         // 其他 ABI 沒有可用的推論後端，打進去只是白佔空間；sandbox 不再自帶 native build。
         ndk { abiFilters += "arm64-v8a" }

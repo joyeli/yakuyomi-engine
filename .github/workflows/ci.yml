@@ -56,7 +56,7 @@ jobs:
       - name: Assemble (compile check)
         run: ./gradlew :inference-core:assembleDebug :engine:assembleDebug :nightread-android:assembleDebug :app-sandbox:assembleDebug --no-daemon --stacktrace
 
-      # JVM 單元測試（核心 13、翻譯 39、夜讀 10、sandbox 探針的守門摘要 2、關卡判定 9 與第 3a 階 3；夜讀與探針的整頁測試讀 nightread submodule 的測試頁，要上面的 recursive）。
+      # JVM 單元測試（核心 20、翻譯 42、夜讀 26、sandbox 探針的守門摘要 2、關卡判定 9、第 3a 階 3 與第 3b 階 3；夜讀與探針的整頁測試讀 nightread submodule 的測試頁，要上面的 recursive）。
       - name: Unit tests
         run: ./gradlew :inference-core:testDebugUnitTest :engine:testDebugUnitTest :nightread-android:testDebugUnitTest :app-sandbox:testDebugUnitTest --no-daemon --stacktrace
 

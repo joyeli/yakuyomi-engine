@@ -26,7 +26,8 @@ import li.joye.yakuyomi.nightread.NightReadInput
  * 確認 Kotlin 那半不會丟例外（兩邊都丟例外在手機上算相同，那種案例比了等於沒比）。
  */
 internal object ProbeBinExtras {
-    class Case(val op: String, val tag: String, val kotlin: () -> Any, val native: () -> Any)
+    /** 一組比對。[fma]＝這一組在電腦上核對過合成 FMA 會改結果（只有第 3b 階的 [ProbeGrayExtras] 逐組標；第 3a 階照運算算，見 [FMA_SENSITIVE]）。 */
+    class Case(val op: String, val tag: String, val kotlin: () -> Any, val native: () -> Any, val fma: Boolean = false)
 
     /** 多邊形數（0–16 個頂點輪流，每種 200 個）。 */
     const val POLYGON_CASES = 3400

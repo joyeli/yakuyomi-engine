@@ -5,6 +5,7 @@ import android.os.Process
 import androidx.documentfile.provider.DocumentFile
 import li.joye.yakuyomi.engine.NcnnBackend
 import li.joye.yakuyomi.nightread.NightBinWorkload
+import li.joye.yakuyomi.nightread.NightGrayWorkload
 import li.joye.yakuyomi.nightread.NightNative
 import li.joye.yakuyomi.nightread.NightNativePrims
 import li.joye.yakuyomi.nightread.NightNumericProbe
@@ -17,8 +18,9 @@ import java.io.File
  * 夜讀 C++ 探針本體，跑在一條普通的工作執行緒上（預設堆疊、預設優先權，跟之後產品呼叫 C++ 的條件一樣）：
  *  (a) 8 頁守門摘要（Kotlin）；
  *  (b) 數值核心：C++ 對 ART 的 StrictMath、捨入、BigDecimal、常數表；
- *  (c) 影像原語：同行程差分＋計時（先暖機）。第 2 階的 5 族（步驟 c）、第 3a 階的二值原語（步驟 c3a，[NightBinWorkload]），
- *      以及步驟表沒有的第 3a 階原語只比位元（步驟 c3a.x）；
+ *  (c) 影像原語：同行程差分＋計時（先暖機）。第 2 階的 5 族（步驟 c）、第 3a 階的二值原語（步驟 c3a，[NightBinWorkload]）、
+ *      第 3b 階的灰階／濾波／繪圖／numpy 原語（步驟 c3b，[NightGrayWorkload]），以及步驟表沒涵蓋的第 3a、3b 階案例只比位元
+ *      （步驟 c3a.x、c3b.x）；
  *  (d) 模型：緒數矩陣、兩兩同時跑、吞吐。
  *
  * 每一步先記「正在跑」再動手：閃退時下次開 app 看得出是哪一步（[ProbeRecovery]）。一步丟例外（含 OOM）只記 FAIL，繼續下一步。
@@ -172,7 +174,7 @@ class NightProbeRunner(
                 "soLoaded" to so, "nightNative" to NightNative.available(),
                 "numericBridge" to NightNumericProbe.available(),
                 "rulesVersion" to NightRead.RULES_VERSION, "abi" to NightNative.ABI_VERSION,
-                "workload" to NightPrimWorkload.VERSION, "binWorkload" to NightBinWorkload.VERSION,
+                "workload" to NightPrimWorkload.VERSION, "binWorkload" to NightBinWorkload.VERSION, "grayWorkload" to NightGrayWorkload.VERSION,
             )
             so
         } == true
@@ -184,6 +186,9 @@ class NightProbeRunner(
         cooldown()
         step("c3a", "(c) 第 3a 階影像原語（二值、形態學、距離）：比位元、比時間（約 2–3 分鐘）") { stepBin() }
         step("c3a.x", "(c) 第 3a 階補充：步驟表沒有的原語，只比位元（約 30 秒）") { stepBinExtra() }
+        cooldown()
+        step("c3b", "(c) 第 3b 階影像原語（灰階、濾波、繪圖、numpy）：比位元、比時間（約 2–3 分鐘）") { stepGray() }
+        step("c3b.x", "(c) 第 3b 階補充：步驟表沒涵蓋的參數與尺寸，只比位元（約 1 分鐘）") { stepGrayExtra() }
         cooldown()
         // 不管 (d) 發生什麼事都要有摘要：(a)(b)(c) 的關卡數字才不會只剩散落的 GATE 列
         var modelsReady = true
@@ -265,6 +270,7 @@ class NightProbeRunner(
         val nativeNs: Long,
         val identical: Boolean,
         val peakBytes: Long,
+        val fma: Boolean = false,
     )
 
     /** 一族（[family] null＝合計）的加權總和，取自各自工作量的 summarize。 */
@@ -272,8 +278,11 @@ class NightProbeRunner(
         val ratio: Double get() = kotlinNs / nativeNs
     }
 
-    /** 一組原語寫的紀錄種類：第 2 階沿用 WARM／PRIM／PRIM_PAGE／PRIM_TOTAL（跟 nightprobe-2 一樣），第 3a 階用 BIN_*。[label] 接在暖機警告後面。 */
-    private class DiffKinds(val warm: String, val step: String, val page: String, val total: String, val label: String)
+    /**
+     * 一組原語寫的紀錄種類：第 2 階沿用 WARM／PRIM／PRIM_PAGE／PRIM_TOTAL（跟 nightprobe-2 一樣），第 3a 階用 BIN_*，第 3b 階用 GRAY_*。
+     * [label] 接在暖機警告後面；[fma]＝逐步的列多一欄 fma（這一步合成 FMA 會不會改結果，第 3b 階才有）。
+     */
+    private class DiffKinds(val warm: String, val step: String, val page: String, val total: String, val label: String, val fma: Boolean = false)
 
     /** [different]＝正式量時有任一次不同的步驟；[warmDifferent]＝暖機時不同的「頁/步驟」。 */
     private class DiffOutcome(val rows: List<DiffRow>, val sums: List<DiffSum>, val different: List<String>, val warmDifferent: Set<String>)
@@ -314,10 +323,11 @@ class NightProbeRunner(
         for (pg in pages) {
             val rs = differential(pg.input, PRIM_REPEAT) { res ->
                 val r = row(res)
-                report.line(
-                    kinds.step, "page" to pg.name, "step" to r.id, "family" to r.family, "weight" to r.weight,
+                val cols = arrayOf<Pair<String, Any?>>(
+                    "page" to pg.name, "step" to r.id, "family" to r.family, "weight" to r.weight,
                     "kotlinUs" to r.kotlinNs / 1000, "cppUs" to r.nativeNs / 1000, "identical" to r.identical, "peakKB" to r.peakBytes / 1024,
                 )
+                if (kinds.fma) report.line(kinds.step, *cols, "fma" to r.fma) else report.line(kinds.step, *cols)
             }
             raw += rs
             for (s in summarize(rs)) {
@@ -394,10 +404,52 @@ class NightProbeRunner(
         )
     }
 
-    /** 補充比對一種運算的累計。時間只是參考：整張影像的原語，C++ 取原語本身的耗時（不含 JNI 複製）；ellipse、rect、polygonArea 含 JNI。 */
+    /**
+     * 第 3b 階的灰階、濾波、繪圖、numpy 原語（[NightGrayWorkload]：GMORPH、FILTER、EDGE、DRAW、SPARSE、NUMPY）。關卡同第 3a 階：只有「全部相同」
+     * （要比滿整張步驟表）；倍數只做參考。步驟表標了 fmaSensitive 的步驟（可分離濾波）合成 FMA 會改結果，所以這幾步相同＝手機上的 C++
+     * 沒把 Float 乘加合成 FMA（CI 另外掃反組譯）：關卡列出比到幾步、哪幾步。
+     */
+    private fun stepGray() {
+        if (!NightNative.available()) {
+            report.line("GATE", "key" to "gray_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
+            return
+        }
+        val pages = primPages()
+        val want = pages.sumOf { pg -> graySteps(pg.input.gray.w, pg.input.gray.h) }
+        val fmaWant = pages.sumOf { pg -> grayFmaSteps(pg.input.gray.w, pg.input.gray.h) }
+        val o = diffSet(
+            GRAY_KINDS, pages,
+            { p: NightReadInput, rep: Int, cb: ((NightGrayWorkload.StepResult) -> Unit)? -> NightGrayWorkload.differential(p.gray, p.seg, p.charMask, rep, cb) },
+            { r -> DiffRow(r.step.id, r.step.family.toString(), r.step.weight, r.kotlinNs, r.nativeNs, r.identical, r.nativePeakBytes, r.step.fmaSensitive) },
+            { rs -> NightGrayWorkload.summarize(rs).map { DiffSum(it.family?.name, it.kotlinWeightedNs, it.nativeWeightedNs, it.identical) } },
+        )
+        val fmaRows = o.rows.filter { it.fma }
+        val fmaIds = fmaRows.map { it.id }.distinct()
+        // 暖機時不同的也算（[DiffOutcome.warmDifferent] 是「頁/步驟」）
+        val fmaDifferent = (fmaRows.filter { !it.identical }.map { it.id } + o.warmDifferent.map { it.substringAfter('/') }.filter { it in fmaIds }).distinct()
+        report.line(
+            "GATE", "key" to "gray_identical", "pass" to ProbeRecords.verdict(o.different.size + o.warmDifferent.size, o.rows.size, want),
+            "steps" to o.rows.size, "want" to want, "fmaSteps" to fmaRows.size, "fmaWant" to fmaWant,
+            "fmaIds" to fmaIds.joinToString(","), "fmaDifferent" to fmaDifferent.joinToString(","),
+            "different" to o.different.joinToString(","), "warmDifferent" to o.warmDifferent.joinToString(","),
+            "workload" to NightGrayWorkload.VERSION,
+        )
+        val total = o.sums.last()
+        report.line(
+            "GATE", "key" to "gray_ratio", "ratio" to "%.3f".format(total.ratio), "perFamily" to perFamily(o.sums),
+            "note" to "只做參考、不是關卡；權重＝一頁產品兩檔的實際呼叫次數（6 頁中位數，NightGrayWorkload 檔頭；20 條線、2000 點一步的已除掉），一頁中位數 0 次的權重 0；C++ 時間不含 JNI 複製",
+        )
+    }
+
+    /**
+     * 補充比對一種運算的累計。時間只是參考：整張影像的原語，C++ 取原語本身的耗時（不含 JNI 複製）；回傳不是 Timed 的（ellipse、rect、
+     * polygonArea、npSum、npArgsort、eigh2、gaussW）含 JNI。
+     */
     private class Extra {
         var cases = 0
         var diffs = 0
+        var fmaCases = 0
+        var fmaDiffs = 0
         var kotlinNs = 0L
         var nativeNs = 0L
         val firstDiffs = ArrayList<String>()
@@ -410,12 +462,45 @@ class NightProbeRunner(
         Result.failure(e)
     }
 
-    /** 步驟表沒有的第 3a 階原語，只比位元（案例見 [ProbeBinExtras]）。 */
+    /** 步驟表沒有的第 3a 階原語，只比位元（案例見 [ProbeBinExtras]）。紀錄與 nightprobe-3 相同：BIN_EXTRA 的 fma 欄照運算標。 */
     private fun stepBinExtra() {
         if (!NightNative.available()) {
             report.line("GATE", "key" to "bin_extra_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
             return
         }
+        extraSet(
+            "BIN_EXTRA", "bin_extra_identical", "第 3a 階", ProbeBinExtras.globalCases(), { pg -> ProbeBinExtras.pageCases(pg.name, pg.input) },
+            ProbeBinExtras::same, { c -> c.op in ProbeBinExtras.FMA_SENSITIVE }, perCaseFma = false,
+        )
+    }
+
+    /** 步驟表沒涵蓋的第 3b 階參數與尺寸，只比位元（案例見 [ProbeGrayExtras]）。會受 FMA 影響的逐組標（電腦上核對過的整頁可分離濾波）。 */
+    private fun stepGrayExtra() {
+        if (!NightNative.available()) {
+            report.line("GATE", "key" to "gray_extra_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
+            return
+        }
+        extraSet(
+            "GRAY_EXTRA", "gray_extra_identical", "第 3b 階", ProbeGrayExtras.globalCases(), { pg -> ProbeGrayExtras.pageCases(pg.name, pg.input) },
+            ProbeGrayExtras::same, { c -> c.fma }, perCaseFma = true,
+        )
+    }
+
+    /**
+     * 補充比對：跟頁無關的 [global] 先比，再逐頁建案例、比、丟掉（整頁的輸入不同時留在記憶體）。每種運算一列 [kind]、最後一列關卡 [gateKey]。
+     * [perCaseFma] false（第 3a 階，紀錄格式不變）＝每列的 fma 欄是「這種運算會受 FMA 影響」；true（第 3b 階）＝每列記 fmaCases／fmaDiffs、
+     * 關卡多 fmaDiffs。關卡的 fmaCases 都是 [isFma] 為真的組數。
+     */
+    private fun extraSet(
+        kind: String,
+        gateKey: String,
+        label: String,
+        global: List<ProbeBinExtras.Case>,
+        pageCases: (PrimPage) -> List<ProbeBinExtras.Case>,
+        same: (Any, Any) -> Boolean,
+        isFma: (ProbeBinExtras.Case) -> Boolean,
+        perCaseFma: Boolean,
+    ) {
         val ex = LinkedHashMap<String, Extra>()
         fun cmp(c: ProbeBinExtras.Case) {
             val e = ex.getOrPut(c.op) { Extra() }
@@ -426,26 +511,29 @@ class NightProbeRunner(
             val t2 = System.nanoTime()
             val timed = raw.getOrNull() as? NightNativePrims.Timed<*>
             val b = if (timed != null) Result.success(timed.value ?: Unit) else raw
+            val fma = isFma(c)
             e.cases++
+            if (fma) e.fmaCases++
             e.kotlinNs += t1 - t0
             e.nativeNs += timed?.nanos ?: (t2 - t1)
-            val same = when {
+            val ok = when {
                 a.isFailure && b.isFailure -> true
-                a.isSuccess && b.isSuccess -> ProbeBinExtras.same(a.getOrThrow(), b.getOrThrow())
+                a.isSuccess && b.isSuccess -> same(a.getOrThrow(), b.getOrThrow())
                 else -> false
             }
-            if (!same) {
+            if (!ok) {
                 e.diffs++
+                if (fma) e.fmaDiffs++
                 if (e.firstDiffs.size < 3) e.firstDiffs += c.tag
                 report.line(
-                    "WARN", "what" to "第 3a 階補充比對不同", "op" to c.op, "case" to c.tag,
+                    "WARN", "what" to "${label}補充比對不同", "op" to c.op, "case" to c.tag,
                     "kotlin" to (a.exceptionOrNull()?.javaClass?.simpleName ?: "ok"), "cpp" to (b.exceptionOrNull()?.javaClass?.simpleName ?: "ok"),
                 )
             }
         }
-        ProbeBinExtras.globalCases().forEach(::cmp)
+        global.forEach(::cmp)
         for (pg in primPages()) {
-            ProbeBinExtras.pageCases(pg.name, pg.input).forEach(::cmp)
+            pageCases(pg).forEach(::cmp)
             report.publish(force = false)
         }
         var cases = 0
@@ -453,16 +541,23 @@ class NightProbeRunner(
         for ((op, e) in ex) {
             cases += e.cases
             diffs += e.diffs
-            report.line(
-                "BIN_EXTRA", "op" to op, "cases" to e.cases, "diffs" to e.diffs, "kotlinUs" to e.kotlinNs / 1000, "cppUs" to e.nativeNs / 1000,
-                "fma" to (op in ProbeBinExtras.FMA_SENSITIVE), "firstDiffs" to e.firstDiffs.joinToString(","),
-            )
+            val head = arrayOf<Pair<String, Any?>>("op" to op, "cases" to e.cases, "diffs" to e.diffs, "kotlinUs" to e.kotlinNs / 1000, "cppUs" to e.nativeNs / 1000)
+            if (perCaseFma) {
+                report.line(kind, *head, "fmaCases" to e.fmaCases, "fmaDiffs" to e.fmaDiffs, "firstDiffs" to e.firstDiffs.joinToString(","))
+            } else {
+                report.line(kind, *head, "fma" to (e.fmaCases > 0), "firstDiffs" to e.firstDiffs.joinToString(","))
+            }
         }
-        report.line(
-            "GATE", "key" to "bin_extra_identical", "pass" to (diffs == 0 && cases > 0), "cases" to cases, "diffs" to diffs,
-            "fmaCases" to ex.filterKeys { it in ProbeBinExtras.FMA_SENSITIVE }.values.sumOf { it.cases },
-            "different" to ex.filterValues { it.diffs > 0 }.keys.joinToString(","),
-        )
+        val fmaCases = ex.values.sumOf { it.fmaCases }
+        val tail = arrayOf<Pair<String, Any?>>("different" to ex.filterValues { it.diffs > 0 }.keys.joinToString(","))
+        if (perCaseFma) {
+            report.line(
+                "GATE", "key" to gateKey, "pass" to (diffs == 0 && cases > 0), "cases" to cases, "diffs" to diffs,
+                "fmaCases" to fmaCases, "fmaDiffs" to ex.values.sumOf { it.fmaDiffs }, *tail,
+            )
+        } else {
+            report.line("GATE", "key" to gateKey, "pass" to (diffs == 0 && cases > 0), "cases" to cases, "diffs" to diffs, "fmaCases" to fmaCases, *tail)
+        }
     }
 
     // ── (d) ─────────────────────────────────────────────────────────────────
@@ -726,7 +821,7 @@ class NightProbeRunner(
         out += "SUMMARY\t總時間 ${secs()} 秒（這一輪）；可除錯=${env.debuggable()}；警告 $warns 筆；離開最上層 ${fg.left} 次；閃退過的步驟：${state.crashed.joinToString(",").ifEmpty { "無" }}；失敗的步驟：${failed.joinToString(",").ifEmpty { "無" }}"
         if (!modelsReady) out += "SUMMARY\t★ (d) 的模型沒準備好，這一輪還沒跑完（換資料夾後按「接著跑」）"
         if (fg.left > 0 || fg.steps.isNotEmpty()) {
-            val hit = listOfNotNull("第 3 項".takeIf { "c" in fg.steps }, "第 5c 項".takeIf { "c3a" in fg.steps })
+            val hit = listOfNotNull("第 3 項".takeIf { "c" in fg.steps }, "第 5c 項".takeIf { "c3a" in fg.steps }, "第 6c 項".takeIf { "c3b" in fg.steps })
             out += "SUMMARY\t★ 中途離開過畫面：這台手機切走後只給 5 顆核心，這幾步的時間偏慢：${fg.steps.joinToString(",")}${if (hit.isEmpty()) "" else "（含 (c)，下面${hit.joinToString("、")}的倍數要打折看）"}"
         }
         out += "SUMMARY\t1. 手機上 Kotlin 摘要等於電腦：${pf("kotlin_digest")}（${g("kotlin_digest")?.get("digest")?.take(16) ?: "-"}）"
@@ -738,16 +833,43 @@ class NightProbeRunner(
         out += "SUMMARY\t5a. 第 3a 階原語逐位元相同（這一階的關卡）：${pf("bin_identical")}（${g("bin_identical")?.get("steps") ?: "-"}／${g("bin_identical")?.get("want") ?: "-"} 步；不同：${g("bin_identical")?.get("different")?.ifEmpty { "無" } ?: "-"}；暖機時不同：${g("bin_identical")?.get("warmDifferent")?.ifEmpty { "無" } ?: "-"}）${g("bin_identical")?.get("why") ?: ""}"
         out += "SUMMARY\t5b. 第 3a 階補充：步驟表沒有的原語逐位元相同（也算這一階的關卡）：${pf("bin_extra_identical")}（${g("bin_extra_identical")?.get("cases") ?: "-"} 組，其中會受 FMA 影響的 ${g("bin_extra_identical")?.get("fmaCases") ?: "-"} 組；不同 ${g("bin_extra_identical")?.get("diffs") ?: "-"}${g("bin_extra_identical")?.get("different")?.takeIf { it.isNotEmpty() }?.let { "：$it" } ?: ""}）${g("bin_extra_identical")?.get("why") ?: ""}"
         out += "SUMMARY\t5c. 第 3a 階合計 C++ 比 ART 快幾倍（只做參考）：${g("bin_ratio")?.get("ratio") ?: "-"}；各族 ${g("bin_ratio")?.get("perFamily") ?: "-"}"
+        val gi = g("gray_identical")
+        out += "SUMMARY\t6a. 第 3b 階原語逐位元相同（這一階的關卡）：${pf("gray_identical")}（${gi?.get("steps") ?: "-"}／${gi?.get("want") ?: "-"} 步，其中會受 FMA 影響的 ${gi?.get("fmaSteps") ?: "-"}／${gi?.get("fmaWant") ?: "-"} 步${gi?.get("fmaIds")?.takeIf { it.isNotEmpty() }?.let { "（$it）" } ?: ""}、不同 ${gi?.get("fmaDifferent")?.ifEmpty { "無" } ?: "-"}；不同：${gi?.get("different")?.ifEmpty { "無" } ?: "-"}；暖機時不同：${gi?.get("warmDifferent")?.ifEmpty { "無" } ?: "-"}）${gi?.get("why") ?: ""}"
+        val ge = g("gray_extra_identical")
+        out += "SUMMARY\t6b. 第 3b 階補充：步驟表沒涵蓋的參數與尺寸逐位元相同（也算這一階的關卡）：${pf("gray_extra_identical")}（${ge?.get("cases") ?: "-"} 組，其中電腦上核對過會受 FMA 影響的 ${ge?.get("fmaCases") ?: "-"} 組、不同 ${ge?.get("fmaDiffs") ?: "-"}；不同 ${ge?.get("diffs") ?: "-"}${ge?.get("different")?.takeIf { it.isNotEmpty() }?.let { "：$it" } ?: ""}）${ge?.get("why") ?: ""}"
+        out += "SUMMARY\t6c. 第 3b 階合計 C++ 比 ART 快幾倍（只做參考）：${g("gray_ratio")?.get("ratio") ?: "-"}；各族 ${g("gray_ratio")?.get("perFamily") ?: "-"}"
+        out += "SUMMARY\t6d. 手機上的 C++ 有沒有把 Float 乘加合成 FMA（6a 的 FMA 步驟與 6b 的 FMA 組全部比到且相同才算「沒有」）：${fmaEvidence(gi, ge)}"
         out.forEach { report.raw(it) }
         report.line("END", "finished" to modelsReady)
+    }
+
+    /**
+     * 6d：會受 FMA 影響的步驟（6a）與案例（6b）全部比到且相同＝「沒有」；有一處不同＝「有不同」（先看是哪一步、哪一組）；
+     * 有一項沒量到或沒比完＝「不完整」（不能當證據）。
+     */
+    private fun fmaEvidence(gi: Map<String, String>?, ge: Map<String, String>?): String {
+        val steps = gi?.get("fmaSteps")?.toIntOrNull()
+        val stepsWant = gi?.get("fmaWant")?.toIntOrNull()
+        val stepsDiff = gi?.get("fmaDifferent").orEmpty()
+        val cases = ge?.get("fmaCases")?.toIntOrNull()
+        val casesDiff = ge?.get("fmaDiffs")?.toIntOrNull()
+        val n = "6a ${steps ?: "-"}／${stepsWant ?: "-"} 步、6b ${cases ?: "-"} 組"
+        return when {
+            stepsDiff.isNotEmpty() || (casesDiff ?: 0) > 0 -> "有不同（$n；不同的步驟：${stepsDiff.ifEmpty { "無" }}；不同的組數：${casesDiff ?: "-"}）"
+            steps == null || stepsWant == null || steps == 0 || steps < stepsWant || cases == null || cases == 0 || casesDiff == null -> "不完整（$n）"
+            else -> "沒有（$n 全部相同）"
+        }
     }
 
     companion object {
         /**
          * 紀錄格式。nightprobe-3＝nightprobe-2 再加第 3a 階：步驟 c3a（BIN_WARM／BIN／BIN_PAGE／BIN_TOTAL、關卡 bin_identical／bin_ratio）、
-         * 步驟 c3a.x（BIN_EXTRA 帶 fma 欄、關卡 bin_extra_identical 帶 fmaCases）、摘要第 5 項；原有的列不變。
+         * 步驟 c3a.x（BIN_EXTRA 帶 fma 欄、關卡 bin_extra_identical 帶 fmaCases）、摘要第 5 項。
+         * nightprobe-4＝再加第 3b 階：步驟 c3b（GRAY_WARM／GRAY（多 fma 欄）／GRAY_PAGE／GRAY_TOTAL、關卡 gray_identical 帶 fmaSteps／fmaWant／
+         * fmaIds／fmaDifferent、gray_ratio）、步驟 c3b.x（GRAY_EXTRA 帶 fmaCases／fmaDiffs、關卡 gray_extra_identical 帶 fmaCases／fmaDiffs）、
+         * 摘要第 6 項（6d 是 FMA 的證據）；META 多 grayWorkload。原有的列不變。
          */
-        const val FORMAT = "nightprobe-3"
+        const val FORMAT = "nightprobe-4"
 
         /** 每個純量函式的案例數（電腦上 200 萬、8 緒）。手機控制在 1–2 分鐘。 */
         const val NUMERIC_CASES = 1_000_000L
@@ -763,9 +885,16 @@ class NightProbeRunner(
 
         private val PRIM_KINDS = DiffKinds("WARM", "PRIM", "PRIM_PAGE", "PRIM_TOTAL", "")
         private val BIN_KINDS = DiffKinds("BIN_WARM", "BIN", "BIN_PAGE", "BIN_TOTAL", "（第 3a 階）")
+        private val GRAY_KINDS = DiffKinds("GRAY_WARM", "GRAY", "GRAY_PAGE", "GRAY_TOTAL", "（第 3b 階）", fma = true)
 
         /** 第 3a 階步驟表在 [w]×[h] 的頁上有幾步原語（準備步驟不算）：比滿這麼多步才算「全部相同」。 */
         fun binSteps(w: Int, h: Int): Int = NightBinWorkload.program(w, h).count { it.family != null }
+
+        /** 第 3b 階步驟表在 [w]×[h] 的頁上有幾步原語（準備步驟不算）：比滿這麼多步才算「全部相同」。 */
+        fun graySteps(w: Int, h: Int): Int = NightGrayWorkload.program(w, h).count { it.family != null }
+
+        /** 其中合成 FMA 會改結果的步驟數（[NightGrayWorkload.Step.fmaSensitive]；JVM 測試在 4 張頁上逐步核對）。 */
+        fun grayFmaSteps(w: Int, h: Int): Int = NightGrayWorkload.program(w, h).count { it.family != null && it.fmaSensitive }
 
         /** (d) 的 3 張公開頁（sandbox 內建的原圖，解碼後用產品的前處理）。 */
         val MODEL_PAGES = listOf("test/ch34_011.jpg", "test/demo05.png", "test/demo01.jpg")
