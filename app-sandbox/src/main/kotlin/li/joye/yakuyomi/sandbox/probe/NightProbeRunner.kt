@@ -455,11 +455,12 @@ class NightProbeRunner(
             diffs += e.diffs
             report.line(
                 "BIN_EXTRA", "op" to op, "cases" to e.cases, "diffs" to e.diffs, "kotlinUs" to e.kotlinNs / 1000, "cppUs" to e.nativeNs / 1000,
-                "firstDiffs" to e.firstDiffs.joinToString(","),
+                "fma" to (op in ProbeBinExtras.FMA_SENSITIVE), "firstDiffs" to e.firstDiffs.joinToString(","),
             )
         }
         report.line(
             "GATE", "key" to "bin_extra_identical", "pass" to (diffs == 0 && cases > 0), "cases" to cases, "diffs" to diffs,
+            "fmaCases" to ex.filterKeys { it in ProbeBinExtras.FMA_SENSITIVE }.values.sumOf { it.cases },
             "different" to ex.filterValues { it.diffs > 0 }.keys.joinToString(","),
         )
     }
@@ -735,7 +736,7 @@ class NightProbeRunner(
         out += "SUMMARY\t4a. 模型輸出（只做紀錄）：6／3 緒 ${pf("models_sha_6v3")}（${cnt("models_sha_6v3")}）；1 緒 ${pf("models_sha_1")}（${cnt("models_sha_1")}）；兩兩同時 ${pf("models_sha_pairs")}（${cnt("models_sha_pairs")}）；吞吐 ${pf("models_sha_tp")}（${cnt("models_sha_tp")}）"
         out += "SUMMARY\t4b. 模型速度（只做紀錄）：3 緒比 6 緒慢 ${g("models_ratio_3v6")?.get("ratio") ?: "-"} 倍（模擬假設 1.35）；兩個 3 緒同時比 6 緒一次一個快 ${g("models_throughput")?.get("gainPct") ?: "-"}%（門檻 25%）；A=${g("models_throughput")?.get("A") ?: "-"} B=${g("models_throughput")?.get("B") ?: "-"} C=${g("models_throughput")?.get("C") ?: "-"} ms"
         out += "SUMMARY\t5a. 第 3a 階原語逐位元相同（這一階的關卡）：${pf("bin_identical")}（${g("bin_identical")?.get("steps") ?: "-"}／${g("bin_identical")?.get("want") ?: "-"} 步；不同：${g("bin_identical")?.get("different")?.ifEmpty { "無" } ?: "-"}；暖機時不同：${g("bin_identical")?.get("warmDifferent")?.ifEmpty { "無" } ?: "-"}）${g("bin_identical")?.get("why") ?: ""}"
-        out += "SUMMARY\t5b. 第 3a 階補充：步驟表沒有的原語逐位元相同（也算這一階的關卡）：${pf("bin_extra_identical")}（${g("bin_extra_identical")?.get("cases") ?: "-"} 組，不同 ${g("bin_extra_identical")?.get("diffs") ?: "-"}${g("bin_extra_identical")?.get("different")?.takeIf { it.isNotEmpty() }?.let { "：$it" } ?: ""}）${g("bin_extra_identical")?.get("why") ?: ""}"
+        out += "SUMMARY\t5b. 第 3a 階補充：步驟表沒有的原語逐位元相同（也算這一階的關卡）：${pf("bin_extra_identical")}（${g("bin_extra_identical")?.get("cases") ?: "-"} 組，其中會受 FMA 影響的 ${g("bin_extra_identical")?.get("fmaCases") ?: "-"} 組；不同 ${g("bin_extra_identical")?.get("diffs") ?: "-"}${g("bin_extra_identical")?.get("different")?.takeIf { it.isNotEmpty() }?.let { "：$it" } ?: ""}）${g("bin_extra_identical")?.get("why") ?: ""}"
         out += "SUMMARY\t5c. 第 3a 階合計 C++ 比 ART 快幾倍（只做參考）：${g("bin_ratio")?.get("ratio") ?: "-"}；各族 ${g("bin_ratio")?.get("perFamily") ?: "-"}"
         out.forEach { report.raw(it) }
         report.line("END", "finished" to modelsReady)
@@ -744,7 +745,7 @@ class NightProbeRunner(
     companion object {
         /**
          * 紀錄格式。nightprobe-3＝nightprobe-2 再加第 3a 階：步驟 c3a（BIN_WARM／BIN／BIN_PAGE／BIN_TOTAL、關卡 bin_identical／bin_ratio）、
-         * 步驟 c3a.x（BIN_EXTRA、關卡 bin_extra_identical）、摘要第 5 項；原有的列不變。
+         * 步驟 c3a.x（BIN_EXTRA 帶 fma 欄、關卡 bin_extra_identical 帶 fmaCases）、摘要第 5 項；原有的列不變。
          */
         const val FORMAT = "nightprobe-3"
 
