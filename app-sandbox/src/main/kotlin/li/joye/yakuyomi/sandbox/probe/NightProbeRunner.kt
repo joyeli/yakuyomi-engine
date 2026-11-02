@@ -34,6 +34,8 @@ class NightProbeRunner(
     /** 這一輪以前就有的紀錄（接著跑時，矩陣的預期 sha 從這裡讀回來）。 */
     private val expected = HashMap<String, String>()
 
+    private var nativeLoaded = false
+
     private fun secs() = "%.1f".format((System.nanoTime() - t0) / 1e9)
 
     private fun envLine(tag: String, step: String) {
@@ -43,6 +45,18 @@ class NightProbeRunner(
         }
     }
 
+    private fun fail(id: String, e: Throwable) {
+        report.line("FAIL", "step" to id, "error" to "${e.javaClass.name}: ${e.message}", "stack" to e.stackTrace.take(6).joinToString(" < "))
+    }
+
+    private fun begin(id: String, title: String, limitMin: Int) {
+        status(title)
+        state.inProgress = id
+        report.line("STEP", "id" to id, "title" to title)
+        envLine("begin", id)
+        current = Current(id, System.nanoTime() + limitMin * 60_000_000_000L)
+    }
+
     /** 跑一步：做過或閃退過的跳過；先記「正在跑」，例外不外傳。 */
     private fun step(id: String, title: String, limitMin: Int = 20, body: () -> Unit) {
         if (id in state.crashed) {
@@ -50,22 +64,43 @@ class NightProbeRunner(
             return
         }
         if (id in state.done) return
-        status(title)
-        state.inProgress = id
-        report.line("STEP", "id" to id, "title" to title)
-        envLine("begin", id)
-        current = Current(id, System.nanoTime() + limitMin * 60_000_000_000L)
+        begin(id, title, limitMin)
         try {
             body()
             report.line("STEP_OK", "id" to id)
         } catch (e: Throwable) {
-            report.line("FAIL", "step" to id, "error" to "${e.javaClass.name}: ${e.message}", "stack" to e.stackTrace.take(6).joinToString(" < "))
+            fail(id, e)
         }
         current = null
         envLine("end", id)
         state.addDone(id)
         state.inProgress = null
         report.publish(force = !id.startsWith("d.pair."))   // 組合很多、資料夾可能是雲端；閃退時下次開 app 會補一份
+    }
+
+    /**
+     * 準備步驟（載 .so、複製模型、頁面輸入、建 Net 與暖機）：一樣先記「正在跑」、一樣有看門狗，所以閃退或卡死都查得到是這裡。
+     * 結果留在記憶體，接著跑也要重做，所以不看 done；閃退過就不再試（不然每次接著跑都死在同一處）。
+     * 失敗或閃退過回 null，靠它的步驟由呼叫端記 SKIP。
+     */
+    private fun <T : Any> prep(id: String, title: String, limitMin: Int = 10, body: () -> T): T? {
+        if (id in state.crashed) {
+            report.line("SKIP", "step" to id, "why" to "上次在這一步閃退")
+            return null
+        }
+        begin(id, title, limitMin)
+        var out: T? = null
+        try {
+            out = body()
+            report.line("STEP_OK", "id" to id)
+        } catch (e: Throwable) {
+            fail(id, e)
+        }
+        current = null
+        envLine("end", id)
+        state.inProgress = null
+        report.publish()
+        return out
     }
 
     private class Current(val id: String, val deadlineNs: Long)
@@ -90,6 +125,7 @@ class NightProbeRunner(
                     }
                 }
                 state.addCrashed(c.id)
+                state.selfKill = c.id
                 state.inProgress = null
                 report.publish()
                 status("「${c.id}」卡住了（已寫進紀錄），app 會自己關閉。重新打開後按「接著跑」。")
@@ -113,35 +149,52 @@ class NightProbeRunner(
 
     fun run() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
-        val soLoaded = NcnnBackend.available   // 載入唯一的 .so：夜讀的 native 方法要它載入後才找得到
         readExpected()
         startWatchdog()
         if (state.done.isEmpty() && state.crashed.isEmpty()) {
-            report.line("BEGIN", "format" to "nightprobe-1", "thread" to Thread.currentThread().name, "priority" to Process.getThreadPriority(Process.myTid()))
+            report.line("BEGIN", "format" to "nightprobe-2", "thread" to Thread.currentThread().name, "priority" to Process.getThreadPriority(Process.myTid()))
             env.metaLines(report, buildTag)
-            report.line(
-                "META",
-                "soLoaded" to soLoaded, "nightNative" to NightNative.available(),
-                "numericBridge" to NightNumericProbe.available(),
-                "rulesVersion" to NightRead.RULES_VERSION, "workload" to NightPrimWorkload.VERSION,
-            )
             if (env.debuggable()) report.line("WARN", "what" to "這是可除錯的 APK：ART 比正式版慢很多，C++ 的倍數會被高估，數字不能當關卡依據")
             report.publish()
         } else {
             report.line("RESUME", "done" to state.done.size, "crashed" to state.crashed.joinToString(","))
         }
+        // 載入唯一的 .so：夜讀的 native 方法要它載入後才找得到。JNI_OnLoad 死掉也要留得下紀錄，而且 (a) 不需要它，照跑。
+        nativeLoaded = prep("init", "載入原生庫") {
+            val so = NcnnBackend.available
+            report.line(
+                "META",
+                "soLoaded" to so, "nightNative" to NightNative.available(),
+                "numericBridge" to NightNumericProbe.available(),
+                "rulesVersion" to NightRead.RULES_VERSION, "workload" to NightPrimWorkload.VERSION,
+            )
+            so
+        } == true
         cooldown()
         step("a", "(a) 8 頁守門摘要（約 2 分鐘）") { stepGuard() }
         step("b", "(b) 數值核心對照（約 1–2 分鐘）") { stepNumeric() }
         cooldown()
         step("c", "(c) 5 族影像原語：比位元、比時間（約 2 分鐘）") { stepPrims() }
         cooldown()
-        stepModels()
-        summary()
-        state.finished = true
+        // 不管 (d) 發生什麼事都要有摘要：(a)(b)(c) 的關卡數字才不會只剩散落的 GATE 列
+        var modelsReady = true
+        try {
+            modelsReady = stepModels()
+        } catch (e: Throwable) {
+            fail("d", e)
+        }
+        current = null
         state.inProgress = null
+        summary(modelsReady)
+        state.finished = modelsReady   // 缺模型不算跑完：換資料夾後按「接著跑」，(a)(b)(c) 不用重做
         report.publish()
-        status("完成（這一輪 ${secs()} 秒）。摘要在下面，紀錄：${report.fileName}。請按「分享紀錄」。")
+        status(
+            if (modelsReady) {
+                "完成（這一輪 ${secs()} 秒）。摘要在下面，紀錄：${report.fileName}。請按「分享紀錄」。"
+            } else {
+                "(d) 的模型沒準備好（看紀錄的 FAIL 列）。換資料夾後按「接著跑」，做完的步驟不會重做。"
+            },
+        )
     }
 
     // ── (a) ─────────────────────────────────────────────────────────────────
@@ -182,7 +235,7 @@ class NightProbeRunner(
         NightNumericProbe.runArrays(NUMERIC_ARRAY_SCALE, rec)
         report.publish(force = false)
         NightNumericProbe.runTables(threads, 1, rec)
-        report.line("GATE", "key" to "numeric", "pass" to (diffs == 0L), "cases" to cases, "diffs" to diffs)
+        report.line("GATE", "key" to "numeric", "pass" to (diffs == 0L && cases > 0L), "cases" to cases, "diffs" to diffs)
     }
 
     // ── (c) ─────────────────────────────────────────────────────────────────
@@ -197,10 +250,19 @@ class NightProbeRunner(
         val load = fixtures()
         val pages = PRIM_PAGES.map { PrimPage(it, GuardDigest.input(load, it)) }
         // 暖機：ART 的 JIT 要幾輪才穩定。每輪都記，事後看得出 Kotlin 的時間有沒有收斂；連兩輪變化 < 3% 就停（最少 3 輪、最多 8 輪）。
+        // 暖機也比位元：只偶爾才不同的那種差異（重用記憶體、讀到未初始化資料）只在這裡出現一次也算沒過，所以不能只看最後那輪。
+        val warmDifferent = LinkedHashSet<String>()
         var prev = Long.MAX_VALUE
         var stable = 0
         for (pass in 1..8) {
-            val rs = pages.flatMap { NightPrimWorkload.differential(it.input.gray, it.input.seg, it.input.charMask, 1) }
+            val rs = pages.flatMap { pg ->
+                NightPrimWorkload.differential(pg.input.gray, pg.input.seg, pg.input.charMask, 1).onEach { r ->
+                    if (!r.identical) {
+                        warmDifferent += "${pg.name}/${r.step.id}"
+                        report.line("WARN", "what" to "暖機時 C++ 與 Kotlin 位元不同", "page" to pg.name, "step" to r.step.id, "pass" to pass)
+                    }
+                }
+            }
             val kt = rs.sumOf { it.kotlinNs } / 1_000_000
             val cc = rs.sumOf { it.nativeNs } / 1_000_000
             report.line("WARM", "pass" to pass, "kotlinMs" to kt, "cppMs" to cc, "identical" to rs.all { it.identical })
@@ -234,7 +296,10 @@ class NightProbeRunner(
             )
         }
         val bad = all.filter { !it.identical }.map { it.step.id }.distinct()
-        report.line("GATE", "key" to "families_identical", "pass" to bad.isEmpty(), "steps" to all.size, "different" to bad.joinToString(","))
+        report.line(
+            "GATE", "key" to "families_identical", "pass" to (bad.isEmpty() && warmDifferent.isEmpty()), "steps" to all.size,
+            "different" to bad.joinToString(","), "warmDifferent" to warmDifferent.joinToString(","),
+        )
         val total = sums.last()
         report.line(
             "GATE", "key" to "combined_ratio", "pass" to (total.ratio >= 1.5), "ratio" to "%.3f".format(total.ratio), "need" to 1.5,
@@ -252,41 +317,29 @@ class NightProbeRunner(
         forEachRecord("EXPECT") { kv -> expected[kv.getValue("key")] = kv.getValue("sha") }
     }
 
-    private fun forEachRecord(kind: String, f: (Map<String, String>) -> Unit) {
-        val file = report.local
-        if (!file.exists()) return
-        file.forEachLine { l ->
-            if (l.startsWith("$kind\t")) {
-                f(l.split('\t').drop(1).associate { it.substringBefore('=') to it.substringAfter('=', "") })
-            }
-        }
-    }
+    private fun lines(): List<String> = if (report.local.exists()) report.local.readLines() else emptyList()
 
-    private fun stepModels() {
+    private fun forEachRecord(kind: String, f: (Map<String, String>) -> Unit) = ProbeRecords.records(lines(), kind).forEach(f)
+
+    /** 回傳 false＝模型沒準備好，這一輪不算跑完（換資料夾後可以接著跑）。 */
+    private fun stepModels(): Boolean {
+        if (!nativeLoaded) {
+            report.line("SKIP", "step" to "d", "why" to "原生庫沒載入")
+            return true
+        }
         val probe = ModelProbe(ctx, tree, report, env)
-        if (!NcnnBackend.available) {
-            report.line("FAIL", "step" to "d", "error" to "NCNN 原生庫沒載入")
-            return
+        // 路徑留在記憶體，接著跑也要再登記一次（檔案已經複製過就很快）
+        val ready = prep("d.models", "(d) 準備模型（第一次要從資料夾複製，約 1–2 分鐘）", limitMin = 30) { probe.prepareModels() }
+        if (ready == null) {
+            report.line("SKIP", "step" to "d", "why" to "模型沒準備好")
+            return "d.models" in state.crashed
         }
-        var ready = false
-        step("d.models", "(d) 準備模型（第一次要從資料夾複製，約 1–2 分鐘）") {
-            probe.prepareModels()
-            ready = true
+        val pages = MODEL_PAGES.mapNotNull { asset ->
+            prep("d.page.${asset.substringAfterLast('/')}", "(d) 準備頁面輸入：${asset.substringAfterLast('/')}") { probe.preparePage(asset) }
         }
-        if (!ready) {
-            // 上一輪已經複製過：這輪只是登記路徑；真的缺模型就照樣失敗、記下來、後面全部略過
-            if ("d.models" !in state.done) return
-            runCatching { probe.prepareModels(); ready = true }.onFailure {
-                report.line("FAIL", "step" to "d.models", "error" to it.toString())
-                return
-            }
-        }
-        val pages = try {
-            status("(d) 準備 3 張頁的輸入…")
-            MODEL_PAGES.map { probe.preparePage(it) }
-        } catch (e: Throwable) {
-            report.line("FAIL", "step" to "d.pages", "error" to e.toString())
-            return
+        if (pages.isEmpty()) {
+            report.line("SKIP", "step" to "d", "why" to "沒有一張頁準備好")
+            return true
         }
         report.publish()
         cooldown()
@@ -295,6 +348,7 @@ class NightProbeRunner(
         pairs(probe, pages)
         cooldown()
         throughput(probe, pages[0])
+        return true
     }
 
     /** 6／3 緒交錯量（交錯才不會有一邊全落在溫控之後），1 緒另外跑一輪；比 sha，並算 3 緒比 6 緒慢幾倍。 */
@@ -302,6 +356,7 @@ class NightProbeRunner(
         step("d.matrix.6v3", "(d) 模型：6 緒、3 緒輸出比對與速度（約 2 分鐘）") {
             val ratios = HashMap<ModelProbe.M, Pair<Long, Long>>()
             var mismatches = 0
+            var compared = 0
             probe.NetSet(6).use { six ->
                 probe.NetSet(3).use { three ->
                     for (pg in pages) for (m in ModelProbe.M.values()) {
@@ -332,6 +387,7 @@ class NightProbeRunner(
                             "sha16" to sha6.take(16), "mismatches" to bad,
                         )
                         mismatches += bad
+                        compared++
                         val (a, b) = ratios[m] ?: (0L to 0L)
                         ratios[m] = (a + t6[1]) to (b + t3[1])
                     }
@@ -342,35 +398,59 @@ class NightProbeRunner(
             val six = ModelProbe.ROUND.sumOf { ratios.getValue(it).first }
             val three = ModelProbe.ROUND.sumOf { ratios.getValue(it).second }
             report.line("GATE", "key" to "models_ratio_3v6", "ratio" to "%.3f".format(three.toDouble() / six), "assumed" to 1.35)
-            report.line("GATE", "key" to "models_sha_6v3", "pass" to (mismatches == 0), "mismatches" to mismatches)
+            report.line(
+                "GATE", "key" to "models_sha_6v3", "pass" to ProbeRecords.verdict(mismatches, compared, MODEL_CELLS),
+                "compared" to compared, "want" to MODEL_CELLS, "mismatches" to mismatches,
+            )
         }
         step("d.matrix.1", "(d) 模型：1 緒輸出比對（約 1 分鐘）") {
             var mismatches = 0
+            var compared = 0
             probe.NetSet(1).use { one ->
                 for (pg in pages) for (m in ModelProbe.M.values()) {
                     val outs = probe.alloc(m, pg)
                     probe.forward(m, one[m], pg, outs)
                     val dt = probe.forward(m, one[m], pg, outs)
                     val sha = ModelProbe.shaOf(outs)
-                    val want = expected[key(pg.name, m)]
-                    val same = want == null || want == sha
-                    if (!same) mismatches++
-                    report.line("MATRIX1", "page" to pg.name, "model" to m.name, "ms1" to dt / 1_000_000, "sha16" to sha.take(16), "same" to same)
+                    val want = expected[key(pg.name, m)] // 6／3 緒那步沒留下基準：只記 sha，不能當相同
+                    if (want != null) {
+                        compared++
+                        if (want != sha) mismatches++
+                    }
+                    report.line(
+                        "MATRIX1", "page" to pg.name, "model" to m.name, "ms1" to dt / 1_000_000, "sha16" to sha.take(16),
+                        "same" to (if (want == null) "none" else (want == sha).toString()),
+                    )
                 }
             }
-            report.line("GATE", "key" to "models_sha_1", "pass" to (mismatches == 0), "mismatches" to mismatches)
+            report.line(
+                "GATE", "key" to "models_sha_1", "pass" to ProbeRecords.verdict(mismatches, compared, MODEL_CELLS),
+                "compared" to compared, "want" to MODEL_CELLS, "mismatches" to mismatches,
+            )
         }
     }
 
     /** 兩兩同時跑，比 sha。每個組合一步：閃退了下次跳過那一個組合。 */
     private fun pairs(probe: ModelProbe, pages: List<ModelProbe.Page>) {
-        for (th in listOf(3, 6)) {
+        for (th in PAIR_THREADS) {
             val ids = pages.flatMap { pg -> ModelProbe.PAIRS.map { (a, b) -> Triple(pg, a, b) } }
             fun id(pg: ModelProbe.Page, a: ModelProbe.M, b: ModelProbe.M) = "d.pair.$th.${pg.name}.$a+$b"
             if (ids.all { (pg, a, b) -> id(pg, a, b) in state.done || id(pg, a, b) in state.crashed }) continue
-            status("(d) 模型兩兩同時跑（$th 緒）…")
-            probe.NetSet(th).use { set ->
-                pages.firstOrNull()?.let { probe.warm(set, it) }
+            val loaded = prep("d.pair.$th.load", "(d) 載入模型，準備兩兩同時跑（$th 緒）") {
+                probe.NetSet(th).also { s ->
+                    try {
+                        pages.firstOrNull()?.let { probe.warm(s, it) }
+                    } catch (e: Throwable) {
+                        s.close()
+                        throw e
+                    }
+                }
+            }
+            if (loaded == null) {
+                report.line("SKIP", "step" to "d.pair.$th", "why" to "d.pair.$th.load 沒成功，這個緒數的組合都沒跑")
+                continue
+            }
+            loaded.use { set ->
                 for ((pg, a, b) in ids) {
                     step(id(pg, a, b), "(d) 同時跑 $a＋$b（$th 緒）", limitMin = 3) {
                         val bad = probe.pair(a, b, set, pg, { m -> expected[key(pg.name, m)] }) { kv -> report.line("PAIR", *kv) }
@@ -379,14 +459,14 @@ class NightProbeRunner(
                 }
             }
         }
-        var bad = 0
-        var n = 0
-        forEachRecord("PAIR") { kv ->
-            n++
-            bad += kv["mismatches"]?.toIntOrNull() ?: 0
-        }
-        val crashed = state.crashed.filter { it.startsWith("d.pair.") }
-        report.line("GATE", "key" to "models_sha_pairs", "pass" to (bad == 0 && crashed.isEmpty()), "pairs" to n, "mismatches" to bad, "crashed" to crashed.joinToString(","))
+        val all = lines()
+        val g = ProbeRecords.pairs(all)
+        report.line(
+            "GATE", "key" to "models_sha_pairs", "pass" to ProbeRecords.verdict(g.mismatches, g.compared, PAIR_CELLS),
+            "pairs" to g.pairs, "compared" to g.compared, "want" to PAIR_CELLS, "mismatches" to g.mismatches,
+            "crashed" to state.crashed.filter { it.startsWith("d.pair.") }.joinToString(","),
+            "failed" to ProbeRecords.failedSteps(all).filter { it.startsWith("d.pair.") }.joinToString(","),
+        )
     }
 
     /** A＝6 緒一次一個、B＝兩個 3 緒同時、C＝兩個 6 緒同時，各 ×10，A、B 量兩次（前後對照溫控漂移）。 */
@@ -400,11 +480,32 @@ class NightProbeRunner(
             tpGate()
             return
         }
-        status("(d) 吞吐（約 3 分鐘）…")
-        probe.NetSet(6).use { six ->
-            probe.NetSet(3).use { three ->
+        val nets = prep("d.tp.load", "(d) 載入模型，準備量吞吐") {
+            val six = probe.NetSet(6)
+            val three = try {
+                probe.NetSet(3)
+            } catch (e: Throwable) {
+                six.close()
+                throw e
+            }
+            try {
                 probe.warm(six, pg)
                 probe.warm(three, pg)
+            } catch (e: Throwable) {
+                three.close()
+                six.close()
+                throw e
+            }
+            six to three
+        }
+        if (nets == null) {
+            report.line("SKIP", "step" to "d.tp", "why" to "d.tp.load 沒成功，吞吐都沒跑")
+            tpGate()
+            return
+        }
+        status("(d) 吞吐（約 3 分鐘）…")
+        nets.first.use { six ->
+            nets.second.use { three ->
                 for (m in modes) {
                     val set = if (m.th == 6) six else three
                     step("d.tp.${m.id}", "(d) 吞吐 ${m.label} ×$TP_ROUNDS", limitMin = 8) {
@@ -414,7 +515,7 @@ class NightProbeRunner(
                             "TP", "mode" to m.id, "label" to m.label, "threads" to m.th, "workers" to m.workers, "tasks" to r.tasks, "rounds" to TP_ROUNDS,
                             "wallMs" to wallMs, "cpuMs" to r.cpuMs, "cores" to "%.2f".format(r.cpuMs.toDouble() / wallMs),
                             "msPerRound" to wallMs / TP_ROUNDS, "medianMs" to r.medianMs.entries.joinToString(",") { "${it.key}=${it.value}" },
-                            "mismatches" to r.mismatches,
+                            "mismatches" to r.mismatches, "compared" to r.compared, "noExpect" to r.noExpect,
                         )
                         if (r.mismatches != 0) report.line("WARN", "what" to "吞吐實驗輸出不同", "mode" to m.id, "count" to r.mismatches)
                     }
@@ -425,12 +526,12 @@ class NightProbeRunner(
     }
 
     private fun tpGate() {
-        val wall = HashMap<String, Long>()
-        var bad = 0
-        forEachRecord("TP") { kv ->
-            wall[kv.getValue("mode")] = kv.getValue("wallMs").toLong()
-            bad += kv["mismatches"]?.toIntOrNull() ?: 0
-        }
+        val g = ProbeRecords.throughput(lines())
+        report.line(
+            "GATE", "key" to "models_sha_tp", "pass" to ProbeRecords.verdict(g.mismatches, g.comparedModes, TP_MODES),
+            "compared" to g.comparedModes, "want" to TP_MODES, "mismatches" to g.mismatches, "noExpect" to g.noExpect,
+        )
+        val wall = g.wallMs
         val a = listOfNotNull(wall["A1"], wall["A2"])
         val b = listOfNotNull(wall["B1"], wall["B2"])
         if (a.isEmpty() || b.isEmpty()) {
@@ -441,35 +542,43 @@ class NightProbeRunner(
         val gain = a.average() / b.average() - 1.0
         report.line(
             "GATE", "key" to "models_throughput", "pass" to (gain >= 0.25), "gainPct" to "%.1f".format(gain * 100), "need" to "25",
-            "A" to a.joinToString(","), "B" to b.joinToString(","), "C" to wall["C"], "mismatches" to bad,
+            "A" to a.joinToString(","), "B" to b.joinToString(","), "C" to wall["C"], "modes" to wall.size, "mismatches" to g.mismatches,
             "note" to "兩個 3 緒同時比 6 緒一次一個快多少（只做紀錄，不擋往下）",
         )
     }
 
     // ── 摘要 ─────────────────────────────────────────────────────────────────
 
-    private fun summary() {
+    private fun summary(modelsReady: Boolean) {
+        val all = lines()
         val gates = LinkedHashMap<String, Map<String, String>>()
-        forEachRecord("GATE") { kv -> gates[kv.getValue("key")] = kv }
-        var warns = 0
-        forEachRecord("WARN") { warns++ }
+        for (kv in ProbeRecords.records(all, "GATE")) gates[kv.getValue("key")] = kv // 同一個關卡寫過兩次（接著跑）以最後一次為準
+        val warns = ProbeRecords.records(all, "WARN").size
+        val fg = ProbeRecords.foreground(all)
+        val failed = ProbeRecords.failedSteps(all)
         fun g(k: String) = gates[k]
         fun pf(k: String): String = when (g(k)?.get("pass")) {
             "true" -> "通過"
             "false" -> "沒過"
+            "incomplete" -> "沒比完"
             else -> "沒量到"
         }
+        fun cnt(k: String) = "${g(k)?.get("compared") ?: "0"}／${g(k)?.get("want") ?: "-"} 組，不同 ${g(k)?.get("mismatches") ?: "-"}"
         val out = ArrayList<String>()
         out += "SUMMARY\t==== 關卡摘要（只列數字，不下決定）===="
-        out += "SUMMARY\t總時間 ${secs()} 秒（這一輪）；可除錯=${env.debuggable()}；警告 $warns 筆；離開最上層 ${ProbeSession.leftCount} 次；閃退過的步驟：${state.crashed.joinToString(",").ifEmpty { "無" }}"
-        if (ProbeSession.leftCount > 0) out += "SUMMARY\t★ 中途離開過畫面：這台手機切走後只給 5 顆核心，切走那幾段的時間偏慢，看 ENV 列的 top／cpus"
+        out += "SUMMARY\t總時間 ${secs()} 秒（這一輪）；可除錯=${env.debuggable()}；警告 $warns 筆；離開最上層 ${fg.left} 次；閃退過的步驟：${state.crashed.joinToString(",").ifEmpty { "無" }}；失敗的步驟：${failed.joinToString(",").ifEmpty { "無" }}"
+        if (!modelsReady) out += "SUMMARY\t★ (d) 的模型沒準備好，這一輪還沒跑完（換資料夾後按「接著跑」）"
+        if (fg.left > 0 || fg.steps.isNotEmpty()) {
+            out += "SUMMARY\t★ 中途離開過畫面：這台手機切走後只給 5 顆核心，這幾步的時間偏慢：${fg.steps.joinToString(",")}${if ("c" in fg.steps) "（含 (c)，下面第 3 項的倍數要打折看）" else ""}"
+        }
         out += "SUMMARY\t1. 手機上 Kotlin 摘要等於電腦：${pf("kotlin_digest")}（${g("kotlin_digest")?.get("digest")?.take(16) ?: "-"}）"
         out += "SUMMARY\t2a. 數值核心逐位元相同：${pf("numeric")}（${g("numeric")?.get("cases") ?: "-"} 組，不同 ${g("numeric")?.get("diffs") ?: "-"}）${g("numeric")?.get("why") ?: ""}"
-        out += "SUMMARY\t2b. 5 族原語逐位元相同：${pf("families_identical")}（${g("families_identical")?.get("steps") ?: "-"} 步；不同：${g("families_identical")?.get("different")?.ifEmpty { "無" } ?: "-"}）"
+        out += "SUMMARY\t2b. 5 族原語逐位元相同：${pf("families_identical")}（${g("families_identical")?.get("steps") ?: "-"} 步；不同：${g("families_identical")?.get("different")?.ifEmpty { "無" } ?: "-"}；暖機時不同：${g("families_identical")?.get("warmDifferent")?.ifEmpty { "無" } ?: "-"}）"
         out += "SUMMARY\t3. 5 族合計 C++ 比 ART 快幾倍（門檻 1.5）：${g("combined_ratio")?.get("ratio") ?: "-"}（${pf("combined_ratio")}）；各族 ${g("combined_ratio")?.get("perFamily") ?: "-"}"
-        out += "SUMMARY\t4. 模型（只做紀錄）：輸出 6／3 緒 ${pf("models_sha_6v3")}、1 緒 ${pf("models_sha_1")}、兩兩同時 ${pf("models_sha_pairs")}；3 緒比 6 緒慢 ${g("models_ratio_3v6")?.get("ratio") ?: "-"} 倍（模擬假設 1.35）；兩個 3 緒同時比 6 緒一次一個快 ${g("models_throughput")?.get("gainPct") ?: "-"}%（門檻 25%）；A=${g("models_throughput")?.get("A") ?: "-"} B=${g("models_throughput")?.get("B") ?: "-"} C=${g("models_throughput")?.get("C") ?: "-"} ms"
+        out += "SUMMARY\t4a. 模型輸出（只做紀錄）：6／3 緒 ${pf("models_sha_6v3")}（${cnt("models_sha_6v3")}）；1 緒 ${pf("models_sha_1")}（${cnt("models_sha_1")}）；兩兩同時 ${pf("models_sha_pairs")}（${cnt("models_sha_pairs")}）；吞吐 ${pf("models_sha_tp")}（${cnt("models_sha_tp")}）"
+        out += "SUMMARY\t4b. 模型速度（只做紀錄）：3 緒比 6 緒慢 ${g("models_ratio_3v6")?.get("ratio") ?: "-"} 倍（模擬假設 1.35）；兩個 3 緒同時比 6 緒一次一個快 ${g("models_throughput")?.get("gainPct") ?: "-"}%（門檻 25%）；A=${g("models_throughput")?.get("A") ?: "-"} B=${g("models_throughput")?.get("B") ?: "-"} C=${g("models_throughput")?.get("C") ?: "-"} ms"
         out.forEach { report.raw(it) }
-        report.line("END", "finished" to true)
+        report.line("END", "finished" to modelsReady)
     }
 
     companion object {
@@ -487,5 +596,17 @@ class NightProbeRunner(
 
         /** 吞吐實驗每種模式 10 輪（一輪＝[ModelProbe.ROUND]）。 */
         const val TP_ROUNDS = 10
+
+        /** 吞吐的模式數（A1、B1、C、A2、B2）。 */
+        const val TP_MODES = 5
+
+        /** 兩兩同時跑的緒數。 */
+        val PAIR_THREADS = listOf(3, 6)
+
+        /** 緒數矩陣應有的頁×模型數。少了就是沒比完，不能算通過。 */
+        val MODEL_CELLS = MODEL_PAGES.size * ModelProbe.M.values().size
+
+        /** 兩兩同時跑應有的組合數（3 頁 × 10 種 × 2 種緒數）。 */
+        val PAIR_CELLS = MODEL_PAGES.size * ModelProbe.PAIRS.size * PAIR_THREADS.size
     }
 }

@@ -11,10 +11,6 @@ object ProbeSession {
     @Volatile
     var activityVisible = false
 
-    /** 離開過最上層幾次（量到的時間不算數：這台手機切走後只給 5 顆核心）。 */
-    @Volatile
-    var leftCount = 0
-
     @Volatile
     var report: ProbeReport? = null
     @Volatile

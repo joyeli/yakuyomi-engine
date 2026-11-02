@@ -22,16 +22,25 @@ class ProbeState(ctx: Context) {
         get() = p.getString("step", null)
         set(v) { p.edit().putString("step", v).commit() }
 
-    /** 上次中斷已經寫進紀錄了（同一次中斷不重複寫）。 */
-    var recovered: Boolean
-        get() = p.getBoolean("recovered", false)
-        set(v) { p.edit().putBoolean("recovered", v).commit() }
+    /** 看門狗自己結束行程時記下的步驟：[ProbeRecovery] 看到就知道這次不是閃退，HANG 已經寫進紀錄了。 */
+    var selfKill: String?
+        get() = p.getString("selfKill", null)
+        set(v) { p.edit().putString("selfKill", v).commit() }
+
+    /** 已經寫進紀錄的最後一筆 ApplicationExitInfo（同一次中斷不重複寫）。 */
+    var lastExitTs: Long
+        get() = p.getLong("lastExit", 0L)
+        set(v) { p.edit().putLong("lastExit", v).commit() }
 
     val done: Set<String> get() = p.getStringSet("done", emptySet()) ?: emptySet()
     val crashed: Set<String> get() = p.getStringSet("crashed", emptySet()) ?: emptySet()
 
+    /** 中斷過一次、原因看不出是閃退的步驟（例如被系統收掉）：再中斷一次就當閃退跳過，免得接著跑永遠死在同一處。 */
+    val interrupted: Set<String> get() = p.getStringSet("interrupted", emptySet()) ?: emptySet()
+
     fun addDone(id: String) { p.edit().putStringSet("done", done + id).commit() }
     fun addCrashed(id: String) { p.edit().putStringSet("crashed", crashed + id).commit() }
+    fun addInterrupted(id: String) { p.edit().putStringSet("interrupted", interrupted + id).commit() }
 
     fun reset(file: String, now: Long) {
         p.edit().clear().putString("file", file).putLong("started", now).commit()

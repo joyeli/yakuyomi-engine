@@ -37,12 +37,6 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
 
     private val paths = HashMap<M, Pair<String, String>>()
 
-    private fun candidates(): List<DocumentFile> {
-        val out = arrayListOf(tree)
-        tree.findFile("models")?.takeIf { it.isDirectory }?.let { out += it }
-        return out
-    }
-
     private fun copyLocal(doc: DocumentFile): File {
         val out = File(ctx.filesDir, doc.name ?: error("模型沒有檔名"))
         if (out.exists() && out.length() == doc.length()) return out
@@ -67,12 +61,9 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
 
     /** 從所選資料夾（或它底下的 models）把 4 顆模型放進 filesDir。缺模型丟例外。 */
     fun prepareModels() {
-        val docs = candidates().flatMap { it.listFiles().toList() }
+        val docs = docsIn(tree)
         for (m in M.values()) {
-            fun find(suffix: String) = docs.firstOrNull { d ->
-                val n = d.name?.lowercase() ?: return@firstOrNull false
-                n.contains(m.key) && n.endsWith(suffix)
-            } ?: error("所選資料夾（或 models 子資料夾）缺 ${m.key} 的 $suffix")
+            fun find(suffix: String) = findModel(docs, m, suffix) ?: error("所選資料夾（或 models 子資料夾）缺 ${m.key} 的 $suffix")
             val t0 = System.nanoTime()
             val p = copyLocal(find(".param"))
             val b = copyLocal(find(".bin"))
@@ -154,13 +145,18 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
         val handles = HashMap<M, Long>()
 
         init {
-            for (m in M.values()) {
-                val (p, b) = paths.getValue(m)
-                val t0 = System.nanoTime()
-                val h = NcnnBackend.createNetEx(p, b, threads, fp16Storage = true, fp16Arith = true)
-                check(h != 0L) { "${m.name} 載入失敗（$threads 緒）" }
-                handles[m] = h
-                report.line("LOAD", "model" to m.name, "threads" to threads, "ms" to (System.nanoTime() - t0) / 1_000_000)
+            try {
+                for (m in M.values()) {
+                    val (p, b) = paths.getValue(m)
+                    val t0 = System.nanoTime()
+                    val h = NcnnBackend.createNetEx(p, b, threads, fp16Storage = true, fp16Arith = true)
+                    check(h != 0L) { "${m.name} 載入失敗（$threads 緒）" }
+                    handles[m] = h
+                    report.line("LOAD", "model" to m.name, "threads" to threads, "ms" to (System.nanoTime() - t0) / 1_000_000)
+                }
+            } catch (e: Throwable) {
+                close() // 載到一半失敗不留下已經載好的
+                throw e
             }
         }
 
@@ -184,6 +180,8 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
     fun pair(a: M, b: M, set: NetSet, pg: Page, expect: (M) -> String?, sink: (Array<Pair<String, Any?>>) -> Unit): Int {
         val barrier = CyclicBarrier(2)
         val mismatches = AtomicInteger(0)
+        val compared = AtomicInteger(0)
+        val noExpect = AtomicInteger(0)
         val firstError = AtomicReference<Throwable?>(null)
         val doneA = AtomicBoolean(false)
         val doneB = AtomicBoolean(false)
@@ -203,7 +201,12 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
                     runs[i]++
                     val sha = shaOf(outs)
                     val want = expect(m)
-                    if (want != null && want != sha) mismatches.incrementAndGet()
+                    if (want == null) {
+                        noExpect.incrementAndGet() // 沒有基準＝沒比到，不能當相同
+                    } else {
+                        compared.incrementAndGet()
+                        if (want != sha) mismatches.incrementAndGet()
+                    }
                     me.set(true)
                 } while (!other.get() && runs[i] < MAX_REPEAT)
             } catch (t: Throwable) {
@@ -224,14 +227,14 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
             arrayOf(
                 "page" to pg.name, "a" to a.name, "b" to b.name, "threads" to set.threads,
                 "runsA" to runs[0], "runsB" to runs[1], "msA" to sumNs[0] / runs[0] / 1_000_000, "msB" to sumNs[1] / runs[1] / 1_000_000,
-                "wallMs" to wallMs, "overlapMs" to overlap, "mismatches" to mismatches.get(),
+                "wallMs" to wallMs, "overlapMs" to overlap, "mismatches" to mismatches.get(), "compared" to compared.get(), "noExpect" to noExpect.get(),
             ),
         )
         return mismatches.get()
     }
 
     /** 吞吐實驗的結果。 */
-    class Throughput(val wallNs: Long, val cpuMs: Long, val tasks: Int, val medianMs: Map<M, Long>, val mismatches: Int)
+    class Throughput(val wallNs: Long, val cpuMs: Long, val tasks: Int, val medianMs: Map<M, Long>, val mismatches: Int, val compared: Int, val noExpect: Int)
 
     /**
      * [workers] 條執行緒從同一份工作清單拿工作（[ROUND] × [rounds]：跟合併模式一頁實際用到的模型一樣），第 i 條用 [sets] 的第 i 組。
@@ -271,18 +274,25 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
         val cpu = Process.getElapsedCpuTime() - cpu0
         firstError.get()?.let { throw it }
         var bad = 0
+        var compared = 0
+        var noExpect = 0
         for (w in 0 until workers) for (m in M.values()) {
-            val want = expect(m) ?: continue
             val o = perWorker[w].getValue(m)
             // 這條執行緒可能沒拿到這顆模型的工作（全 0）：全 0 不算數
             if (o.all { a -> a.all { it == 0f } }) continue
+            val want = expect(m)
+            if (want == null) {
+                noExpect++ // 沒有基準＝沒比到，不能當相同
+                continue
+            }
+            compared++
             if (shaOf(o) != want) bad++
         }
         val med = M.values().associateWith { m ->
             val v = tasks.indices.filter { tasks[it] == m }.map { ms[it] }.sorted()
             if (v.isEmpty()) 0L else v[v.size / 2] / 1_000_000
         }
-        return Throughput(wall, cpu, tasks.size, med, bad)
+        return Throughput(wall, cpu, tasks.size, med, bad, compared, noExpect)
     }
 
     companion object {
@@ -297,6 +307,25 @@ internal class ModelProbe(private val ctx: Context, private val tree: DocumentFi
             M.DBNET to M.CSEG, M.DBNET to M.DBNET, M.DBNET to M.YOLO, M.YOLO to M.CSEG, M.YOLO to M.YOLO, M.CSEG to M.CSEG,
             M.AOT to M.YOLO, M.AOT to M.DBNET, M.AOT to M.CSEG, M.AOT to M.AOT,
         )
+
+        private fun docsIn(tree: DocumentFile): List<DocumentFile> {
+            val dirs = arrayListOf(tree)
+            tree.findFile("models")?.takeIf { it.isDirectory }?.let { dirs += it }
+            return dirs.flatMap { it.listFiles().toList() }
+        }
+
+        private fun findModel(docs: List<DocumentFile>, m: M, suffix: String) = docs.firstOrNull { d ->
+            val n = d.name?.lowercase() ?: return@firstOrNull false
+            n.contains(m.key) && n.endsWith(suffix)
+        }
+
+        /** 所選資料夾（或它底下的 models）還缺哪些模型檔。按「開始」時先問，免得 (a)(b)(c) 跑完才發現。 */
+        fun missing(tree: DocumentFile): List<String> {
+            val docs = docsIn(tree)
+            return M.values().flatMap { m ->
+                listOf(".param", ".bin").filter { findModel(docs, m, it) == null }.map { "${m.key}$it" }
+            }
+        }
 
         fun shaOf(arrs: Array<FloatArray>): String {
             val md = MessageDigest.getInstance("SHA-256")

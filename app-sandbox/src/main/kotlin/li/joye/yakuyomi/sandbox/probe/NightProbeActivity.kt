@@ -134,10 +134,8 @@ class NightProbeActivity : AppCompatActivity() {
         super.onStop()
         ProbeSession.activityVisible = false
         if (ProbeSession.running) {
-            ProbeSession.leftCount++
-            // 不在主執行緒寫：紀錄的鎖可能正被「複製到所選資料夾」拿著
-            val n = ProbeSession.leftCount
-            ProbeSession.report?.let { r -> Thread { r.line("WARN", "what" to "畫面離開最上層（切走或鎖屏），之後的時間不能算", "count" to n) }.start() }
+            // 不在主執行緒寫：紀錄的鎖可能正被「複製到所選資料夾」拿著。摘要從紀錄算次數，所以閃退後接著跑也不會歸零。
+            ProbeSession.report?.let { r -> Thread { r.line("WARN", "what" to ProbeRecords.LEFT_FOREGROUND) }.start() }
         }
     }
 
@@ -154,15 +152,31 @@ class NightProbeActivity : AppCompatActivity() {
         shareButton.isEnabled = state.fileName != null
     }
 
+    /** 先看資料夾裡有沒有 4 顆模型（在別的執行緒：資料夾可能是雲端），缺的話直接說，別等 (a)(b)(c) 跑完才失敗。 */
     private fun start(resume: Boolean) {
         val t = tree() ?: return
+        startButton.isEnabled = false
+        resumeButton.isEnabled = false
+        stepText.text = "檢查資料夾裡的模型…"
+        Thread {
+            val missing = runCatching { ModelProbe.missing(t) }.getOrElse { listOf("讀不了資料夾：${it.message}") }
+            runOnUiThread {
+                if (missing.isEmpty()) {
+                    launch(t, resume)
+                } else {
+                    stepText.text = "所選資料夾（或它底下的 models）缺這些模型，請重選資料夾：\n${missing.joinToString("\n")}"
+                    refresh()
+                }
+            }
+        }.start()
+    }
+
+    private fun launch(t: DocumentFile, resume: Boolean) {
         val now = System.currentTimeMillis()
         if (!resume) state.reset(SimpleDateFormat("MMdd_HHmmss", Locale.US).format(Date(now)) + "_nightprobe.txt", now)
-        state.recovered = false
         val report = ProbeReport(applicationContext, t, state.fileName!!)
         ProbeSession.report = report
         ProbeSession.tree = t
-        ProbeSession.leftCount = 0
         ProbeSession.running = true
         logText.text = ""
         // 逐步的細項不上畫面：探針量時間時別讓主執行緒一直排版
@@ -198,7 +212,7 @@ class NightProbeActivity : AppCompatActivity() {
     private fun share() {
         val name = state.fileName ?: return
         val dir = ProbeReport.dirOf(this)
-        val files = listOf(File(dir, name), File(dir, name.removeSuffix(".txt") + "_crash.pb")).filter { it.isFile }
+        val files = dir.listFiles().orEmpty().filter { it.isFile && ProbeRecords.belongsToReport(it.name, name) }.sortedBy { it.name }
         if (files.isEmpty()) return
         val uris = ArrayList(files.map { FileProvider.getUriForFile(this, "$packageName.nightprobe", it) })
         val send = if (uris.size == 1) {
@@ -212,7 +226,7 @@ class NightProbeActivity : AppCompatActivity() {
 
     companion object {
         private const val PREF_TREE = "modelTree" // 跟 MainActivity 同一個資料夾
-        const val BUILD_TAG = "v2.8-nightprobe"
+        const val BUILD_TAG = "v2.9-nightprobe"
         private val UI_HIDDEN = listOf("ENV\t", "PRIM\t", "PAIR\t", "NUM\t", "LOAD\t", "EXPECT\t", "STEP_OK\t", "STEP\t")
     }
 }
