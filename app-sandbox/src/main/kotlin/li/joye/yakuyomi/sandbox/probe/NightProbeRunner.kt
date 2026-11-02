@@ -4,17 +4,21 @@ import android.content.Context
 import android.os.Process
 import androidx.documentfile.provider.DocumentFile
 import li.joye.yakuyomi.engine.NcnnBackend
+import li.joye.yakuyomi.nightread.NightBinWorkload
 import li.joye.yakuyomi.nightread.NightNative
+import li.joye.yakuyomi.nightread.NightNativePrims
 import li.joye.yakuyomi.nightread.NightNumericProbe
 import li.joye.yakuyomi.nightread.NightPrimWorkload
 import li.joye.yakuyomi.nightread.NightRead
+import li.joye.yakuyomi.nightread.NightReadInput
 import java.io.File
 
 /**
  * 夜讀 C++ 探針本體，跑在一條普通的工作執行緒上（預設堆疊、預設優先權，跟之後產品呼叫 C++ 的條件一樣）：
  *  (a) 8 頁守門摘要（Kotlin）；
  *  (b) 數值核心：C++ 對 ART 的 StrictMath、捨入、BigDecimal、常數表；
- *  (c) 5 族原語：同行程差分＋計時（先暖機）；
+ *  (c) 影像原語：同行程差分＋計時（先暖機）。第 2 階的 5 族（步驟 c）、第 3a 階的二值原語（步驟 c3a，[NightBinWorkload]），
+ *      以及步驟表沒有的第 3a 階原語只比位元（步驟 c3a.x）；
  *  (d) 模型：緒數矩陣、兩兩同時跑、吞吐。
  *
  * 每一步先記「正在跑」再動手：閃退時下次開 app 看得出是哪一步（[ProbeRecovery]）。一步丟例外（含 OOM）只記 FAIL，繼續下一步。
@@ -152,12 +156,13 @@ class NightProbeRunner(
         readExpected()
         startWatchdog()
         if (state.done.isEmpty() && state.crashed.isEmpty()) {
-            report.line("BEGIN", "format" to "nightprobe-2", "thread" to Thread.currentThread().name, "priority" to Process.getThreadPriority(Process.myTid()))
+            report.line("BEGIN", "format" to FORMAT, "thread" to Thread.currentThread().name, "priority" to Process.getThreadPriority(Process.myTid()))
             env.metaLines(report, buildTag)
             if (env.debuggable()) report.line("WARN", "what" to "這是可除錯的 APK：ART 比正式版慢很多，C++ 的倍數會被高估，數字不能當關卡依據")
             report.publish()
         } else {
-            report.line("RESUME", "done" to state.done.size, "crashed" to state.crashed.joinToString(","))
+            // 接著跑的可能是舊版探針開的紀錄：這一段之後的列照這一版的格式
+            report.line("RESUME", "done" to state.done.size, "crashed" to state.crashed.joinToString(","), "format" to FORMAT, "buildTag" to buildTag)
         }
         // 載入唯一的 .so：夜讀的 native 方法要它載入後才找得到。JNI_OnLoad 死掉也要留得下紀錄，而且 (a) 不需要它，照跑。
         nativeLoaded = prep("init", "載入原生庫") {
@@ -166,7 +171,8 @@ class NightProbeRunner(
                 "META",
                 "soLoaded" to so, "nightNative" to NightNative.available(),
                 "numericBridge" to NightNumericProbe.available(),
-                "rulesVersion" to NightRead.RULES_VERSION, "workload" to NightPrimWorkload.VERSION,
+                "rulesVersion" to NightRead.RULES_VERSION, "abi" to NightNative.ABI_VERSION,
+                "workload" to NightPrimWorkload.VERSION, "binWorkload" to NightBinWorkload.VERSION,
             )
             so
         } == true
@@ -175,6 +181,9 @@ class NightProbeRunner(
         step("b", "(b) 數值核心對照（約 1–2 分鐘）") { stepNumeric() }
         cooldown()
         step("c", "(c) 5 族影像原語：比位元、比時間（約 2 分鐘）") { stepPrims() }
+        cooldown()
+        step("c3a", "(c) 第 3a 階影像原語（二值、形態學、距離）：比位元、比時間（約 2–3 分鐘）") { stepBin() }
+        step("c3a.x", "(c) 第 3a 階補充：步驟表沒有的原語，只比位元（約 30 秒）") { stepBinExtra() }
         cooldown()
         // 不管 (d) 發生什麼事都要有摘要：(a)(b)(c) 的關卡數字才不會只剩散落的 GATE 列
         var modelsReady = true
@@ -240,71 +249,218 @@ class NightProbeRunner(
 
     // ── (c) ─────────────────────────────────────────────────────────────────
 
-    private class PrimPage(val name: String, val input: li.joye.yakuyomi.nightread.NightReadInput)
+    private class PrimPage(val name: String, val input: NightReadInput)
 
-    private fun stepPrims() {
-        if (!NightNative.available()) {
-            report.line("GATE", "key" to "families_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
-            return
-        }
+    private fun primPages(): List<PrimPage> {
         val load = fixtures()
-        val pages = PRIM_PAGES.map { PrimPage(it, GuardDigest.input(load, it)) }
-        // 暖機：ART 的 JIT 要幾輪才穩定。每輪都記，事後看得出 Kotlin 的時間有沒有收斂；連兩輪變化 < 3% 就停（最少 3 輪、最多 8 輪）。
-        // 暖機也比位元：只偶爾才不同的那種差異（重用記憶體、讀到未初始化資料）只在這裡出現一次也算沒過，所以不能只看最後那輪。
+        return PRIM_PAGES.map { PrimPage(it, GuardDigest.input(load, it)) }
+    }
+
+    /** 一步的結果。第 2 階（[NightPrimWorkload]）與第 3a 階（[NightBinWorkload]）的 StepResult 是不同的類別，都轉成這個樣子寫紀錄。 */
+    private class DiffRow(
+        val id: String,
+        val family: String,
+        val weight: Double,
+        val kotlinNs: Long,
+        val nativeNs: Long,
+        val identical: Boolean,
+        val peakBytes: Long,
+    )
+
+    /** 一族（[family] null＝合計）的加權總和，取自各自工作量的 summarize。 */
+    private class DiffSum(val family: String?, val kotlinNs: Double, val nativeNs: Double, val identical: Boolean) {
+        val ratio: Double get() = kotlinNs / nativeNs
+    }
+
+    /** 一組原語寫的紀錄種類：第 2 階沿用 WARM／PRIM／PRIM_PAGE／PRIM_TOTAL（跟 nightprobe-2 一樣），第 3a 階用 BIN_*。[label] 接在暖機警告後面。 */
+    private class DiffKinds(val warm: String, val step: String, val page: String, val total: String, val label: String)
+
+    /** [different]＝正式量時有任一次不同的步驟；[warmDifferent]＝暖機時不同的「頁/步驟」。 */
+    private class DiffOutcome(val rows: List<DiffRow>, val sums: List<DiffSum>, val different: List<String>, val warmDifferent: Set<String>)
+
+    /**
+     * 一組原語在 [pages] 上的同行程差分與計時：先暖機（ART 的 JIT 要幾輪才穩定；每輪都記，連兩輪 Kotlin 時間變化 < 3% 就停，最少 3 輪、最多 8 輪），
+     * 再每頁 [PRIM_REPEAT] 次、取中位數，逐步、逐頁、合計寫紀錄。
+     * 暖機也比位元：只偶爾才不同的那種差異（重用記憶體、讀到未初始化資料）只在這裡出現一次也算沒過，所以不能只看最後那輪。
+     */
+    private fun <R> diffSet(
+        kinds: DiffKinds,
+        pages: List<PrimPage>,
+        differential: (NightReadInput, Int, ((R) -> Unit)?) -> List<R>,
+        row: (R) -> DiffRow,
+        summarize: (List<R>) -> List<DiffSum>,
+    ): DiffOutcome {
         val warmDifferent = LinkedHashSet<String>()
         var prev = Long.MAX_VALUE
         var stable = 0
         for (pass in 1..8) {
             val rs = pages.flatMap { pg ->
-                NightPrimWorkload.differential(pg.input.gray, pg.input.seg, pg.input.charMask, 1).onEach { r ->
+                differential(pg.input, 1, null).map(row).onEach { r ->
                     if (!r.identical) {
-                        warmDifferent += "${pg.name}/${r.step.id}"
-                        report.line("WARN", "what" to "暖機時 C++ 與 Kotlin 位元不同", "page" to pg.name, "step" to r.step.id, "pass" to pass)
+                        warmDifferent += "${pg.name}/${r.id}"
+                        report.line("WARN", "what" to "暖機時 C++ 與 Kotlin 位元不同${kinds.label}", "page" to pg.name, "step" to r.id, "pass" to pass)
                     }
                 }
             }
             val kt = rs.sumOf { it.kotlinNs } / 1_000_000
             val cc = rs.sumOf { it.nativeNs } / 1_000_000
-            report.line("WARM", "pass" to pass, "kotlinMs" to kt, "cppMs" to cc, "identical" to rs.all { it.identical })
+            report.line(kinds.warm, "pass" to pass, "kotlinMs" to kt, "cppMs" to cc, "identical" to rs.all { it.identical })
             stable = if (prev != Long.MAX_VALUE && Math.abs(kt - prev) < prev * 0.03) stable + 1 else 0
             prev = kt
             if (pass >= 3 && stable >= 1) break
         }
         report.publish(force = false)
-        val all = ArrayList<NightPrimWorkload.StepResult>()
+        val raw = ArrayList<R>()
         for (pg in pages) {
-            val rs = NightPrimWorkload.differential(pg.input.gray, pg.input.seg, pg.input.charMask, 5) { r ->
+            val rs = differential(pg.input, PRIM_REPEAT) { res ->
+                val r = row(res)
                 report.line(
-                    "PRIM", "page" to pg.name, "step" to r.step.id, "family" to r.step.family, "weight" to r.step.weight,
-                    "kotlinUs" to r.kotlinNs / 1000, "cppUs" to r.nativeNs / 1000, "identical" to r.identical, "peakKB" to r.nativePeakBytes / 1024,
+                    kinds.step, "page" to pg.name, "step" to r.id, "family" to r.family, "weight" to r.weight,
+                    "kotlinUs" to r.kotlinNs / 1000, "cppUs" to r.nativeNs / 1000, "identical" to r.identical, "peakKB" to r.peakBytes / 1024,
                 )
             }
-            all += rs
-            for (s in NightPrimWorkload.summarize(rs)) {
+            raw += rs
+            for (s in summarize(rs)) {
                 report.line(
-                    "PRIM_PAGE", "page" to pg.name, "family" to (s.family ?: "ALL"), "kotlinMs" to "%.1f".format(s.kotlinWeightedNs / 1e6),
-                    "cppMs" to "%.1f".format(s.nativeWeightedNs / 1e6), "ratio" to "%.3f".format(s.ratio), "identical" to s.identical,
+                    kinds.page, "page" to pg.name, "family" to (s.family ?: "ALL"), "kotlinMs" to "%.1f".format(s.kotlinNs / 1e6),
+                    "cppMs" to "%.1f".format(s.nativeNs / 1e6), "ratio" to "%.3f".format(s.ratio), "identical" to s.identical,
                 )
             }
             report.publish(force = false)
         }
-        val sums = NightPrimWorkload.summarize(all)
+        val sums = summarize(raw)
         for (s in sums) {
             report.line(
-                "PRIM_TOTAL", "family" to (s.family ?: "ALL"), "kotlinMs" to "%.1f".format(s.kotlinWeightedNs / 1e6),
-                "cppMs" to "%.1f".format(s.nativeWeightedNs / 1e6), "ratio" to "%.3f".format(s.ratio), "identical" to s.identical,
+                kinds.total, "family" to (s.family ?: "ALL"), "kotlinMs" to "%.1f".format(s.kotlinNs / 1e6),
+                "cppMs" to "%.1f".format(s.nativeNs / 1e6), "ratio" to "%.3f".format(s.ratio), "identical" to s.identical,
             )
         }
-        val bad = all.filter { !it.identical }.map { it.step.id }.distinct()
-        report.line(
-            "GATE", "key" to "families_identical", "pass" to (bad.isEmpty() && warmDifferent.isEmpty()), "steps" to all.size,
-            "different" to bad.joinToString(","), "warmDifferent" to warmDifferent.joinToString(","),
+        val rows = raw.map(row)
+        return DiffOutcome(rows, sums, rows.filter { !it.identical }.map { it.id }.distinct(), warmDifferent)
+    }
+
+    private fun perFamily(sums: List<DiffSum>) = sums.dropLast(1).joinToString(",") { "${it.family}=${"%.3f".format(it.ratio)}" }
+
+    /** 第 2 階的 5 族（[NightPrimWorkload]）：關卡＝全部相同＋合計至少 1.5 倍。 */
+    private fun stepPrims() {
+        if (!NightNative.available()) {
+            report.line("GATE", "key" to "families_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
+            return
+        }
+        val o = diffSet(
+            PRIM_KINDS, primPages(),
+            { p: NightReadInput, rep: Int, cb: ((NightPrimWorkload.StepResult) -> Unit)? -> NightPrimWorkload.differential(p.gray, p.seg, p.charMask, rep, cb) },
+            { r -> DiffRow(r.step.id, r.step.family.toString(), r.step.weight, r.kotlinNs, r.nativeNs, r.identical, r.nativePeakBytes) },
+            { rs -> NightPrimWorkload.summarize(rs).map { DiffSum(it.family?.name, it.kotlinWeightedNs, it.nativeWeightedNs, it.identical) } },
         )
-        val total = sums.last()
+        report.line(
+            "GATE", "key" to "families_identical", "pass" to (o.different.isEmpty() && o.warmDifferent.isEmpty()), "steps" to o.rows.size,
+            "different" to o.different.joinToString(","), "warmDifferent" to o.warmDifferent.joinToString(","),
+        )
+        val total = o.sums.last()
         report.line(
             "GATE", "key" to "combined_ratio", "pass" to (total.ratio >= 1.5), "ratio" to "%.3f".format(total.ratio), "need" to 1.5,
-            "perFamily" to sums.dropLast(1).joinToString(",") { "${it.family}=${"%.3f".format(it.ratio)}" },
+            "perFamily" to perFamily(o.sums),
             "note" to "權重＝一頁產品兩檔的實際呼叫次數（6 頁中位數，NightPrimWorkload 檔頭）；遮罩是頁面導出的代理；C++ 時間不含 JNI 複製",
+        )
+    }
+
+    /**
+     * 第 3a 階的二值原語（[NightBinWorkload]：MORPH、LINE、DIST、MISC、BITS）。這一階的關卡只有「全部相同」（要比滿整張步驟表）；
+     * 倍數只做參考：權重 0 的步驟（巢狀在其他原語裡的、一頁 0–1 次的）只比位元、不計入合計。
+     */
+    private fun stepBin() {
+        if (!NightNative.available()) {
+            report.line("GATE", "key" to "bin_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
+            return
+        }
+        val pages = primPages()
+        val want = pages.sumOf { pg -> binSteps(pg.input.gray.w, pg.input.gray.h) }
+        val o = diffSet(
+            BIN_KINDS, pages,
+            { p: NightReadInput, rep: Int, cb: ((NightBinWorkload.StepResult) -> Unit)? -> NightBinWorkload.differential(p.gray, p.seg, p.charMask, rep, cb) },
+            { r -> DiffRow(r.step.id, r.step.family.toString(), r.step.weight, r.kotlinNs, r.nativeNs, r.identical, r.nativePeakBytes) },
+            { rs -> NightBinWorkload.summarize(rs).map { DiffSum(it.family?.name, it.kotlinWeightedNs, it.nativeWeightedNs, it.identical) } },
+        )
+        report.line(
+            "GATE", "key" to "bin_identical", "pass" to ProbeRecords.verdict(o.different.size + o.warmDifferent.size, o.rows.size, want),
+            "steps" to o.rows.size, "want" to want, "different" to o.different.joinToString(","), "warmDifferent" to o.warmDifferent.joinToString(","),
+            "workload" to NightBinWorkload.VERSION,
+        )
+        val total = o.sums.last()
+        report.line(
+            "GATE", "key" to "bin_ratio", "ratio" to "%.3f".format(total.ratio), "perFamily" to perFamily(o.sums),
+            "note" to "只做參考、不是關卡；權重＝一頁產品兩檔的實際呼叫次數（6 頁中位數，NightBinWorkload 檔頭），巢狀與一頁 0–1 次的權重 0；遮罩是頁面導出的代理；C++ 時間不含 JNI 複製",
+        )
+    }
+
+    /** 補充比對一種運算的累計。時間只是參考：整張影像的原語，C++ 取原語本身的耗時（不含 JNI 複製）；ellipse、rect、polygonArea 含 JNI。 */
+    private class Extra {
+        var cases = 0
+        var diffs = 0
+        var kotlinNs = 0L
+        var nativeNs = 0L
+        val firstDiffs = ArrayList<String>()
+    }
+
+    /** 只接一般的例外：兩邊都丟＝相同（Kotlin 會丟例外的輸入，C++ 也要丟）。OOM 之類的 Error 照樣往外丟，這一步記 FAIL。 */
+    private fun attempt(f: () -> Any): Result<Any> = try {
+        Result.success(f())
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
+
+    /** 步驟表沒有的第 3a 階原語，只比位元（案例見 [ProbeBinExtras]）。 */
+    private fun stepBinExtra() {
+        if (!NightNative.available()) {
+            report.line("GATE", "key" to "bin_extra_identical", "pass" to false, "why" to "C++ 不可用（版本不符或 .so 沒載入）")
+            return
+        }
+        val ex = LinkedHashMap<String, Extra>()
+        fun cmp(c: ProbeBinExtras.Case) {
+            val e = ex.getOrPut(c.op) { Extra() }
+            val t0 = System.nanoTime()
+            val a = attempt(c.kotlin)
+            val t1 = System.nanoTime()
+            val raw = attempt(c.native)
+            val t2 = System.nanoTime()
+            val timed = raw.getOrNull() as? NightNativePrims.Timed<*>
+            val b = if (timed != null) Result.success(timed.value ?: Unit) else raw
+            e.cases++
+            e.kotlinNs += t1 - t0
+            e.nativeNs += timed?.nanos ?: (t2 - t1)
+            val same = when {
+                a.isFailure && b.isFailure -> true
+                a.isSuccess && b.isSuccess -> ProbeBinExtras.same(a.getOrThrow(), b.getOrThrow())
+                else -> false
+            }
+            if (!same) {
+                e.diffs++
+                if (e.firstDiffs.size < 3) e.firstDiffs += c.tag
+                report.line(
+                    "WARN", "what" to "第 3a 階補充比對不同", "op" to c.op, "case" to c.tag,
+                    "kotlin" to (a.exceptionOrNull()?.javaClass?.simpleName ?: "ok"), "cpp" to (b.exceptionOrNull()?.javaClass?.simpleName ?: "ok"),
+                )
+            }
+        }
+        ProbeBinExtras.globalCases().forEach(::cmp)
+        for (pg in primPages()) {
+            ProbeBinExtras.pageCases(pg.name, pg.input).forEach(::cmp)
+            report.publish(force = false)
+        }
+        var cases = 0
+        var diffs = 0
+        for ((op, e) in ex) {
+            cases += e.cases
+            diffs += e.diffs
+            report.line(
+                "BIN_EXTRA", "op" to op, "cases" to e.cases, "diffs" to e.diffs, "kotlinUs" to e.kotlinNs / 1000, "cppUs" to e.nativeNs / 1000,
+                "firstDiffs" to e.firstDiffs.joinToString(","),
+            )
+        }
+        report.line(
+            "GATE", "key" to "bin_extra_identical", "pass" to (diffs == 0 && cases > 0), "cases" to cases, "diffs" to diffs,
+            "different" to ex.filterValues { it.diffs > 0 }.keys.joinToString(","),
         )
     }
 
@@ -569,7 +725,8 @@ class NightProbeRunner(
         out += "SUMMARY\t總時間 ${secs()} 秒（這一輪）；可除錯=${env.debuggable()}；警告 $warns 筆；離開最上層 ${fg.left} 次；閃退過的步驟：${state.crashed.joinToString(",").ifEmpty { "無" }}；失敗的步驟：${failed.joinToString(",").ifEmpty { "無" }}"
         if (!modelsReady) out += "SUMMARY\t★ (d) 的模型沒準備好，這一輪還沒跑完（換資料夾後按「接著跑」）"
         if (fg.left > 0 || fg.steps.isNotEmpty()) {
-            out += "SUMMARY\t★ 中途離開過畫面：這台手機切走後只給 5 顆核心，這幾步的時間偏慢：${fg.steps.joinToString(",")}${if ("c" in fg.steps) "（含 (c)，下面第 3 項的倍數要打折看）" else ""}"
+            val hit = listOfNotNull("第 3 項".takeIf { "c" in fg.steps }, "第 5c 項".takeIf { "c3a" in fg.steps })
+            out += "SUMMARY\t★ 中途離開過畫面：這台手機切走後只給 5 顆核心，這幾步的時間偏慢：${fg.steps.joinToString(",")}${if (hit.isEmpty()) "" else "（含 (c)，下面${hit.joinToString("、")}的倍數要打折看）"}"
         }
         out += "SUMMARY\t1. 手機上 Kotlin 摘要等於電腦：${pf("kotlin_digest")}（${g("kotlin_digest")?.get("digest")?.take(16) ?: "-"}）"
         out += "SUMMARY\t2a. 數值核心逐位元相同：${pf("numeric")}（${g("numeric")?.get("cases") ?: "-"} 組，不同 ${g("numeric")?.get("diffs") ?: "-"}）${g("numeric")?.get("why") ?: ""}"
@@ -577,19 +734,37 @@ class NightProbeRunner(
         out += "SUMMARY\t3. 5 族合計 C++ 比 ART 快幾倍（門檻 1.5）：${g("combined_ratio")?.get("ratio") ?: "-"}（${pf("combined_ratio")}）；各族 ${g("combined_ratio")?.get("perFamily") ?: "-"}"
         out += "SUMMARY\t4a. 模型輸出（只做紀錄）：6／3 緒 ${pf("models_sha_6v3")}（${cnt("models_sha_6v3")}）；1 緒 ${pf("models_sha_1")}（${cnt("models_sha_1")}）；兩兩同時 ${pf("models_sha_pairs")}（${cnt("models_sha_pairs")}）；吞吐 ${pf("models_sha_tp")}（${cnt("models_sha_tp")}）"
         out += "SUMMARY\t4b. 模型速度（只做紀錄）：3 緒比 6 緒慢 ${g("models_ratio_3v6")?.get("ratio") ?: "-"} 倍（模擬假設 1.35）；兩個 3 緒同時比 6 緒一次一個快 ${g("models_throughput")?.get("gainPct") ?: "-"}%（門檻 25%）；A=${g("models_throughput")?.get("A") ?: "-"} B=${g("models_throughput")?.get("B") ?: "-"} C=${g("models_throughput")?.get("C") ?: "-"} ms"
+        out += "SUMMARY\t5a. 第 3a 階原語逐位元相同（這一階的關卡）：${pf("bin_identical")}（${g("bin_identical")?.get("steps") ?: "-"}／${g("bin_identical")?.get("want") ?: "-"} 步；不同：${g("bin_identical")?.get("different")?.ifEmpty { "無" } ?: "-"}；暖機時不同：${g("bin_identical")?.get("warmDifferent")?.ifEmpty { "無" } ?: "-"}）${g("bin_identical")?.get("why") ?: ""}"
+        out += "SUMMARY\t5b. 第 3a 階補充：步驟表沒有的原語逐位元相同（也算這一階的關卡）：${pf("bin_extra_identical")}（${g("bin_extra_identical")?.get("cases") ?: "-"} 組，不同 ${g("bin_extra_identical")?.get("diffs") ?: "-"}${g("bin_extra_identical")?.get("different")?.takeIf { it.isNotEmpty() }?.let { "：$it" } ?: ""}）${g("bin_extra_identical")?.get("why") ?: ""}"
+        out += "SUMMARY\t5c. 第 3a 階合計 C++ 比 ART 快幾倍（只做參考）：${g("bin_ratio")?.get("ratio") ?: "-"}；各族 ${g("bin_ratio")?.get("perFamily") ?: "-"}"
         out.forEach { report.raw(it) }
         report.line("END", "finished" to modelsReady)
     }
 
     companion object {
+        /**
+         * 紀錄格式。nightprobe-3＝nightprobe-2 再加第 3a 階：步驟 c3a（BIN_WARM／BIN／BIN_PAGE／BIN_TOTAL、關卡 bin_identical／bin_ratio）、
+         * 步驟 c3a.x（BIN_EXTRA、關卡 bin_extra_identical）、摘要第 5 項；原有的列不變。
+         */
+        const val FORMAT = "nightprobe-3"
+
         /** 每個純量函式的案例數（電腦上 200 萬、8 緒）。手機控制在 1–2 分鐘。 */
         const val NUMERIC_CASES = 1_000_000L
 
         /** 陣列案例數的比例（電腦上 1 倍）。 */
         const val NUMERIC_ARRAY_SCALE = 0.25
 
-        /** (c) 的 4 張公開 fixture 頁。 */
+        /** (c) 的 4 張公開 fixture 頁（要在 [GuardDigest.PAGES] 裡：assets 只打包那些）。 */
         val PRIM_PAGES = listOf("ch34_011", "ch34_015", "demo05", "demo06")
+
+        /** (c) 正式量時每頁每步跑幾次（取中位數）。 */
+        const val PRIM_REPEAT = 5
+
+        private val PRIM_KINDS = DiffKinds("WARM", "PRIM", "PRIM_PAGE", "PRIM_TOTAL", "")
+        private val BIN_KINDS = DiffKinds("BIN_WARM", "BIN", "BIN_PAGE", "BIN_TOTAL", "（第 3a 階）")
+
+        /** 第 3a 階步驟表在 [w]×[h] 的頁上有幾步原語（準備步驟不算）：比滿這麼多步才算「全部相同」。 */
+        fun binSteps(w: Int, h: Int): Int = NightBinWorkload.program(w, h).count { it.family != null }
 
         /** (d) 的 3 張公開頁（sandbox 內建的原圖，解碼後用產品的前處理）。 */
         val MODEL_PAGES = listOf("test/ch34_011.jpg", "test/demo05.png", "test/demo01.jpg")
