@@ -2,7 +2,8 @@
 # 引擎原生庫的守門（CI 與本機共用）：
 #   1. APK 每個 ABI 只有一個 .so：libyakuyomi_ncnn.so（ncnn 是靜態庫，兩個 .so 各帶一份就有兩個 SimpleOMP 常駐池）。
 #   2. llvm-nm -D 只看得到 JNI（JNI_OnLoad*、Java_*）；夜讀的 JNI 入口都在（握手、第 2 階與第 3a 階原語各抽一個）。
-#   3. 夜讀的物件檔沒有 FMA、沒有 OpenMP 參照；反面自檢：同一支掃描要抓得到 NDK 預設旗標編出來的 fmadd。
+#   3. 夜讀的物件檔沒有 FMA、沒有 OpenMP 參照（objdump／nm 失敗或沒輸出＝不通過，不當成乾淨）；反面自檢：同一支掃描要抓得到
+#      NDK 預設旗標編出來的 fmadd。
 #   4. 夜讀的編譯旗標守住逐位元規則（最後的 -O 是 -O2、-ffp-contract=off…；nightread 的 check_compile_flags.py）。
 #
 # 用法：check_native_so.sh <apk> <cxx 變體目錄，例如 inference-core/.cxx/RelWithDebInfo> [--probe]
@@ -82,11 +83,21 @@ done
 [ -n "$build" ] || { echo "找不到跟 APK 同一個 build-id（$apk_id）的建置目錄：$cxx"; exit 2; }
 echo "建置目錄：$build（build-id $apk_id）"
 mapfile -t objs < <(cd "$build" && find nightread_native/CMakeFiles -name '*.o')
+# 工具的輸出先存起來、看結束碼再 grep：工具失敗（WSL 叫 Windows 版 .exe 偶爾會）不能被當成「沒找到」而算通過。失敗重試一次，仍失敗＝不通過。
+run_tool() {   # run_tool <輸出變數名> <工具> <參數…>：在 $build 下跑，成功才把 stdout 放進變數
+  local __out=$1 out; shift
+  out="$(cd "$build" && "$@")" || out="$(cd "$build" && "$@")" || return 1
+  printf -v "$__out" '%s' "$out"
+}
 n=0
 for o in "${objs[@]}"; do
-  hits="$(cd "$build" && "$objdump" -d --no-show-raw-insn "$o" | grep -Ei $'\t(fmadd|fmsub|fnmadd|fnmsub|fmla|fmls)\\b' || true)"
+  if ! run_tool dis "$objdump" -d --no-show-raw-insn "$o" || ! grep -q 'file format' <<<"$dis"; then
+    echo "objdump 失敗或沒有輸出：$o"; fail=1; continue
+  fi
+  hits="$(grep -Ei $'\t(fmadd|fmsub|fnmadd|fnmsub|fmla|fmls)\\b' <<<"$dis" || true)"
   if [ -n "$hits" ]; then echo "FMA：$o"; echo "$hits" | head -5; fail=1; fi
-  omp="$(cd "$build" && "$nm" "$o" | grep -E '__kmpc|omp_' || true)"
+  if ! run_tool syms_o "$nm" "$o"; then echo "nm 失敗：$o"; fail=1; continue; fi
+  omp="$(grep -E '__kmpc|omp_' <<<"$syms_o" || true)"
   if [ -n "$omp" ]; then echo "OpenMP 參照：$o"; echo "$omp" | head -5; fail=1; fi
   n=$((n + 1))
 done
