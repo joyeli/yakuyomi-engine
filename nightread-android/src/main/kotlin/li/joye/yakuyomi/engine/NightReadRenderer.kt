@@ -10,7 +10,9 @@ import li.joye.yakuyomi.nightread.NightReadParams
 import li.joye.yakuyomi.nightread.NightReadStageTimer
 import li.joye.yakuyomi.nightread.NightTier
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
@@ -53,9 +55,14 @@ class UnionCharSegmenter(private val parts: List<CharSegmenter>) : CharSegmenter
  * 分段版只填 [renderMs]。
  */
 class NightReadStats {
-    /** detector.detect 本身（不含分群、遮罩轉換——那些算進 [renderMs]）。 */
+    /**
+     * detector.detect 本身（不含分群、遮罩轉換——那些算進 [renderMs]）。偵測與分割同時跑時（`inferenceBranch`，預設）
+     * 兩段是重疊的牆鐘，各自含等另一邊放開 NCNN 全域鎖的時間，相加會大於推論實際花的時間。
+     */
+    @Volatile
     var detectMs = 0L
-    /** charSeg.segment（聯集配方＝各顆相加）。 */
+    /** charSeg.segment（聯集配方＝各顆相加）；同時跑時同 [detectMs] 的說明。 */
+    @Volatile
     var maskMs = 0L
     /**
      * 灰階／彩度、分群 AABB、遮罩轉換、NightRead.render、輸出 Bitmap。多檔版＝分析＋各檔合成＋各檔轉 Bitmap，
@@ -104,6 +111,16 @@ class NightReadStats {
  * **併發**：可以多頁並行——這裡與 nightread 函式庫都沒有共享可變狀態（函式庫已驗可重入：多緒 render 與單緒逐像素相同）。
  * 記憶體由呼叫端控管（每頁約 150 MB，512 MB heap 約只放得下 2 頁）；推論進不進 NCNN 全域鎖、持鎖前向的優先權與中止由
  * 模型組決定（[NcnnFlavor]、[NcnnLowPriorityHook]）；呼叫端要在每次推論前後插自己的檢查點時用 lambda 版 [render]。
+ *
+ * **偵測‖人物分割**（各一條龍入口的 `inferenceBranch`，2026-11 S11）：一頁的偵測與人物分割同時跑——分割交給這個 Executor、
+ * 偵測在呼叫執行緒上；兩個前向照樣各自經過模型組的全域鎖（多緒組仍是串行），重疊的是前後處理與等鎖，輸出逐位元相同。
+ * 預設 [NEW_THREAD_BRANCH]（每頁開一條短命的 daemon 執行緒）；null＝依序（先偵測再分割，都在呼叫執行緒上）。分支還沒
+ * 開始跑時呼叫執行緒做完偵測就自己跑分割（池子滿、執行緒起得慢都不會乾等）。
+ *  - 推論掛鉤在**發起推論的那條執行緒**上被呼叫（[NcnnLowPriorityHook]），靠執行緒區域狀態分辨頁的呼叫端要給一個會把
+ *    那份狀態帶到分支執行緒上的 Executor（Yakuyomi fork 的夜讀 governor 就是），否則分支上的分割前向找不到它的中止條件與
+ *    優先權設定。
+ *  - 1 緒、不進鎖的模型組（[NcnnFlavor.NIGHT_FREE] 那種「刻意不吃核」的組）傳 null：同時跑會變成兩條各吃一核。
+ *  - 推論期的暫存從「兩者取大」變成「兩者相加」，每頁多約 15–20 MB，仍低於重繪的尖峰（下面的 58 B/px 不變）。
  *
  * **頁內並行**（各重繪入口的 `parallel`，2026-10-06）：nightread 分析裡彼此獨立的分支（人物收邊平滑、場景曲線、灰圈證據、
  * 貼紙計畫）與「更多」的背景物件量測丟給這個 Executor 跑（`NightRead.renderTiers` 的同名參數；輸出逐位元相同；量測裡只有部分頁
@@ -170,10 +187,11 @@ object NightReadRenderer {
         extraLines: List<TextLine> = emptyList(),
         inpaintMask: Bitmap? = null,
         parallel: Executor? = null,
+        inferenceBranch: Executor? = NEW_THREAD_BRANCH,
     ): Bitmap = checkNotNull(
         render(
             page, detect = detector::detect, segment = charSeg::segment, params = params, stats = stats,
-            extraLines = extraLines, inpaintMask = inpaintMask, parallel = parallel,
+            extraLines = extraLines, inpaintMask = inpaintMask, parallel = parallel, inferenceBranch = inferenceBranch,
         ),
     )
 
@@ -186,6 +204,8 @@ object NightReadRenderer {
      * [beforeRender]：推論做完、進入 Kotlin 重繪（一頁最貴的一段，數秒）之前呼叫一次。回 false＝放棄這頁 → 回 null，
      * finally 照樣回收 textMask 與縮圖（呼叫端用來在暫停／讓路時丟回待做、把 heap 放掉）。
      * [parallel]：頁內並行（見類別說明；null＝依序）。
+     * [inferenceBranch]：[segment] 在哪條執行緒上與 [detect] 同時跑（見類別說明「偵測‖人物分割」；null＝依序）。
+     * [detect] 與 [segment] 可能在兩條執行緒上同時被呼叫，兩者裡的檢查點要能多緒呼叫。
      */
     fun render(
         page: Bitmap,
@@ -197,7 +217,10 @@ object NightReadRenderer {
         inpaintMask: Bitmap? = null,
         beforeRender: () -> Boolean = { true },
         parallel: Executor? = null,
-    ): Bitmap? = withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
+        inferenceBranch: Executor? = NEW_THREAD_BRANCH,
+    ): Bitmap? = withInference(
+        page, detect, segment, stats, extraLines, inpaintMask, beforeRender, inferenceBranch,
+    ) { work, detection, chars ->
         render(work, detection, chars, params, stats, inpaintMask, parallel)
     }
 
@@ -222,6 +245,7 @@ object NightReadRenderer {
      * [stats]：detect／mask 同 [render]；[NightReadStats.renderMs] 不含 sink；[NightReadStats.tierMs] 每檔；
      * [NightReadStats.stagesMs] 的分析段照舊、各檔的段名加檔位前綴（`l2.paintSticker=45`）。
      * [inpaintMask] 同一條龍 [render]（只有「更多」看它）。[parallel]：頁內並行（見類別說明；null＝依序）。
+     * [inferenceBranch]：偵測‖人物分割（同 lambda 版 [render]；null＝依序）。
      *
      * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），多檔版與單檔 [render] 相同（nightread 共用分析的快取存
      * 1 bit/px），所以每頁 58 B/px 的估算照用；帶 [inpaintMask] 的頁多 1 B/px（轉成的布林遮罩）＋函式庫內部位元版 1/8 B/px
@@ -238,10 +262,13 @@ object NightReadRenderer {
         beforeRender: () -> Boolean = { true },
         tiers: List<NightTier> = NightTier.entries,
         parallel: Executor? = null,
+        inferenceBranch: Executor? = NEW_THREAD_BRANCH,
         sink: (NightTier, Bitmap?) -> Unit,
     ): Boolean {
         require(tiers.isNotEmpty()) { "renderTiers：至少要一檔" }
-        return withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
+        return withInference(
+            page, detect, segment, stats, extraLines, inpaintMask, beforeRender, inferenceBranch,
+        ) { work, detection, chars ->
             renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, parallel, sink)
         } != null
     }
@@ -257,15 +284,18 @@ object NightReadRenderer {
         inpaintMask: Bitmap? = null,
         tiers: List<NightTier> = NightTier.entries,
         parallel: Executor? = null,
+        inferenceBranch: Executor? = NEW_THREAD_BRANCH,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         renderTiers(page, detect = detector::detect, segment = charSeg::segment, base = base, stats = stats,
-            extraLines = extraLines, inpaintMask = inpaintMask, tiers = tiers, parallel = parallel, sink = sink)
+            extraLines = extraLines, inpaintMask = inpaintMask, tiers = tiers, parallel = parallel,
+            inferenceBranch = inferenceBranch, sink = sink)
     }
 
     /**
-     * 縮圖 → 偵測（併 [extraLines]）→ 分割 → [beforeRender] → [body]（在縮後的工作圖上）。[beforeRender] 回 false＝回 null。
-     * textMask 與縮圖在 finally 回收（例外也一樣），[page] 所有權不變。lambda 版 [render] 與 [renderTiers] 共用。
+     * 縮圖 → 偵測（併 [extraLines]）‖ 分割（[inferBoth]，[inferenceBranch] null＝依序）→ [beforeRender] → [body]（在縮後的
+     * 工作圖上）。[beforeRender] 回 false＝回 null。textMask 與縮圖在 finally 回收（例外也一樣；偵測或分割任一邊拋例外時先等
+     * 另一邊結束、回收 textMask 再拋），[page] 所有權不變。lambda 版 [render] 與 [renderTiers] 共用。
      * [inpaintMask] 只在這裡驗與 [page] 對得上（推論前，免得白跑一頁才拋）；對應到工作圖尺寸在 [body] 裡（[toInput]）。
      */
     private fun <T : Any> withInference(
@@ -276,23 +306,30 @@ object NightReadRenderer {
         extraLines: List<TextLine>,
         inpaintMask: Bitmap?,
         beforeRender: () -> Boolean,
+        inferenceBranch: Executor?,
         body: (Bitmap, Detection, BooleanArray) -> T,
     ): T? {
         inpaintMask?.let { requireFitsPage(it, page) }
         val work = scaleToBudget(page, stats)
         try {
-            var t = System.nanoTime()
-            val detected = detect(work)
-            stats?.detectMs = (System.nanoTime() - t) / 1_000_000
-            val detection = if (extraLines.isEmpty()) {
-                detected
-            } else {
-                Detection(detected.lines + scaleLines(extraLines, work.width.toFloat() / page.width), detected.textMask)
-            }
+            val (detected, chars) = inferBoth(
+                detect = {
+                    val t = System.nanoTime()
+                    detect(work).also { stats?.detectMs = (System.nanoTime() - t) / 1_000_000 }
+                },
+                segment = {
+                    val t = System.nanoTime()
+                    segment(work).also { stats?.maskMs = (System.nanoTime() - t) / 1_000_000 }
+                },
+                branch = inferenceBranch,
+                discard = { it.textMask.recycle() },
+            )
             try {
-                t = System.nanoTime()
-                val chars = segment(work)
-                stats?.maskMs = (System.nanoTime() - t) / 1_000_000
+                val detection = if (extraLines.isEmpty()) {
+                    detected
+                } else {
+                    Detection(detected.lines + scaleLines(extraLines, work.width.toFloat() / page.width), detected.textMask)
+                }
                 if (!beforeRender()) return null
                 return body(work, detection, chars)
             } finally {
@@ -300,6 +337,108 @@ object NightReadRenderer {
             }
         } finally {
             if (work !== page) work.recycle()
+        }
+    }
+
+    /**
+     * 預設的 `inferenceBranch`：每次開一條短命的 daemon 執行緒（[INFERENCE_THREAD_NAME]）跑分割。不帶任何執行緒區域狀態，
+     * 優先權照 Java 慣例繼承呼叫執行緒的 `Thread.priority`（不是 `Process.setThreadPriority` 設的 nice）。
+     */
+    val NEW_THREAD_BRANCH: Executor = Executor { r -> Thread(r, INFERENCE_THREAD_NAME).apply { isDaemon = true }.start() }
+
+    /** [NEW_THREAD_BRANCH] 開的執行緒名（診斷用）。 */
+    const val INFERENCE_THREAD_NAME = "yaku-night-infer"
+
+    /**
+     * 偵測與人物分割同時跑（S11，與 Bitmap 無關、JVM 單元測試直接打）：[segment] 交給 [branch]、[detect] 在呼叫執行緒上跑；
+     * [branch] 還沒開始跑 [segment] 時（池子滿、執行緒起得慢），呼叫執行緒做完 [detect] 就自己跑——同一份工作只跑一次；
+     * [branch] 拒收（execute 拋例外）也一樣。null＝依序：先 [detect] 再 [segment]，都在呼叫執行緒上（與以前相同）。
+     *
+     * 任一邊拋例外：一定先等另一邊結束（不會留一個前向在背景跑），偵測結果交 [discard]（回收 textMask），再往外拋——
+     * [detect] 的例外優先，[segment] 的掛在 suppressed；只有 [segment] 拋時拋它（例外型別原樣保留，OOM 照樣是 OOM）。
+     * 等分支時被中斷照樣等完（不理會中斷，旗標回傳前補回去），與依序版一樣不因中斷提早離開。
+     */
+    internal fun <D : Any, S : Any> inferBoth(
+        detect: () -> D,
+        segment: () -> S,
+        branch: Executor?,
+        discard: (D) -> Unit,
+    ): Pair<D, S> {
+        if (branch == null) {
+            val d = detect()
+            val s = try {
+                segment()
+            } catch (t: Throwable) {
+                discard(d)
+                throw t
+            }
+            return d to s
+        }
+        val seg = BranchTask(segment)
+        try {
+            branch.execute(seg)
+        } catch (_: Throwable) {
+            // 拒收（或連執行緒都開不出來）：做完偵測後由這條自己跑分割（runIfUnclaimed）
+        }
+        var d: D? = null
+        var err: Throwable? = null
+        try {
+            d = detect()
+        } catch (t: Throwable) {
+            err = t
+        }
+        seg.runIfUnclaimed()
+        seg.await()
+        val segErr = seg.error
+        if (err != null || segErr != null) {
+            d?.let(discard)
+            val first = err ?: segErr!!
+            if (err != null && segErr != null && segErr !== err) first.addSuppressed(segErr)
+            throw first
+        }
+        return checkNotNull(d) to checkNotNull(seg.result)
+    }
+
+    /** [inferBoth] 的分支：先搶到的那條執行緒跑（[run] 或 [runIfUnclaimed]），只跑一次；[await] 等它跑完。 */
+    private class BranchTask<S : Any>(private val body: () -> S) : Runnable {
+        private val claimed = AtomicBoolean(false)
+        private val done = CountDownLatch(1)
+
+        // 在 done.countDown() 之前寫、await() 之後讀（latch 保證可見）
+        var result: S? = null
+            private set
+        var error: Throwable? = null
+            private set
+
+        override fun run() {
+            if (claimed.compareAndSet(false, true)) execute()
+        }
+
+        fun runIfUnclaimed() {
+            if (claimed.compareAndSet(false, true)) execute()
+        }
+
+        private fun execute() {
+            try {
+                result = body()
+            } catch (t: Throwable) {
+                error = t
+            } finally {
+                done.countDown()
+            }
+        }
+
+        fun await() {
+            var interrupted = false
+            while (true) {
+                try {
+                    done.await()
+                    break
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt()
         }
     }
 
