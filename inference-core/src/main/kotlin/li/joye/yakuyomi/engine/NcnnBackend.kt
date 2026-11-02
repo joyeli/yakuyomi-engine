@@ -301,6 +301,21 @@ object NcnnBackend {
     private external fun ocrCtcNative(handle: Long, chw: FloatArray, w: Int, h: Int, pe: FloatArray, t: Int, idx: IntArray, logp: FloatArray): Int
 
     /**
+     * **只給 sandbox 的夜讀 C++ 探針**量「模型能不能同時跑」：直接呼叫原生前向，**不進 [ncnnLock]、也不管 [NcnnFlavor] 的 1 緒限制**。
+     * 產品一律走下面帶鎖的版本（多緒同時跑要等探針的數字出來才決定）。
+     */
+    fun probeDetectDbnet(handle: Long, chw: FloatArray, inW: Int, inH: Int, db: FloatArray, mask: FloatArray): Int =
+        detectDbnetNative(handle, chw, inW, inH, db, mask)
+
+    /** 見 [probeDetectDbnet]。 */
+    fun probeInpaintAot(handle: Long, img: FloatArray, mask: FloatArray, s: Int, out: FloatArray): Int =
+        inpaintAotNative(handle, img, mask, s, out)
+
+    /** 見 [probeDetectDbnet]。 */
+    fun probeExtract(handle: Long, chw: FloatArray, inW: Int, inH: Int, inC: Int, outNames: Array<String>, outs: Array<FloatArray>): Int =
+        extractNative(handle, chw, inW, inH, inC, outNames, outs)
+
+    /**
      * DBNet 偵測（矩形 resize_aspect 輸入，繞開正方形 832-992 crash 帶）：chw=[3,inH,inW] → db 填 [2*inW*inH]（raw logits 2ch 全解析）、
      * mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。[flavor]＝進不進鎖、優先權與掛鉤（見 [NcnnFlavor]）。
      */

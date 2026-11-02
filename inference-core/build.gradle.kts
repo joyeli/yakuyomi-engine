@@ -9,6 +9,10 @@ plugins {
 group = "li.joye.yakuyomi"
 version = "0.5.0"
 
+// 夜讀 C++ 核心（yakuyomi-nightread/native）編進同一個 .so；只有在專案屬性明確給值時才改預設（CMakeLists.txt 的兩個 option）。
+val nightNative = providers.gradleProperty("yakuyomi.nightNative").orNull != "false"
+val nightProbe = providers.gradleProperty("yakuyomi.nightProbe").orNull == "true"
+
 android {
     namespace = "li.joye.yakuyomi.inference"
     compileSdk = 37
@@ -25,7 +29,11 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
-                arguments += listOf("-DANDROID_STL=c++_static")
+                arguments += listOf(
+                    "-DANDROID_STL=c++_static",
+                    "-DYAKUYOMI_NIGHT_NATIVE=${if (nightNative) "ON" else "OFF"}",
+                    "-DYAKUYOMI_NIGHT_PROBE=${if (nightProbe) "ON" else "OFF"}",
+                )
             }
         }
     }

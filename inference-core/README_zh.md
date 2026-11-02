@@ -49,6 +49,12 @@ Group：`li.joye.yakuyomi:inference-core`。Min SDK 26。只出 arm64-v8a。
 
 因此單獨用夜讀時，會多帶 OCR 和去字那兩個用不到的小函式。NCNN 的層實作本來就整包連進來。
 
+`NcnnBackend` 另有 `probeDetectDbnet`、`probeInpaintAot`、`probeExtract`，不進全域鎖，只給 sandbox 的「夜讀 C++ 探針」量多個前向同時跑，產品不要用。
+
+夜讀的 C++ 核心（`yakuyomi-nightread/native`）也編進這個 `.so`：CMake 用 `add_subdirectory(... EXCLUDE_FROM_ALL)` 帶進來，夜讀的逐位元旗標（`-O2`、`-ffp-contract=off`…）只釘在它自己的目標上。產品的重繪目前還是 Kotlin，C++ 只有探針會呼叫。
+
+這個庫只匯出 JNI（`exports.map`，加上 `-Wl,--exclude-libs,ALL`）。`tools/check_native_so.sh` 檢查每個 ABI 只有一個 `.so`、匯出的符號、夜讀物件檔沒有 FMA 與 OpenMP、夜讀的編譯旗標，CI 會跑。
+
 `consumer-rules.pro` 讓 R8 保留原生方法名，跟著這個模組帶到每個使用它的 app。
 
 ## 建置
@@ -56,6 +62,7 @@ Group：`li.joye.yakuyomi:inference-core`。Min SDK 26。只出 arm64-v8a。
 - NDK `28.2.13676358`、CMake `3.22.1`（`externalNativeBuild`）。reader app 釘同一版 NDK，才能 strip 這個庫。
 - 只編 `arm64-v8a`；預編的 NCNN 只有 arm64。
 - app 用 `includeBuild` 接本 repo 時，引擎這個 build 和它裡面巢狀的夜讀函式庫 build 各自找 Android SDK，讀不到 app 的 `local.properties`。請設 `ANDROID_HOME`，或在 `yakuyomi-engine/` 和 `yakuyomi-engine/yakuyomi-nightread/` 各放一份寫了 `sdk.dir=...` 的 `local.properties`。
+- Gradle 屬性：`-Pyakuyomi.nightNative=false` 不編夜讀 C++（`YAKUYOMI_NIGHT_NATIVE`，預設開）；`-Pyakuyomi.nightProbe=true` 多編夜讀的數值自測橋（`YAKUYOMI_NIGHT_PROBE`，預設關），只給探針用。夜讀 C++ 開著時需要 `yakuyomi-nightread` submodule，CMake 找不到會直接報錯。
 - 要換預編的 NCNN，請用 SimpleOMP（`NCNN_SIMPLEOMP=ON`）、不含 Vulkan 重編，並確認 `ncnn.cmake` 沒有連結裸的 `pthread`（NDK 沒有 `libpthread`；`Threads::Threads` 沒問題）。
 
 ## `@InternalEngineApi`

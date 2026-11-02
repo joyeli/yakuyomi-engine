@@ -49,6 +49,12 @@ So every native entry point stays in this module, even the ones only one side us
 
 Night reading on its own therefore carries the two small OCR and inpaint functions it never calls. NCNN's layer code is linked in full either way.
 
+`NcnnBackend` also has `probeDetectDbnet`, `probeInpaintAot` and `probeExtract`, which skip the global lock. They exist only so the sandbox's night-reading C++ probe can measure forwards running at the same time; products must not use them.
+
+The night-reading C++ core (`yakuyomi-nightread/native`) is built into this `.so` too: CMake pulls it in with `add_subdirectory(... EXCLUDE_FROM_ALL)`, and its bit-exact flags (`-O2`, `-ffp-contract=off`, ...) stay on its own targets. The product still renders in Kotlin; only the probe calls the C++ for now.
+
+The library exports JNI symbols only (`exports.map` plus `-Wl,--exclude-libs,ALL`). `tools/check_native_so.sh` checks for one `.so` per ABI, the exported symbols, no FMA or OpenMP in the night-reading objects, and their compile flags. CI runs it.
+
 `consumer-rules.pro` keeps the native method names through R8; it travels with this module to every app that uses it.
 
 ## Building
@@ -56,6 +62,7 @@ Night reading on its own therefore carries the two small OCR and inpaint functio
 - NDK `28.2.13676358` and CMake `3.22.1` (`externalNativeBuild`). The reader app pins the same NDK so it can strip the library.
 - Only `arm64-v8a` is built; the prebuilt NCNN is arm64 only.
 - When an app pulls this repo in with `includeBuild`, the engine build and the night-read library build nested in it each look for the Android SDK on their own; the app's `local.properties` is not read there. Set `ANDROID_HOME`, or put a `local.properties` with `sdk.dir=...` in both `yakuyomi-engine/` and `yakuyomi-engine/yakuyomi-nightread/`.
+- Gradle properties: `-Pyakuyomi.nightNative=false` leaves the night-reading C++ out (`YAKUYOMI_NIGHT_NATIVE`, on by default); `-Pyakuyomi.nightProbe=true` also builds its numeric self-test bridge (`YAKUYOMI_NIGHT_PROBE`, off by default), for the probe only. With the night-reading C++ on, the `yakuyomi-nightread` submodule must be present; CMake stops with an error otherwise.
 - If you replace the prebuilt NCNN, build it with SimpleOMP (`NCNN_SIMPLEOMP=ON`) and without Vulkan, and make sure `ncnn.cmake` does not link a bare `pthread` (the NDK has no `libpthread`; `Threads::Threads` is fine).
 
 ## `@InternalEngineApi`

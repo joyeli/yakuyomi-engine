@@ -1,0 +1,11 @@
+/*
+ * libyakuyomi_ncnn.so 只匯出 JNI。其餘（ncnn、libc++、夜讀核心、fdlibm、ncnn 標頭的 inline）一律 local。
+ * JNI_OnLoad* 用萬用字元：現在沒有定義它，連結器的 --no-undefined-version 對沒有定義的精確名稱會報錯。
+ */
+{
+  global:
+    JNI_OnLoad*;
+    Java_*;
+  local:
+    *;
+};
