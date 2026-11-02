@@ -269,7 +269,37 @@ object NightReadRenderer {
         return withInference(
             page, detect, segment, stats, extraLines, inpaintMask, beforeRender, inferenceBranch,
         ) { work, detection, chars ->
-            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, parallel, sink)
+            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, parallel, sinkOwns = false, sink)
+        } != null
+    }
+
+    /**
+     * 同 lambda 版 [renderTiers]（參數、回傳、去重、例外、計時都一樣），差別只在 Bitmap 的所有權：交給 [sink] 的 Bitmap
+     * **從 sink 被呼叫的那一刻起歸 sink**，引擎之後不再碰它——sink 回傳後不 recycle，sink 自己拋例外時也不 recycle。
+     * 用途＝把編碼交給另一條執行緒（fork 合併輪的夜讀，S5）：sink 把 Bitmap 交出去就回傳，引擎接著合成下一檔，編碼與合成
+     * 重疊；同一時間可能有兩張輸出 Bitmap（像素在 native，不吃 Java heap）。交出去的那張由 sink 那邊負責 recycle（含它
+     * 自己拋例外、或交不出去的情況）。sink 收到 null（與前一檔相同）時沒有 Bitmap 要管。
+     * px 緩衝照舊整頁一份：Bitmap 是 createBitmap 複製出來的，sink 拿走後引擎改寫 px 不影響它。
+     */
+    fun renderTiersOwning(
+        page: Bitmap,
+        detect: (Bitmap) -> Detection,
+        segment: (Bitmap) -> BooleanArray,
+        base: NightReadParams = NightReadParams(),
+        stats: NightReadStats? = null,
+        extraLines: List<TextLine> = emptyList(),
+        inpaintMask: Bitmap? = null,
+        beforeRender: () -> Boolean = { true },
+        tiers: List<NightTier> = NightTier.entries,
+        parallel: Executor? = null,
+        inferenceBranch: Executor? = NEW_THREAD_BRANCH,
+        sink: (NightTier, Bitmap?) -> Unit,
+    ): Boolean {
+        require(tiers.isNotEmpty()) { "renderTiers：至少要一檔" }
+        return withInference(
+            page, detect, segment, stats, extraLines, inpaintMask, beforeRender, inferenceBranch,
+        ) { work, detection, chars ->
+            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, parallel, sinkOwns = true, sink)
         } != null
     }
 
@@ -489,7 +519,8 @@ object NightReadRenderer {
 
     /**
      * 多檔版的重繪段（工作圖、偵測、人物遮罩已就緒）：一份 [NightReadInput]、一份 px 緩衝給各檔共用；去重在
-     * [streamTiers]，這裡只轉 Bitmap、交 [sink]（交完就 recycle）與計時。計時見 [renderTiers]。
+     * [streamTiers]，這裡只轉 Bitmap、交 [sink]（[sinkOwns]＝false：交完就 recycle；true：歸 sink，見 [handTier]）與計時。
+     * 計時見 [renderTiers]。
      */
     private fun renderTiersOn(
         page: Bitmap,
@@ -500,6 +531,7 @@ object NightReadRenderer {
         stats: NightReadStats?,
         inpaintMask: Bitmap?,
         parallel: Executor?,
+        sinkOwns: Boolean,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         val t = System.nanoTime()
@@ -549,11 +581,7 @@ object NightReadRenderer {
                 val bmp = Bitmap.createBitmap(px, page.width, page.height, Bitmap.Config.ARGB_8888)
                 val s0 = System.nanoTime()
                 tierMs[k] = (s0 - tierStart) / 1_000_000
-                try {
-                    sink(tiers[k], bmp)
-                } finally {
-                    bmp.recycle()
-                }
+                handTier(bmp, sinkOwns, recycle = Bitmap::recycle) { sink(tiers[k], it) }
                 val s1 = System.nanoTime()
                 sinkNs += s1 - s0               // 轉 Bitmap 算進合成；sink（編碼、寫檔）不算
                 last = s1
@@ -593,6 +621,23 @@ object NightReadRenderer {
                     out(k, true, true)
                 }
             }
+        }
+    }
+
+    /**
+     * 把一檔的輸出交給 sink（與 Bitmap 無關、JVM 單元測試 NightTierHandoffTest 直接打）。[sinkOwns]＝false：sink 回傳後、
+     * 或 sink 拋例外時都 [recycle]（[renderTiers] 的契約：sink 不得留住）；true：[out] 從 sink 被呼叫起歸 sink，這裡一律不
+     * recycle（sink 回傳、拋例外都一樣；[renderTiersOwning]）。sink 的例外照樣往外拋。
+     */
+    internal inline fun <B : Any> handTier(out: B, sinkOwns: Boolean, recycle: (B) -> Unit, sink: (B) -> Unit) {
+        if (sinkOwns) {
+            sink(out)
+            return
+        }
+        try {
+            sink(out)
+        } finally {
+            recycle(out)
         }
     }
 
