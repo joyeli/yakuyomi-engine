@@ -18,6 +18,12 @@
             android:layout_height="wrap_content"
             android:text="選擇模型資料夾（dbnet／ocr_48px_ctc／aot 的 .ncnn.param+.bin）" />
 
+        <Button
+            android:id="@+id/nightProbeButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="夜讀 C++ 探針" />
+
         <!-- LLM key：只在 app 內輸入、存 prefs。APK 不再於 build 時注入（防外流）；沒填就不翻譯 -->
         <LinearLayout
             android:layout_width="match_parent"

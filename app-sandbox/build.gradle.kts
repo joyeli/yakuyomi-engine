@@ -3,26 +3,65 @@ plugins {
     // AGP 9+ 內建 Kotlin 支援，不再套 kotlin.android
 }
 
+// 夜讀 C++ 探針的守門頁：照 nightread 的 fixture 打包進 assets/nightprobe/page，不在本 repo 留第二份。
+// 清單跟探針的 GuardDigest.fixtureFiles() 相同（GuardDigestJvmTest 檢查檔案都在）。
+abstract class NightProbeFixtures : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val pages: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outDir: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        val dir = outDir.get().asFile.resolve("nightprobe/page")
+        dir.deleteRecursively()
+        dir.mkdirs()
+        pages.files.forEach { it.copyTo(dir.resolve(it.name)) }
+    }
+}
+
+val nightProbeFixtures = tasks.register<NightProbeFixtures>("nightProbeFixtures") {
+    val src = rootProject.file("yakuyomi-nightread/nightread/src/test/resources/page")
+    val guardPages = listOf("ch34_011", "demo01", "demo02", "demo05", "demo06", "ch34_015", "syn_more", "syn_v4")
+    pages.from(
+        guardPages.flatMap { p -> listOf("gray.png", "seg.png", "char.png", "chroma.png", "regions.txt").map { src.resolve("${p}_$it") } } +
+            src.resolve("syn_v4_inpaint.png"),
+    )
+    outDir.set(layout.buildDirectory.dir("generated/nightprobe"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(nightProbeFixtures, NightProbeFixtures::outDir)
+    }
+}
+
 // LLM key **不再**於 build 時注入 APK（2026-09-26 拔掉：APK 外流＝key 外流）。sandbox 改在 app 內輸入、存 prefs；
 // repo 根的 api-keys.properties 只剩桌面 parity 腳本（translate_parity.py）在讀。
 android {
     namespace = "li.joye.yakuyomi.sandbox"
     compileSdk = 37
+    ndkVersion = "28.2.13676358" // 跟 :inference-core 同版（打包時 strip .so 要用；探針要記真正的 .so 大小）
 
     defaultConfig {
         applicationId = "li.joye.yakuyomi.sandbox"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.3-ncnn"
+        versionCode = 3
+        versionName = "0.4-nightprobe"
         // 只打 arm64-v8a（實機）：NCNN 原生層由 :inference-core 提供（libyakuyomi_ncnn，ncnn 預編庫本來就只出 arm64），
         // 其他 ABI 沒有可用的推論後端，打進去只是白佔空間；sandbox 不再自帶 native build。
         ndk { abiFilters += "arm64-v8a" }
     }
 
     buildTypes {
+        // 夜讀 C++ 探針用這個：不可除錯（可除錯的 ART 慢很多，C++ 的倍數會被高估）、不混淆、用 debug key 簽（裝得上、不必另備金鑰）。
+        // 建置：./gradlew :app-sandbox:assembleRelease -Pyakuyomi.nightProbe=true（數值自測橋才進 .so）。
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -33,6 +72,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+    testOptions {
+        unitTests.all { it.maxHeapSize = "2g" } // 守門摘要跑整頁重繪
     }
     buildFeatures {
         viewBinding = true
@@ -52,6 +94,7 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        optIn.add("li.joye.yakuyomi.engine.InternalEngineApi") // 探針直接呼叫 NcnnBackend 的 probe*
     }
 }
 
@@ -66,5 +109,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation("androidx.documentfile:documentfile:1.0.1") // SAF 資料夾讀檔
     implementation("androidx.activity:activity-ktx:1.8.2")      // registerForActivityResult / OpenDocumentTree
+    testImplementation("junit:junit:4.13.2")
     // NCNN 推論全在 :inference-core 內（libyakuyomi_ncnn）；sandbox 只透過引擎介面（Detector/Ocr/Inpainter/Yakuyomi/CharSegmenter），不直接依賴 runtime。
 }

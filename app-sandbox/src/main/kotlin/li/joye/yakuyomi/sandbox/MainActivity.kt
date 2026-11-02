@@ -78,6 +78,9 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         binding.pickFolderButton.setOnClickListener { folderPicker.launch(null) }
+        binding.nightProbeButton.setOnClickListener {
+            startActivity(Intent(this, li.joye.yakuyomi.sandbox.probe.NightProbeActivity::class.java))
+        }
         // LLM key：只能在 app 內輸入（存 prefs）；APK 不內建、留空存檔＝清掉（之後只跑偵測/OCR/去字、不翻譯）
         binding.apiKeyInput.setText(prefs.getString(PREF_API_KEY, "") ?: "")
         binding.apiKeySaveButton.setOnClickListener {
@@ -104,6 +107,8 @@ class MainActivity : AppCompatActivity() {
             else "資料夾：${t.name}（點縮圖選圖 → 診斷／效能比較）"
         // 開機 Toast 標 build 版本：手動安裝後一眼確認裝對版本（沒看到＝還是舊 APK / 同步未完成）
         Toast.makeText(this, "Yakuyomi sandbox $BUILD_TAG", Toast.LENGTH_LONG).show()
+        // 探針跑到一半閃退：先把離開原因寫進探針自己的紀錄（下面的 dumpLastExit 另外落一份 _exit 檔）
+        li.joye.yakuyomi.sandbox.probe.ProbeRecovery.check(this, prefs.getString(PREF_TREE, null))?.let { binding.logText.text = it }
         dumpLastExit(t)
     }
 
@@ -1468,7 +1473,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val BUILD_TAG = "v2.7-nrhelper" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
+        private const val BUILD_TAG = "v2.8-nightprobe" // 改一次就 bump，手動安裝確認版本用（橫幅/Toast 只標這個）
         private const val PREF_LAST_EXIT = "last_exit_ts_v2" // v2＝raw .pb 版；換 key 讓上一版毀掉的那次 crash 重吐一次
         // NCNN 推論由引擎 NcnnBackend（libyakuyomi_ncnn）負責；sandbox 不再自帶 benchmark 用的 libncnn_jni。
 
