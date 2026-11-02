@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 引擎原生庫的守門（CI 與本機共用）：
 #   1. APK 每個 ABI 只有一個 .so：libyakuyomi_ncnn.so（ncnn 是靜態庫，兩個 .so 各帶一份就有兩個 SimpleOMP 常駐池）。
-#   2. llvm-nm -D 只看得到 JNI（JNI_OnLoad*、Java_*）；夜讀的 JNI 入口都在。
+#   2. llvm-nm -D 只看得到 JNI（JNI_OnLoad*、Java_*）；夜讀的 JNI 入口都在（握手、第 2 階與第 3a 階原語各抽一個）。
 #   3. 夜讀的物件檔沒有 FMA、沒有 OpenMP 參照；反面自檢：同一支掃描要抓得到 NDK 預設旗標編出來的 fmadd。
 #   4. 夜讀的編譯旗標守住逐位元規則（最後的 -O 是 -O2、-ffp-contract=off…；nightread 的 check_compile_flags.py）。
 #
@@ -56,7 +56,7 @@ PY
 syms="$(cd "$work" && "$nm" -D --defined-only apk.so | awk '{print $NF}' | tr -d '\r')"
 extra="$(echo "$syms" | grep -vE '^(Java_|JNI_OnLoad)' || true)"
 if [ -n "$extra" ]; then echo "多匯出的符號（$(echo "$extra" | wc -l) 個）："; echo "$extra" | head -20; fail=1; fi
-need="Java_li_joye_yakuyomi_engine_NcnnBackend_extractNative Java_li_joye_yakuyomi_nightread_NightNative_abi Java_li_joye_yakuyomi_nightread_NightNativePrims_nDilatePacked"
+need="Java_li_joye_yakuyomi_engine_NcnnBackend_extractNative Java_li_joye_yakuyomi_nightread_NightNative_abi Java_li_joye_yakuyomi_nightread_NightNativePrims_nDilatePacked Java_li_joye_yakuyomi_nightread_NightNativeBin_nMask"
 for s in $need; do
   echo "$syms" | grep -qx "$s" || { echo "缺 JNI 符號：$s"; fail=1; }
 done
@@ -92,7 +92,9 @@ for o in "${objs[@]}"; do
 done
 [ "$n" -ge 20 ] || { echo "夜讀物件檔太少（$n 個）：路徑不對？"; fail=1; }
 printf 'double f(double a,double b,double c){return a*b+c;}\n' > "$work/p.cpp"
-(cd "$work" && "$clang" --target=aarch64-linux-android26 -O2 -c p.cpp -o p.o && "$objdump" -d p.o | grep -qEi $'\t(fmadd)') \
+# 反組譯先存起來再 grep：pipefail 下 grep -q 一找到就關管子，objdump 還在寫就會收到 SIGPIPE、整條回非 0（WSL 叫 Windows 版 .exe 時偶爾發生）
+selftest="$(cd "$work" && "$clang" --target=aarch64-linux-android26 -O2 -c p.cpp -o p.o && "$objdump" -d p.o)" || selftest=""
+grep -qEi $'\t(fmadd)' <<<"$selftest" \
   || { echo "掃描自檢失敗：預設旗標的 a*b+c 沒反組譯出 fmadd"; fail=1; }
 echo "FMA／OpenMP：掃了 $n 個夜讀物件檔"
 
