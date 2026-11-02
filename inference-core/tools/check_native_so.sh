@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 引擎原生庫的守門（CI 與本機共用）：
 #   1. APK 每個 ABI 只有一個 .so：libyakuyomi_ncnn.so（ncnn 是靜態庫，兩個 .so 各帶一份就有兩個 SimpleOMP 常駐池）。
-#   2. llvm-nm -D 只看得到 JNI（JNI_OnLoad*、Java_*）；夜讀的 JNI 入口都在（握手、第 2 階與第 3a 階原語各抽一個）。
+#   2. llvm-nm -D 只看得到 JNI（JNI_OnLoad*、Java_*）；夜讀的 JNI 入口都在（握手、第 2 階、第 3a 階與第 3b 階原語各抽一個）。
 #   3. 夜讀的物件檔沒有 FMA、沒有 OpenMP 參照（objdump／nm 失敗或沒輸出＝不通過，不當成乾淨）；反面自檢：同一支掃描要抓得到
 #      NDK 預設旗標編出來的 fmadd。
 #   4. 夜讀的編譯旗標守住逐位元規則（最後的 -O 是 -O2、-ffp-contract=off…；nightread 的 check_compile_flags.py）。
@@ -57,7 +57,7 @@ PY
 syms="$(cd "$work" && "$nm" -D --defined-only apk.so | awk '{print $NF}' | tr -d '\r')"
 extra="$(echo "$syms" | grep -vE '^(Java_|JNI_OnLoad)' || true)"
 if [ -n "$extra" ]; then echo "多匯出的符號（$(echo "$extra" | wc -l) 個）："; echo "$extra" | head -20; fail=1; fi
-need="Java_li_joye_yakuyomi_engine_NcnnBackend_extractNative Java_li_joye_yakuyomi_nightread_NightNative_abi Java_li_joye_yakuyomi_nightread_NightNativePrims_nDilatePacked Java_li_joye_yakuyomi_nightread_NightNativeBin_nMask"
+need="Java_li_joye_yakuyomi_engine_NcnnBackend_extractNative Java_li_joye_yakuyomi_nightread_NightNative_abi Java_li_joye_yakuyomi_nightread_NightNativePrims_nDilatePacked Java_li_joye_yakuyomi_nightread_NightNativeBin_nMask Java_li_joye_yakuyomi_nightread_NightNativeGray_nGray"
 for s in $need; do
   echo "$syms" | grep -qx "$s" || { echo "缺 JNI 符號：$s"; fail=1; }
 done
