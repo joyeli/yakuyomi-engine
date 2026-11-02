@@ -56,6 +56,17 @@ jobs:
       - name: Assemble (compile check)
         run: ./gradlew :inference-core:assembleDebug :engine:assembleDebug :nightread-android:assembleDebug :app-sandbox:assembleDebug --no-daemon --stacktrace
 
-      # JVM 單元測試（核心 13、翻譯 39、夜讀 10；夜讀兩支整頁測試讀 nightread submodule 的測試頁，要上面的 recursive）。
+      # JVM 單元測試（核心 13、翻譯 39、夜讀 10、sandbox 探針的守門摘要 2；夜讀與探針的整頁測試讀 nightread submodule 的測試頁，要上面的 recursive）。
       - name: Unit tests
-        run: ./gradlew :inference-core:testDebugUnitTest :engine:testDebugUnitTest :nightread-android:testDebugUnitTest --no-daemon --stacktrace
+        run: ./gradlew :inference-core:testDebugUnitTest :engine:testDebugUnitTest :nightread-android:testDebugUnitTest :app-sandbox:testDebugUnitTest --no-daemon --stacktrace
+
+      # 夜讀 C++ 探針用的 sandbox：不可除錯、數值自測橋編進 .so。
+      - name: Assemble probe APK
+        run: ./gradlew :app-sandbox:assembleRelease -Pyakuyomi.nightProbe=true --no-daemon --stacktrace
+
+      # 原生庫守門：每個 ABI 只有一個 .so、只匯出 JNI、夜讀的物件檔沒有 FMA／OpenMP、夜讀的編譯旗標（含 Debug 的 -O2）。
+      # 產品的建置（上面的 assembleDebug）不能帶數值自測橋，探針的建置一定要帶。
+      - name: Native library checks
+        run: |
+          bash inference-core/tools/check_native_so.sh app-sandbox/build/outputs/apk/debug/app-sandbox-debug.apk inference-core/.cxx/Debug
+          bash inference-core/tools/check_native_so.sh app-sandbox/build/outputs/apk/release/app-sandbox-release.apk inference-core/.cxx/RelWithDebInfo --probe
