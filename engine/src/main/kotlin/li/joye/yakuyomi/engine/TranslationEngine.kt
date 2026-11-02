@@ -34,6 +34,27 @@ interface TranslationEngine : AutoCloseable {
      */
     fun warmUp()
 
+    /**
+     * 偵測模型的 `.param` 路徑；null＝這個實作不借出偵測器（[detectWith] 不可用）。
+     * 給想共用同一顆偵測器的呼叫端比對「是不是同一顆模型」（例如 Yakuyomi fork 的合併處理讓夜讀借用，見 [detectWith]）。
+     */
+    val detectorModelPath: String? get() = null
+
+    /**
+     * 用引擎那顆偵測器、但帶呼叫端給的 [cfg] 偵測一頁（`Detector.detect(page, cfg)`：Net 共用、參數各帶各的；不經 OCR／
+     * 翻譯／去字、不碰 [translatePage] 的任何狀態）。可與 [translatePage] 同時呼叫——偵測器本來就給跨頁流水線多頁同時用。
+     * 回傳的 [Detection.textMask] 歸呼叫端（用完 recycle）；[page] 所有權不變。
+     *
+     * **生命週期由呼叫端顧**：引擎 [close] 之後不可再呼叫（原生 Net 已釋放）。借用的呼叫端要自己確保借用期間引擎不會被關
+     * （Yakuyomi fork 的 TranslationEngineService 用租約擋住關引擎的路徑）。
+     * [detectorModelPath] 為 null 的實作呼叫會拋 [UnsupportedOperationException]。
+     *
+     * 內部 API（[InternalEngineApi]）：只給 Yakuyomi fork 的夜讀共用偵測器用，隨時可能改。
+     */
+    @InternalEngineApi
+    fun detectWith(page: Bitmap, cfg: DetectorConfig): Detection =
+        throw UnsupportedOperationException("這個 TranslationEngine 不借出偵測器")
+
     /** 釋放底層模型的原生資源（detector/ocr/inpainter 的 ONNX session）。呼叫後此實例不可再用。 */
     override fun close()
 }

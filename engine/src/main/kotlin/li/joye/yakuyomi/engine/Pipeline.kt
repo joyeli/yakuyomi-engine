@@ -219,6 +219,16 @@ class Pipeline(
         EngineTrace.log("warmup.done")
     }
 
+    /** 偵測器的模型 `.param` 路徑（見 [TranslationEngine.detectorModelPath]）。 */
+    override val detectorModelPath: String get() = detector.modelPath
+
+    /**
+     * 借這條 pipeline 的偵測器、帶 [cfg] 偵測一頁（`Detector.detect(page, cfg)`，見 [TranslationEngine.detectWith]）。
+     * 不動 [translatePage] 用的 `cfg.detector`；[close] 之後不可呼叫。
+     */
+    @InternalEngineApi
+    override fun detectWith(page: Bitmap, cfg: DetectorConfig): Detection = detector.detect(page, cfg)
+
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
         runCatching { detector.close() }

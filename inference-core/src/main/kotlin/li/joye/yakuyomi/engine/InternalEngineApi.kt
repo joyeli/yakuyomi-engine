@@ -6,11 +6,14 @@ package li.joye.yakuyomi.engine
  * 拆模組前這些宣告是 `internal`；Kotlin 的 internal 跨不了 Gradle 模組，兄弟模組又要用，只好公開，
  * 改用這個 opt-in 標記擋住外部呼叫端（三個模組在各自的 build.gradle.kts 整模組 opt-in）。不屬公開 API，
  * 隨時可能改，外部程式不要 opt-in 來用。
+ *
+ * 也標在個別成員上（例如 `TranslationEngine.detectWith`：Yakuyomi fork 的合併處理讓夜讀借翻譯引擎那顆偵測器），
+ * 那種呼叫端在呼叫處 `@OptIn(InternalEngineApi::class)`。
  */
 @RequiresOptIn(
     message = "Yakuyomi 推論核心的內部 API，只給 :engine 與 :nightread-android 用",
     level = RequiresOptIn.Level.ERROR,
 )
 @Retention(AnnotationRetention.BINARY)
-@Target(AnnotationTarget.CLASS)
+@Target(AnnotationTarget.CLASS, AnnotationTarget.FUNCTION, AnnotationTarget.PROPERTY)
 annotation class InternalEngineApi

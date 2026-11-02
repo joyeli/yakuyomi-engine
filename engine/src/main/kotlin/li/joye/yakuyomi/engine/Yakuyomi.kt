@@ -21,7 +21,9 @@ import android.graphics.Typeface
  * 但生命週期得自己管（這條工廠路徑才會幫你 close）。
  *
  * **夜讀**（頁面本身變暗的分區重繪）不經 [TranslationEngine]：入口是 :nightread-android 的 `NightReadRenderer`（`charSegmenter` 由 [ModelSet]
- * 的兩顆選配分割模型建人物分割器、`render` 一條龍），偵測器可與翻譯共用同一顆 [Detector]。
+ * 的兩顆選配分割模型建人物分割器、`render` 一條龍），偵測器可與翻譯共用同一顆 [Detector]：[create] 回的引擎以
+ * [TranslationEngine.detectorModelPath] 報它載的偵測模型、以 [TranslationEngine.detectWith]（[InternalEngineApi]）借出那顆
+ * Net 並讓呼叫端自帶 [DetectorConfig]——夜讀帶 `DetectorConfig()` 預設值，輸出與自己建一顆相同；借用期間不可 close 引擎。
  */
 object Yakuyomi {
     /**

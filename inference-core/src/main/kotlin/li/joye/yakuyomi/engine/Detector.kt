@@ -12,10 +12,12 @@ import kotlin.math.roundToInt
  *
  * ported from manga_translator/detection/default_utils/ @ d5a3eee
  *   db logits → sigmoid → 二值化 → 連通元件 → minAreaRect → unclip 膨脹 → 旋轉四邊形。
- * 參數由 [DetectorConfig] 提供（§5 第一層）。
+ * 參數由 [DetectorConfig] 提供（§5 第一層）：建構時給的是 [detect] 的預設值；[detect] 的 cfg 多載每次呼叫自帶一份
+ * （Net 共用、參數各帶各的，見該多載）。
  */
 class Detector(
-    modelPath: String,
+    /** 模型 `.param` 路徑（`.bin`＝同名換副檔名）。共用偵測器的呼叫端拿它比對是不是同一顆模型。 */
+    val modelPath: String,
     private val cfg: DetectorConfig = DetectorConfig(),
     /** Net 的建法與推論路徑；翻譯用預設，夜讀依是否讓路選 [NcnnFlavor.NIGHT_LOCKED]／[NcnnFlavor.NIGHT_FREE]。 */
     private val flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
@@ -34,11 +36,22 @@ class Detector(
         Log.i(TAG, "NCNN detector loaded $modelPath $flavor")
     }
 
+    /** 用建構時的 [DetectorConfig] 偵測（同 `detect(page, cfg)` 帶建構時那份）。 */
+    fun detect(page: Bitmap): Detection = detect(page, cfg)
+
     /**
+     * 用呼叫端給的 [cfg] 偵測：前處理（[DetectorConfig.dbnetInputSize]、[DetectorConfig.detectUnsharp]）與後處理門檻
+     * （bin／box／unclip／minSide／segThreshold）全看這份，建構時那份不參與。Net、緒數、進不進全域鎖、低優先權掛鉤
+     * 仍是建構時的 [flavor]（緒數載入時就定死，換不了）。
+     *
+     * 用途：一顆 Net 給兩個用參數不同的呼叫端共用——翻譯引擎的偵測器帶使用者的進階偏好建，Yakuyomi fork 的合併處理讓
+     * 夜讀借同一顆、帶 `DetectorConfig()` 預設值呼叫，輸出與夜讀自己用預設值建一顆完全相同（同一個模型檔、同一種建法）。
+     * 可與 [detect] 同時從多條執行緒呼叫（前後處理都是區域狀態，前向照 [flavor] 進不進全域鎖）。
+     *
      * out0=db（2ch，ch0=raw logits→Kotlin 補 sigmoid）、out1=mask（1ch，半/全解析度平台不定、已 sigmoid）。
-     * 後處理＝[linesFromProbMap]（連通元件+minAreaRect+unclip；score=component-mean prob＝DB box_score_fast）。
+     * 後處理＝[linesFromLogits]（sigmoid → 連通元件+minAreaRect+unclip；score=component-mean prob＝DB box_score_fast）。
      */
-    fun detect(page: Bitmap): Detection {
+    fun detect(page: Bitmap, cfg: DetectorConfig): Detection {
         val pre = ImageOps.detectorChwDbnet(page, cfg.dbnetInputSize, cfg.detectUnsharp)
         val inW = pre.w
         val inH = pre.h
@@ -57,12 +70,7 @@ class Detector(
         val mw = rc / 10000 // JNI 回 mask.w*10000+mask.h（實際 mask 尺寸，不假設半/全解析）
         val mh = rc % 10000
         // db ch0 = raw logits → sigmoid → prob（ctd 的 out0 已 sigmoid、DBNet 沒有）；網格＝矩形 inW×inH
-        val prob = FloatArray(area)
-        for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
-        val lines = linesFromProbMap(
-            cfg, prob, inW, inH, pre.ratio, page.width, page.height,
-            cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
-        )
+        val lines = linesFromLogits(db, inW, inH, pre.ratio, page.width, page.height, cfg)
         // mask（已 sigmoid）→ 原圖尺寸筆畫遮罩。mask 空間 ratio = pre.ratio × mw/inW（半解析=ratio/2、全解析=ratio，動態）。
         val textMask = segToMask(cfg, mask, mw, mh, pre.ratio * mw.toFloat() / inW, page.width, page.height)
         Log.i(TAG, "DBNet 偵測到 ${lines.size} 行（in ${inW}x$inH mask ${mw}x$mh）")
@@ -135,17 +143,33 @@ class Detector(
             pageH: Int,
             cfg: DetectorConfig = DetectorConfig(),
         ): Detection {
-            val area = input.w * input.h
-            val prob = FloatArray(area)
-            for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
-            val lines = linesFromProbMap(
-                cfg, prob, input.w, input.h, input.ratio, pageW, pageH,
-                cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
-            )
+            val lines = linesFromLogits(db, input.w, input.h, input.ratio, pageW, pageH, cfg)
             val textMask = segToMask(
                 cfg, mask, mw, mh, input.ratio * mw.toFloat() / input.w, pageW, pageH,
             )
             return Detection(lines, textMask)
+        }
+
+        /**
+         * DB 機率圖的文字行：[db] 前 [gridW]×[gridH] 個值（ch0 raw logits）補 sigmoid → [linesFromProbMap]，門檻與
+         * minSide 全看 [cfg]。[detect] 與 [postprocess] 共用，所以「cfg 從哪裡來」只在呼叫端決定（JVM 單元測試直接打這裡）。
+         */
+        internal fun linesFromLogits(
+            db: FloatArray,
+            gridW: Int,
+            gridH: Int,
+            ratio: Float,
+            origW: Int,
+            origH: Int,
+            cfg: DetectorConfig,
+        ): List<TextLine> {
+            val area = gridW * gridH
+            val prob = FloatArray(area)
+            for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
+            return linesFromProbMap(
+                cfg, prob, gridW, gridH, ratio, origW, origH,
+                cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
+            )
         }
 
         private fun segToMask(
